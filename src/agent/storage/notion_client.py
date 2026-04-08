@@ -31,10 +31,27 @@ class NotionClient:
                 return response.json()
             except requests.HTTPError as e:
                 last_error = e
+                response_body = ""
+                try:
+                    response_body = e.response.text[:1000]
+                except Exception:
+                    pass
+                # 4xxはクライアントエラーのためリトライしない
+                if e.response.status_code < 500:
+                    logger.error(
+                        "Notion API client error",
+                        extra={"status": e.response.status_code, "response_body": response_body},
+                    )
+                    raise
                 wait = 2**attempt
                 logger.warning(
-                    "Notion API error, retrying",
-                    extra={"attempt": attempt + 1, "wait_seconds": wait, "status": e.response.status_code},
+                    "Notion API server error, retrying",
+                    extra={
+                        "attempt": attempt + 1,
+                        "wait_seconds": wait,
+                        "status": e.response.status_code,
+                        "response_body": response_body,
+                    },
                 )
                 time.sleep(wait)
         if last_error:
@@ -50,18 +67,7 @@ class NotionClient:
         github_url: str | None,
         slack_user: str,
     ) -> str:
-        """成果物ページを作成し、ページURLを返す
-
-        Args:
-            title: ページタイトル（トピック名）
-            category: カテゴリ（技術/時事/ビジネス等）
-            content_blocks: Notionブロック形式のコンテンツリスト
-            github_url: GitHubリポジトリURL（コード成果物がある場合）
-            slack_user: リクエスト元のSlack User ID
-
-        Returns:
-            作成されたページのURL
-        """
+        """成果物ページを作成し、ページURLを返す"""
         properties: dict = {
             "タイトル": {"title": [{"text": {"content": title}}]},
             "カテゴリ": {"select": {"name": category}},
@@ -85,21 +91,11 @@ class NotionClient:
         return page_url
 
     def update_page_status(self, page_id: str, status: str) -> None:
-        """ページステータスを更新する
-
-        Args:
-            page_id: NotionページID
-            status: 新しいステータス（作成中/完了）
-        """
+        """ページステータスを更新する"""
         payload = {"properties": {"ステータス": {"select": {"name": status}}}}
         self._request_with_retry("PATCH", f"{NOTION_API_BASE}/pages/{page_id}", payload)
 
     def append_blocks(self, page_id: str, blocks: list[dict]) -> None:
-        """ページにブロックを追記する（推敲・品質メタデータ追加用）
-
-        Args:
-            page_id: NotionページID
-            blocks: 追記するブロックのリスト
-        """
+        """ページにブロックを追記する"""
         payload = {"children": blocks}
         self._request_with_retry("PATCH", f"{NOTION_API_BASE}/blocks/{page_id}/children", payload)
