@@ -46,7 +46,13 @@ def call_claude(prompt: str, allowed_tools: list[str] | None = None) -> str:
             wait = 2 ** (attempt + 1)
             logger.warning(
                 "Claude CLI error, retrying",
-                extra={"attempt": attempt + 1, "wait_seconds": wait, "returncode": e.returncode},
+                extra={
+                    "attempt": attempt + 1,
+                    "wait_seconds": wait,
+                    "returncode": e.returncode,
+                    "stderr": e.stderr[:500] if e.stderr else "",
+                    "stdout": e.stdout[:500] if e.stdout else "",
+                },
             )
             time.sleep(wait)
 
