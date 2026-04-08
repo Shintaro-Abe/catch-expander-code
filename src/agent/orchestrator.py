@@ -32,14 +32,14 @@ def call_claude(prompt: str, allowed_tools: list[str] | None = None) -> str:
     Returns:
         CLIのstdout出力（JSON文字列）
     """
-    cmd = ["claude", "-p", prompt, "--model", "opus", "--output-format", "json"]
+    cmd = ["claude", "-p", "-", "--model", "opus", "--output-format", "json"]
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
 
     last_error: subprocess.CalledProcessError | None = None
     for attempt in range(MAX_CLAUDE_RETRIES):
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)  # noqa: S603
+            result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
             return result.stdout
         except subprocess.CalledProcessError as e:
             last_error = e
