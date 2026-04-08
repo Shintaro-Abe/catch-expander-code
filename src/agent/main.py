@@ -29,7 +29,7 @@ def _restore_claude_oauth(secret_arn: str) -> None:
     credential_json = _get_secret(secret_arn)
     claude_dir = Path.home() / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
-    credential_path = claude_dir / "credentials.json"
+    credential_path = claude_dir / ".credentials.json"
     credential_path.write_text(credential_json)
     logger.info("Claude OAuth credentials restored")
 
