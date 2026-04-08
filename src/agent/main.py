@@ -6,13 +6,13 @@ from pathlib import Path
 import boto3
 from notify.slack_client import SlackClient
 from orchestrator import Orchestrator
-from pythonjsonlogger import json_log_formatter
+from pythonjsonlogger.json import JsonFormatter
 from state.dynamodb_client import DynamoDbClient
 
 logger = logging.getLogger("catch-expander-agent")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-handler.setFormatter(json_log_formatter.JSONFormatter())
+handler.setFormatter(JsonFormatter())
 logger.addHandler(handler)
 
 secrets_client = boto3.client("secretsmanager")
