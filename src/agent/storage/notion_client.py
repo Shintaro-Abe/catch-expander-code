@@ -78,16 +78,26 @@ class NotionClient:
         if github_url:
             properties["GitHub URL"] = {"url": github_url}
 
+        # ページ作成（最初の100ブロックのみ含める。Notion APIの上限）
+        max_children = 100
         payload: dict = {
             "parent": {"database_id": self.database_id},
             "properties": properties,
         }
         if content_blocks:
-            payload["children"] = content_blocks
+            payload["children"] = content_blocks[:max_children]
 
         result = self._request_with_retry("POST", f"{NOTION_API_BASE}/pages", payload)
+        page_id = result["id"]
         page_url = result["url"]
-        logger.info("Notion page created", extra={"page_id": result["id"], "url": page_url})
+        logger.info("Notion page created", extra={"page_id": page_id, "url": page_url})
+
+        # 残りのブロックを100件ずつ追記
+        remaining = content_blocks[max_children:]
+        for i in range(0, len(remaining), max_children):
+            chunk = remaining[i : i + max_children]
+            self.append_blocks(page_id, chunk)
+
         return page_url
 
     def update_page_status(self, page_id: str, status: str) -> None:
