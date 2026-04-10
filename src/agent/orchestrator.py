@@ -79,7 +79,12 @@ def _parse_claude_response(raw: str) -> dict:
             text = text.split("```json", 1)[1].split("```", 1)[0]
         elif "```" in text:
             text = text.split("```", 1)[1].split("```", 1)[0]
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # JSONパース失敗時はテキストをそのまま返す
+            logger.warning("Failed to parse Claude response as JSON, returning as text")
+            return {"raw_text": text, "parse_error": True}
     return text
 
 
