@@ -245,7 +245,7 @@ class Orchestrator:
         quality_block = self._build_quality_metadata_block(quality_metadata)
         content_blocks.extend(quality_block)
 
-        notion_url = self.notion.create_page(
+        notion_url, notion_page_id = self.notion.create_page(
             title=topic,
             category=category,
             content_blocks=content_blocks,
@@ -260,7 +260,7 @@ class Orchestrator:
             dir_name = f"{topic.replace(' ', '-').lower()}-{datetime.date.today().strftime('%Y%m%d')}"
             self.github.create_readme(dir_name, code_files.get("readme_content", ""), notion_url)
 
-        self.notion.update_page_status(notion_url.split("-")[-1][:32], "完了")
+        self.notion.update_page_status(notion_page_id, "完了")
 
         # 成果物レコードをDynamoDBに保存
         self.db.put_deliverable(

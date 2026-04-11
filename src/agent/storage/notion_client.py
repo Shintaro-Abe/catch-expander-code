@@ -66,8 +66,8 @@ class NotionClient:
         content_blocks: list[dict],
         github_url: str | None,
         slack_user: str,
-    ) -> str:
-        """成果物ページを作成し、ページURLを返す"""
+    ) -> tuple[str, str]:
+        """成果物ページを作成し、(ページURL, ページID)を返す"""
         properties: dict = {
             "タイトル": {"title": [{"text": {"content": title}}]},
             "カテゴリ": {"select": {"name": category}},
@@ -98,7 +98,7 @@ class NotionClient:
             chunk = remaining[i : i + max_children]
             self.append_blocks(page_id, chunk)
 
-        return page_url
+        return page_url, page_id
 
     def update_page_status(self, page_id: str, status: str) -> None:
         """ページステータスを更新する"""
