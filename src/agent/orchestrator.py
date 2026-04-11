@@ -125,6 +125,63 @@ def _parse_claude_response(raw: str) -> dict:
     return {"raw_text": text, "parse_error": True}
 
 
+def _build_code_generation_prompt(
+    topic: str,
+    category: str,
+    research_results: list[dict],
+    profile_text: str,
+    code_types: list[str],
+) -> str:
+    """コード成果物生成専用プロンプトを構築する
+
+    コード生成をテキスト成果物生成から分離することで、応答サイズ超過によるJSON解析失敗を防ぐ。
+    """
+    code_type_labels = {
+        "iac_code": "IaCコード（Terraform または CloudFormation）",
+        "program_code": "プログラムコード（Python またはユーザープロファイルの技術スタック）",
+    }
+    requested_types = "\n".join(f"- {code_type_labels.get(t, t)}" for t in code_types)
+
+    # 調査サマリーのみ抽出（ソース一覧は省略してプロンプトサイズを抑制）
+    research_summary = "\n\n".join(
+        f"### {r.get('step_id', 'unknown')}\n{r.get('summary', '')}"
+        for r in research_results
+        if not r.get("error") and not r.get("parse_error") and r.get("summary")
+    )
+    if not research_summary:
+        research_summary = "（調査結果なし）"
+
+    return (
+        "# コード成果物生成\n\n"
+        "## 依頼\n\n"
+        "以下のトピックに関するコード成果物のみを生成してください。\n"
+        "テキストコンテンツ（調査レポート等）は不要です。コードファイルのみを出力してください。\n\n"
+        f"トピック: {topic}\n"
+        f"カテゴリ: {category}\n"
+        f"ユーザープロファイル:\n{profile_text}\n\n"
+        "## 生成するコード種別\n\n"
+        f"{requested_types}\n\n"
+        "## 調査結果サマリー\n\n"
+        f"{research_summary}\n\n"
+        "## 出力形式\n\n"
+        "**重要**: 前置き文・説明文は不要です。以下のJSON形式のみを ` ```json ` ブロックで出力してください。\n\n"
+        "```json\n"
+        "{\n"
+        '  "files": {\n'
+        '    "ファイルパス": "ファイル内容（コメント付き）"\n'
+        "  },\n"
+        '  "readme_content": "README.md本文"\n'
+        "}\n"
+        "```\n\n"
+        "## 制約\n\n"
+        "- **PoC品質であることを各ファイルの冒頭コメントで明示**すること\n"
+        "- ハードコードされたシークレット・認証情報を含めない\n"
+        "- プロファイルがない場合はAWS + Python（またはTerraform）を標準として生成\n"
+        "- コードは機能的なスケルトン（実装の骨格）として提供。詳細な業務ロジックは省略可\n"
+        "- ファイル数は最大5ファイルに抑える（main, variables, outputs, README等）\n"
+    )
+
+
 class Orchestrator:
     """マルチエージェントワークフローを制御するオーケストレーター"""
 
@@ -248,6 +305,30 @@ class Orchestrator:
         )
         gen_raw = call_claude(gen_prompt)
         deliverables = _parse_claude_response(gen_raw)
+
+        # 5b. コード成果物の独立生成
+        # ジェネレーターがコードを含む大きな応答を1回で返せない場合のフォールバック:
+        # code_files が null のとき、コード生成専用プロンプトで再試行する
+        generate_step_types = [s.get("deliverable_type") for s in workflow.get("generate_steps", [])]
+        code_types = [t for t in generate_step_types if t in ("iac_code", "program_code")]
+        if code_types and "github" in storage_targets and not deliverables.get("code_files"):
+            logger.info(
+                "Generating code files separately",
+                extra={"execution_id": execution_id, "code_types": code_types},
+            )
+            self.slack.post_progress(slack_channel, slack_thread_ts, "⚙️ コード成果物を生成中...")
+            code_raw = call_claude(
+                _build_code_generation_prompt(topic, category, research_results, profile_text, code_types)
+            )
+            code_result = _parse_claude_response(code_raw)
+            if isinstance(code_result, dict) and code_result.get("files"):
+                deliverables["code_files"] = code_result
+                logger.info("Code files generated successfully", extra={"execution_id": execution_id})
+            else:
+                logger.warning(
+                    "Code file generation returned empty result",
+                    extra={"execution_id": execution_id, "parse_error": code_result.get("parse_error", False)},
+                )
 
         # 6. レビュアー起動 + レビューループ
         self.db.update_execution_status(execution_id, "reviewing")
