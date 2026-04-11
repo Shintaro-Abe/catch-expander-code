@@ -22,17 +22,18 @@ def _load_prompt(name: str) -> str:
     return (PROMPTS_DIR / f"{name}.md").read_text()
 
 
-def call_claude(prompt: str, allowed_tools: list[str] | None = None) -> str:
+def call_claude(prompt: str, allowed_tools: list[str] | None = None, model: str = "sonnet") -> str:
     """Claude Code CLIを呼び出し、結果を返す（リトライ付き）
 
     Args:
         prompt: CLIに渡すプロンプト
         allowed_tools: 許可するツールのリスト
+        model: 使用するモデル名（デフォルト: sonnet）
 
     Returns:
         CLIのstdout出力（JSON文字列）
     """
-    cmd = ["claude", "-p", "-", "--model", "opus", "--output-format", "json"]
+    cmd = ["claude", "-p", "-", "--model", model, "--output-format", "json"]
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
 
@@ -381,7 +382,7 @@ class Orchestrator:
                 f"成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```\n\n"
                 f"出典リスト:\n```json\n{sources_text}\n```"
             )
-            raw = call_claude(review_prompt, allowed_tools=["WebFetch"])
+            raw = call_claude(review_prompt, allowed_tools=["WebFetch"], model="opus")
             review_result = _parse_claude_response(raw)
 
             if review_result.get("passed", False):
