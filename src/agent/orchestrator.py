@@ -65,7 +65,11 @@ def call_claude(prompt: str, allowed_tools: list[str] | None = None, model: str 
 
 def _parse_claude_response(raw: str) -> dict:
     """Claude CLIのJSON応答をパースする"""
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {"raw_text": raw}
+
     # --output-format json の場合、result フィールドに応答本文が入る
     if isinstance(data, dict) and "result" in data:
         text = data["result"]
@@ -74,19 +78,51 @@ def _parse_claude_response(raw: str) -> dict:
     else:
         text = raw
 
-    # 応答テキストからJSONブロックを抽出
-    if isinstance(text, str):
-        if "```json" in text:
-            text = text.split("```json", 1)[1].split("```", 1)[0]
-        elif "```" in text:
-            text = text.split("```", 1)[1].split("```", 1)[0]
+    if not isinstance(text, str):
+        return text
+
+    # 応答テキストからJSONブロックを抽出（複数の戦略で試行）
+
+    # 戦略1: ```json コードブロックから抽出
+    if "```json" in text:
+        candidate = text.split("```json", 1)[1].split("```", 1)[0].strip()
         try:
-            return json.loads(text)
+            return json.loads(candidate)
         except json.JSONDecodeError:
-            # JSONパース失敗時はテキストをそのまま返す
-            logger.warning("Failed to parse Claude response as JSON, returning as text")
-            return {"raw_text": text, "parse_error": True}
-    return text
+            pass
+
+    # 戦略2: ``` コードブロックから抽出
+    if "```" in text:
+        candidate = text.split("```", 1)[1].split("```", 1)[0].strip()
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # 戦略3: テキスト全体を直接JSONパース
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+
+    # 戦略4: テキスト内の有効なJSONオブジェクトをスキャン
+    # raw_decode を使い、前置き文の後に来るJSONを検出する
+    # 小さな（キー数2以下の）断片的なJSONオブジェクトは除外する
+    decoder = json.JSONDecoder()
+    for i, char in enumerate(text):
+        if char == "{":
+            try:
+                obj, _ = decoder.raw_decode(text, i)
+                if isinstance(obj, dict) and len(obj) >= 3:  # noqa: PLR2004
+                    return obj
+            except json.JSONDecodeError:
+                continue
+
+    logger.warning(
+        "Failed to parse Claude response as JSON, returning as text",
+        extra={"text_preview": text[:300]},
+    )
+    return {"raw_text": text, "parse_error": True}
 
 
 class Orchestrator:
@@ -149,6 +185,8 @@ class Orchestrator:
             extra={
                 "execution_id": execution_id,
                 "research_steps": len(workflow.get("research_steps", [])),
+                "generate_steps": [s.get("deliverable_type") for s in workflow.get("generate_steps", [])],
+                "storage_targets": workflow.get("storage_targets", ["notion"]),
             },
         )
 
@@ -232,6 +270,16 @@ class Orchestrator:
         # GitHub格納（コード成果物がある場合）
         github_url = None
         code_files = deliverables.get("code_files")
+        logger.info(
+            "Storage decision",
+            extra={
+                "execution_id": execution_id,
+                "storage_targets": storage_targets,
+                "has_code_files": bool(code_files),
+                "github_triggered": bool(code_files and "github" in storage_targets),
+                "deliverables_parse_error": deliverables.get("parse_error", False),
+            },
+        )
         if code_files and "github" in storage_targets:
             import datetime
 
