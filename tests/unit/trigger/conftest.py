@@ -13,6 +13,9 @@ from unittest.mock import MagicMock
 if "app" not in sys.modules:
     _real_boto3 = sys.modules.get("boto3")
     sys.modules["boto3"] = MagicMock()
+    # boto3.dynamodb.conditions はパッケージ階層として登録しないと from import が失敗する
+    sys.modules["boto3.dynamodb"] = MagicMock()
+    sys.modules["boto3.dynamodb.conditions"] = MagicMock()
     try:
         import app  # noqa: F401
     finally:
@@ -20,3 +23,5 @@ if "app" not in sys.modules:
             sys.modules["boto3"] = _real_boto3
         else:
             sys.modules.pop("boto3", None)
+        sys.modules.pop("boto3.dynamodb", None)
+        sys.modules.pop("boto3.dynamodb.conditions", None)

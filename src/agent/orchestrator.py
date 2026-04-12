@@ -212,7 +212,18 @@ class Orchestrator:
 
         # 1. プロファイル取得
         profile = self.db.get_user_profile(user_id) or {}
-        profile_text = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
+        profile_text_base = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
+        learned_prefs = profile.get("learned_preferences", [])
+        if learned_prefs:
+            prefs_lines = "\n".join(f"- {p['text']}" for p in learned_prefs)
+            profile_text = (
+                f"{profile_text_base}\n\n"
+                "## ユーザーの蓄積された好み（学習済み）\n"
+                "以下の好みを成果物の生成方針に必ず反映してください：\n"
+                f"{prefs_lines}"
+            )
+        else:
+            profile_text = profile_text_base
 
         # 2. トピック解析
         orchestrator_prompt = _load_prompt("orchestrator")

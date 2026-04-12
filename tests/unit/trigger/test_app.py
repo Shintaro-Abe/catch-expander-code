@@ -286,3 +286,230 @@ class TestAckAndEcsRunTask:
 
         assert result["statusCode"] == 200
         mock_ecs.run_task.assert_called_once()
+
+
+@pytest.mark.usefixtures("_env_vars")
+class TestFindCompletedExecution:
+    """_find_completed_execution 関数のテスト"""
+
+    @patch("app.dynamodb")
+    def test_returns_item_when_thread_ts_matches(self, mock_dynamodb):
+        from app import _find_completed_execution
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [{"execution_id": "exec-001", "status": "completed", "slack_thread_ts": "111.000"}]
+        }
+
+        result = _find_completed_execution("U_USER", "111.000", "test-prefix")
+
+        assert result is not None
+        assert result["execution_id"] == "exec-001"
+        # status フィルタはクエリに含まれない（呼び出し側で判定する）
+        call_kwargs = mock_table.query.call_args[1]
+        assert call_kwargs["IndexName"] == "user-id-index"
+
+    @patch("app.dynamodb")
+    def test_returns_item_regardless_of_status(self, mock_dynamodb):
+        """status != completed であっても Items があれば返す（status 判定は呼び出し側）"""
+        from app import _find_completed_execution
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [{"execution_id": "exec-002", "status": "in_progress", "slack_thread_ts": "111.000"}]
+        }
+
+        result = _find_completed_execution("U_USER", "111.000", "test-prefix")
+        assert result is not None
+        assert result["status"] == "in_progress"
+
+    @patch("app.dynamodb")
+    def test_returns_none_when_no_items(self, mock_dynamodb):
+        from app import _find_completed_execution
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {"Items": []}
+
+        result = _find_completed_execution("U_USER", "111.000", "test-prefix")
+        assert result is None
+
+
+@pytest.mark.usefixtures("_env_vars")
+class TestFeedbackDetection:
+    """フィードバック検出フローのテスト"""
+
+    def _make_secrets_side_effect(self):
+        return lambda SecretId: {  # noqa: N803
+            "arn:aws:secretsmanager:ap-northeast-1:123:secret:signing": {"SecretString": SIGNING_SECRET},
+            "arn:aws:secretsmanager:ap-northeast-1:123:secret:bot-token": {"SecretString": "xoxb-test"},
+        }[SecretId]
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_thread_reply_to_completed_execution_triggers_feedback(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb, mock_ecs
+    ):
+        """スレッド返信 + 完了済み実行あり → ACK投稿 + TASK_TYPE=feedback でECS起動"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [{"execution_id": "exec-001", "status": "completed", "slack_thread_ts": "111.000"}]
+        }
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> コードが参考になりました",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "222.000",
+                "thread_ts": "111.000",
+            },
+        }
+        event = _make_event(body)
+        result = lambda_handler(event, _make_lambda_context())
+
+        assert result["statusCode"] == 200
+
+        # ACK がスレッドに投稿されること
+        mock_slack.chat_postMessage.assert_called_once()
+        call_kwargs = mock_slack.chat_postMessage.call_args[1]
+        assert call_kwargs["thread_ts"] == "111.000"
+        assert "フィードバック" in call_kwargs["text"]
+
+        # ECS が TASK_TYPE=feedback で起動されること
+        mock_ecs.run_task.assert_called_once()
+        env_vars = {
+            e["name"]: e["value"]
+            for e in mock_ecs.run_task.call_args[1]["overrides"]["containerOverrides"][0]["environment"]
+        }
+        assert env_vars["TASK_TYPE"] == "feedback"
+        assert env_vars["USER_ID"] == "U_USER"
+        assert env_vars["EXECUTION_ID"] == "exec-001"
+        assert env_vars["SLACK_THREAD_TS"] == "111.000"
+        assert "TOPIC" not in env_vars  # 新規トピックフローの環境変数は含まれない
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_thread_reply_to_in_progress_execution_is_ignored(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb, mock_ecs
+    ):
+        """スレッド返信 + status=in_progress の実行 → 無視（HTTP 200、新規トピックフローに入らない）"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [{"execution_id": "exec-002", "status": "in_progress", "slack_thread_ts": "111.000"}]
+        }
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> 良かったです",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "222.000",
+                "thread_ts": "111.000",
+            },
+        }
+        event = _make_event(body)
+        result = lambda_handler(event, _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_ecs.run_task.assert_not_called()
+        mock_webclient_cls.assert_not_called()  # Slack への投稿なし
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_thread_reply_with_no_matching_execution_falls_through_to_topic_flow(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb, mock_ecs
+    ):
+        """スレッド返信 + 実行レコードなし → 新規トピックフロー"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+        mock_slack.chat_postMessage.return_value = {"ts": "333.000"}
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {"Items": []}
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> 別トピック",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "222.000",
+                "thread_ts": "111.000",
+            },
+        }
+        event = _make_event(body)
+        result = lambda_handler(event, _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        # 新規トピックフロー（ECS起動）が実行されること
+        mock_ecs.run_task.assert_called_once()
+        env_vars = {
+            e["name"]: e["value"]
+            for e in mock_ecs.run_task.call_args[1]["overrides"]["containerOverrides"][0]["environment"]
+        }
+        assert env_vars.get("TASK_TYPE", "topic") != "feedback"  # feedback ルートではない
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_non_thread_message_goes_to_topic_flow(self, mock_secrets, mock_webclient_cls, mock_dynamodb, mock_ecs):
+        """スレッドなし（トップレベル投稿）→ DynamoDB クエリなしで新規トピックフロー"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+        mock_slack.chat_postMessage.return_value = {"ts": "444.000"}
+        mock_dynamodb.Table.return_value = MagicMock()
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> Terraform入門",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "444.000",
+                # thread_ts なし
+            },
+        }
+        event = _make_event(body)
+        result = lambda_handler(event, _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_ecs.run_task.assert_called_once()
+        env_vars = {
+            e["name"]: e["value"]
+            for e in mock_ecs.run_task.call_args[1]["overrides"]["containerOverrides"][0]["environment"]
+        }
+        assert env_vars["TOPIC"] == "Terraform入門"

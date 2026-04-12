@@ -77,3 +77,43 @@ class TestSlackClient:
         with pytest.raises(SlackApiError):
             client.post_progress("C1", "ts1", "test")
         assert client.client.chat_postMessage.call_count == 3
+
+    def test_post_feedback_result_single_preference(self):
+        client = self._make_client()
+        client.client = MagicMock()
+        prefs = [{"text": "Terraformはmodule分割する", "replaces_index": None}]
+
+        client.post_feedback_result("C1", "ts1", prefs, 1)
+
+        call_kwargs = client.client.chat_postMessage.call_args[1]
+        assert "✅" in call_kwargs["text"]
+        assert "Terraformはmodule分割する" in call_kwargs["text"]
+        assert "1 件" in call_kwargs["text"]
+
+    def test_post_feedback_result_multiple_preferences(self):
+        client = self._make_client()
+        client.client = MagicMock()
+        prefs = [
+            {"text": "好み1", "replaces_index": None},
+            {"text": "好み2", "replaces_index": None},
+        ]
+
+        client.post_feedback_result("C1", "ts1", prefs, 5)
+
+        call_kwargs = client.client.chat_postMessage.call_args[1]
+        text = call_kwargs["text"]
+        assert "好み1" in text
+        assert "好み2" in text
+        assert "5 件" in text
+
+    def test_post_feedback_unextracted(self):
+        client = self._make_client()
+        client.client = MagicMock()
+
+        client.post_feedback_unextracted("C1", "ts1")
+
+        call_kwargs = client.client.chat_postMessage.call_args[1]
+        assert call_kwargs["channel"] == "C1"
+        assert call_kwargs["thread_ts"] == "ts1"
+        assert "📝" in call_kwargs["text"]
+        assert "抽出できませんでした" in call_kwargs["text"]

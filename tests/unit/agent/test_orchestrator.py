@@ -277,3 +277,84 @@ class TestReviewLoop:
         result = orch._run_review_loop("prompt", {"content_blocks": []}, [], "技術", "gen_prompt", "C1", "ts1")
         assert result["passed"] is True
         assert mock_claude.call_count == 3
+
+
+class TestLearnedPreferencesInProfileText:
+    """learned_preferences が profile_text に反映されるテスト"""
+
+    def _make_minimal_responses(self):
+        """run() を最後まで通すための最小限の Claude 応答列"""
+        analysis = {"category": "技術", "intent": "学習", "perspectives": [], "deliverable_types": ["research_report"]}
+        workflow = {
+            "research_steps": [{"step_id": "r-1", "step_name": "概要", "description": "概要調査", "search_hints": []}],
+            "generate_steps": [{"step_id": "g-1", "step_name": "レポート", "deliverable_type": "research_report"}],
+            "storage_targets": ["notion"],
+        }
+        research = {"step_id": "r-1", "summary": "概要", "sources": []}
+        deliverables = {"content_blocks": [], "code_files": None, "summary": "完成"}
+        review = {"passed": True, "issues": [], "quality_metadata": {}}
+        return [
+            json.dumps({"result": json.dumps(analysis)}),
+            json.dumps({"result": json.dumps(workflow)}),
+            json.dumps({"result": json.dumps(research)}),
+            json.dumps({"result": json.dumps(deliverables)}),
+            json.dumps({"result": json.dumps(review)}),
+        ]
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_learned_preferences_included_in_prompts(self, mock_call_claude, _mock_load):
+        """learned_preferences が1件以上ある場合、最初の call_claude 呼び出しに好みが含まれる"""
+        from orchestrator import Orchestrator
+
+        mock_call_claude.side_effect = self._make_minimal_responses()
+
+        db = MagicMock()
+        db.get_user_profile.return_value = {
+            "user_id": "U1",
+            "role": "エンジニア",
+            "learned_preferences": [
+                {"text": "Terraformはmodule分割する", "created_at": "2026-01-01T00:00:00Z"},
+            ],
+        }
+        db._table.return_value = MagicMock()
+
+        slack = MagicMock()
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+
+        orch.run("exec-1", "U1", "Terraform入門", "C1", "ts1")
+
+        # トピック解析プロンプト（最初の呼び出し）に好みセクションが含まれる
+        first_prompt = mock_call_claude.call_args_list[0][0][0]
+        assert "Terraformはmodule分割する" in first_prompt
+        assert "蓄積された好み" in first_prompt
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_empty_learned_preferences_not_included_in_prompts(self, mock_call_claude, _mock_load):
+        """learned_preferences が空の場合、profile_text に好みセクションが含まれない"""
+        from orchestrator import Orchestrator
+
+        mock_call_claude.side_effect = self._make_minimal_responses()
+
+        db = MagicMock()
+        db.get_user_profile.return_value = {
+            "user_id": "U1",
+            "role": "エンジニア",
+            # learned_preferences なし（既存ユーザー）
+        }
+        db._table.return_value = MagicMock()
+
+        slack = MagicMock()
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+
+        orch.run("exec-1", "U1", "Terraform入門", "C1", "ts1")
+
+        first_prompt = mock_call_claude.call_args_list[0][0][0]
+        assert "蓄積された好み" not in first_prompt

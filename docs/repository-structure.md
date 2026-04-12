@@ -48,6 +48,9 @@ Catch-Expander/
 │   └── agent/                         # ECS エージェントアプリケーション
 │       ├── __init__.py
 │       ├── orchestrator.py            # オーケストレーターエージェント
+│       ├── feedback/                  # フィードバック学習（F8）
+│       │   ├── __init__.py
+│       │   └── feedback_processor.py  # フィードバック解析・プロファイル更新
 │       ├── storage/                   # 外部ストレージ連携
 │       │   ├── __init__.py
 │       │   ├── notion_client.py       # Notion API操作
@@ -70,6 +73,7 @@ Catch-Expander/
 │   │   └── agent/
 │   │       ├── __init__.py
 │   │       ├── test_orchestrator.py
+│   │       ├── test_feedback_processor.py  # F8 フィードバック学習テスト
 │   │       ├── test_notion_client.py
 │   │       ├── test_github_client.py
 │   │       └── test_slack_client.py
@@ -118,6 +122,7 @@ Claude Code CLIを使ってマルチAIエージェントを実行するメイン
 
 | サブディレクトリ | 役割 |
 |----------------|------|
+| `feedback/` | フィードバック解析・`learned_preferences` 更新（F8） |
 | `storage/` | Notion API・GitHub APIの操作 |
 | `state/` | DynamoDBによるワークフロー状態管理 |
 | `notify/` | Slack通知の送信 |

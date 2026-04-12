@@ -57,3 +57,25 @@ class SlackClient:
     def post_error(self, channel: str, thread_ts: str, error_message: str) -> None:
         """エラー通知をスレッドに投稿"""
         self._post_with_retry(channel, thread_ts, f"❌ {error_message}")
+
+    def post_feedback_result(
+        self,
+        channel: str,
+        thread_ts: str,
+        preferences: list[dict],
+        total_count: int,
+    ) -> None:
+        """フィードバック記録完了通知をスレッドに投稿"""
+        lines = ["✅ フィードバックを記録しました。次回から以下の好みを反映します："]
+        for p in preferences:
+            lines.append(f"• {p['text']}")
+        lines.append(f"（現在 {total_count} 件の好みが登録されています）")
+        self._post_with_retry(channel, thread_ts, "\n".join(lines))
+
+    def post_feedback_unextracted(self, channel: str, thread_ts: str) -> None:
+        """具体的な好みが抽出できなかった場合の通知をスレッドに投稿"""
+        text = (
+            "📝 フィードバックを受け取りました。具体的な好みを抽出できませんでしたが、参考にします。\n"
+            "もう少し詳しく教えていただけると、より精度の高い反映ができます。"
+        )
+        self._post_with_retry(channel, thread_ts, text)

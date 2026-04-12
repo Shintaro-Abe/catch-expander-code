@@ -7,10 +7,12 @@
 ```mermaid
 graph TB
     User[ユーザー] -->|トピック送信| Slack[Slack]
+    User -->|フィードバック投稿<br/>完了通知スレッドへ| Slack
     Slack -->|イベント通知| Gateway[API Gateway]
     Gateway -->|リクエスト転送| Lambda[Lambda<br/>トリガー関数]
     Lambda -->|ACK応答| Slack
-    Lambda -->|RunTask| Orch
+    Lambda -->|RunTask<br/>TASK_TYPE=topic| Orch
+    Lambda -->|RunTask<br/>TASK_TYPE=feedback| FP
 
     subgraph MultiAgent [マルチAIエージェント / ECS Container]
         Orch[オーケストレーター<br/>エージェント]
@@ -19,15 +21,18 @@ graph TB
         Orch -->|調査指示| ResearcherN[リサーチャー<br/>エージェント N]
         Orch -->|生成指示| Generator[ジェネレーター<br/>エージェント]
         Orch -->|レビュー依頼| Reviewer[レビュアー<br/>エージェント]
+        FP[フィードバック<br/>プロセッサー]
     end
 
-    Orch -->|プロファイル取得| ProfileDB[(プロファイルDB<br/>DynamoDB)]
+    Orch -->|プロファイル取得<br/>（learned_preferences 含む）| ProfileDB[(プロファイルDB<br/>DynamoDB)]
+    FP -->|preferences 更新| ProfileDB
     Researcher1 -->|Web検索| SearchAPI[Web検索API]
     Researcher2 -->|Web検索| SearchAPI
     ResearcherN -->|Web検索| SearchAPI
     Orch -->|レポート格納| NotionAPI[Notion API]
     Orch -->|コード格納| GitHubAPI[GitHub API]
     Orch -->|進捗・完了通知| Slack
+    FP -->|記録完了通知| Slack
 
     style Lambda fill:#ff9800,color:#fff
     style Orch fill:#f9a825,color:#000
@@ -37,6 +42,7 @@ graph TB
     style ResearcherN fill:#42a5f5,color:#fff
     style Generator fill:#66bb6a,color:#fff
     style Reviewer fill:#ef5350,color:#fff
+    style FP fill:#ab47bc,color:#fff
 ```
 
 ### マルチAIエージェント構成
@@ -89,12 +95,13 @@ graph TB
 |--------------|------|---------|
 | Slack Bot App | ユーザーとのインターフェース（入力受付・通知） | Slack |
 | API Gateway | Slackイベントの受信・ルーティング | API Gateway |
-| トリガー関数 | Slack署名検証、ACK応答、ECSタスク起動 | Lambda |
-| オーケストレーターエージェント | トピック解析、ワークフロー設計、全体制御 | ECS Container（Claude Code CLI） |
+| トリガー関数 | Slack署名検証、ACK応答、ECSタスク起動、フィードバック検出 | Lambda |
+| オーケストレーターエージェント | トピック解析、ワークフロー設計、全体制御（learned_preferences 反映） | ECS Container（Claude Code CLI） |
 | リサーチャーエージェント（×N） | Web検索による情報収集・要約 | ECS Container（Claude Code Agentツール） |
 | ジェネレーターエージェント | 成果物の生成・推敲 | ECS Container（Claude Code Agentツール） |
 | レビュアーエージェント | ソース検証・セルフレビュー・品質メタデータ付与 | ECS Container（Claude Code Agentツール） |
-| プロファイルDB | ユーザープロファイルの永続化 | DynamoDB |
+| フィードバックプロセッサー | フィードバック解析・preferences 抽出・プロファイル更新（TASK_TYPE=feedback） | ECS Container（Claude Code CLI） |
+| プロファイルDB | ユーザープロファイルの永続化（learned_preferences 含む） | DynamoDB |
 | Claude Sonnet 4.6 / Opus 4.6 | 全エージェントの推論エンジン（Sonnet: 通常ステップ、Opus: 品質レビューのみ） | Maxプラン（Claude Code CLI経由） |
 | Web検索 | インターネット情報の検索 | Claude Code組み込み（WebSearch/WebFetch） |
 | Notion API | 成果物ページの作成・更新 | 外部API |
@@ -114,6 +121,7 @@ erDiagram
         string[] expertise "専門領域"
         string[] interests "関心領域"
         string org_context "組織コンテキスト"
+        list learned_preferences "学習済み好み（最大10件）"
         datetime created_at
         datetime updated_at
     }
@@ -714,7 +722,78 @@ sequenceDiagram
     CE->>S: ✅ プロファイルを保存しました（確認内容を表示）
 ```
 
-## 6. エラーハンドリング
+## 6. F8 フィードバック学習
+
+### フロー概要
+
+```
+[ユーザー] 完了通知スレッドにフィードバックを自由テキストで投稿
+      ↓
+[Lambda] thread_ts で完了済み実行を特定 → ECS起動（TASK_TYPE=feedback）
+      ↓
+[ECS / FeedbackProcessor] Claude がフィードバックを解析 → preferences 抽出
+      ↓
+[DynamoDB] user-profiles の learned_preferences を更新（最大10件）
+      ↓
+[Slack] 記録された好みの一覧を同スレッドに通知
+      ↓
+[次回トピック処理] オーケストレーターが learned_preferences を読んでプロンプトに反映
+```
+
+### フィードバック検出ロジック（Lambda）
+
+| 条件 | 動作 |
+|------|------|
+| スレッド返信 + 対応する完了済み実行あり（`status == "completed"`） | フィードバックルート：ACK投稿 → ECS起動（`TASK_TYPE=feedback`） |
+| スレッド返信 + 実行レコードはあるが `status != "completed"` | 無視（HTTP 200 のみ） |
+| スレッド返信 + 実行レコードなし | 新規トピックとして既存フローへ fall through |
+| スレッドなし（トップレベル投稿）| 新規トピックとして既存フロー |
+
+フィードバック検出は既存の `user-id-index` GSI（PK: `user_id`）と `slack_thread_ts` フィールドを流用する。新規 AWS リソースは追加しない。
+
+### FeedbackProcessor コンポーネント
+
+```
+src/agent/feedback/
+└── feedback_processor.py
+    ├── process()               # メインエントリーポイント
+    ├── _build_extraction_prompt()  # Claude への入力プロンプト構築
+    └── _merge_preferences()    # 好みリストのマージ（最大10件、古い順削除）
+```
+
+`FeedbackProcessor` は `call_claude` / `_parse_claude_response`（`orchestrator.py`）を再利用する。
+
+### learned_preferences フィールド仕様
+
+`user-profiles` テーブルに追加される `learned_preferences` フィールドのフォーマット：
+
+```json
+"learned_preferences": [
+  {
+    "text": "Terraformコードはmoduleを分割してディレクトリ構造で管理する",
+    "created_at": "2026-04-12T12:34:56.789Z"
+  }
+]
+```
+
+- 最大10件。超過時は先頭（最古）から削除
+- スキーマレスのため既存レコードへの影響なし（未存在フィールドは空リストとして扱う）
+
+### 生成プロンプトへの反映（Orchestrator）
+
+`Orchestrator.run()` の `profile_text` 構築時に `learned_preferences` を末尾に追記する。
+この1ヶ所の変更でトピック解析・ワークフロー設計・生成の3プロンプトすべてに反映される。
+
+```
+## ユーザーの蓄積された好み（学習済み）
+以下の好みを成果物の生成方針に必ず反映してください：
+- Terraformコードはmoduleを分割してディレクトリ構造で管理する
+- 説明は箇条書きで要点のみ、本文を長くしない
+```
+
+`learned_preferences` が空の場合はセクション自体を追記しない（既存動作を維持）。
+
+## 7. エラーハンドリング
 
 ### エラー種別と対応
 

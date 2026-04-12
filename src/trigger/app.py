@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import boto3
 from aws_lambda_powertools import Logger
+from boto3.dynamodb.conditions import Attr, Key
 from slack_sdk import WebClient
 from slack_verify import verify_slack_signature
 
@@ -15,6 +16,21 @@ dynamodb = boto3.resource("dynamodb")
 ecs_client = boto3.client("ecs")
 
 _cached_secrets: dict[str, str] = {}
+
+
+def _find_completed_execution(user_id: str, thread_ts: str, table_prefix: str) -> dict | None:
+    """workflow-executions テーブルを user-id-index GSI でクエリし、
+    指定 thread_ts に一致する実行レコードを返す。
+    見つからない場合は None を返す。status の判定は呼び出し側で行う。
+    """
+    table = dynamodb.Table(f"{table_prefix}-workflow-executions")
+    response = table.query(
+        IndexName="user-id-index",
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        FilterExpression=Attr("slack_thread_ts").eq(thread_ts),
+    )
+    items = response.get("Items", [])
+    return items[0] if items else None
 
 
 def _get_secret(arn: str) -> str:
@@ -82,6 +98,65 @@ def lambda_handler(event: dict, context: object) -> dict:
         return {"statusCode": 200, "body": ""}
 
     logger.info("Topic received", extra={"user_id": user_id, "topic": topic})
+
+    # フィードバック検出（スレッド返信かどうかを判定）
+    event_thread_ts = event_data.get("thread_ts")
+    event_msg_ts = event_data.get("ts", "")
+    is_thread_reply = bool(event_thread_ts and event_thread_ts != event_msg_ts)
+
+    if is_thread_reply:
+        table_prefix_fb = os.environ["DYNAMODB_TABLE_PREFIX"]
+        execution = _find_completed_execution(user_id, event_thread_ts, table_prefix_fb)
+        if execution is not None:
+            if execution.get("status") == "completed":
+                # フィードバックルート: ACK投稿 → ECS起動（TASK_TYPE=feedback）
+                slack_bot_token_fb = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
+                slack_client_fb = WebClient(token=slack_bot_token_fb)
+                slack_client_fb.chat_postMessage(
+                    channel=channel,
+                    thread_ts=event_thread_ts,
+                    text="📝 フィードバックを受け取りました。プロファイルに反映中...",
+                )
+                ecs_client.run_task(
+                    cluster=os.environ["ECS_CLUSTER_ARN"],
+                    taskDefinition=os.environ["ECS_TASK_DEFINITION_ARN"],
+                    launchType="FARGATE",
+                    networkConfiguration={
+                        "awsvpcConfiguration": {
+                            "subnets": [
+                                os.environ["ECS_SUBNET_1"],
+                                os.environ["ECS_SUBNET_2"],
+                            ],
+                            "securityGroups": [os.environ["ECS_SECURITY_GROUP"]],
+                            "assignPublicIp": "ENABLED",
+                        }
+                    },
+                    overrides={
+                        "containerOverrides": [
+                            {
+                                "name": "agent",
+                                "environment": [
+                                    {"name": "TASK_TYPE", "value": "feedback"},
+                                    {"name": "USER_ID", "value": user_id},
+                                    {"name": "FEEDBACK_TEXT", "value": topic},
+                                    {"name": "EXECUTION_ID", "value": execution["execution_id"]},
+                                    {"name": "SLACK_CHANNEL", "value": channel},
+                                    {"name": "SLACK_THREAD_TS", "value": event_thread_ts},
+                                ],
+                            }
+                        ]
+                    },
+                )
+                logger.info("Feedback task started", extra={"execution_id": execution["execution_id"]})
+                return {"statusCode": 200, "body": ""}
+            else:
+                # 実行レコードはあるが status != "completed" → 無視
+                logger.info(
+                    "Thread reply to non-completed execution, ignoring",
+                    extra={"status": execution.get("status")},
+                )
+                return {"statusCode": 200, "body": ""}
+        # execution is None → 新規トピックフローへ fall through
 
     # SlackへACKメッセージ投稿
     slack_bot_token = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
