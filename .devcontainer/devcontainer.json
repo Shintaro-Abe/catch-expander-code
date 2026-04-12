@@ -1,7 +1,7 @@
 {
-  "name": "claude-code-book-template",
+  "name": "Catch-Expander",
   "image": "mcr.microsoft.com/devcontainers/base:bookworm",
-  "workspaceFolder": "/workspaces/claude-code-book-template",
+  "workspaceFolder": "/workspaces/Catch-Expander",
   "features": {
     "ghcr.io/devcontainers/features/node:1": {},
     "ghcr.io/devcontainers/features/github-cli:1": {}

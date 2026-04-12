@@ -91,8 +91,7 @@ class TestParseClaudeResponse:
 
         # Claudeが前置き文をつけた場合のシミュレーション
         prose_with_json = (
-            "以下が調査結果です。\n\n"
-            '{"step_id": "r-1", "summary": "概要", "sources": [], "extra": "data"}'
+            '以下が調査結果です。\n\n{"step_id": "r-1", "summary": "概要", "sources": [], "extra": "data"}'
         )
         raw = json.dumps({"result": prose_with_json})
         result = _parse_claude_response(raw)
@@ -118,7 +117,7 @@ class TestParseClaudeResponse:
         # 最初の {} はキー1個の断片的JSON。その後に本体JSONが来る
         text_with_small_fragment = (
             'The format is {"type": "text"}. '
-            'Here is the full output: '
+            "Here is the full output: "
             '{"step_id": "r-3", "summary": "full result", "sources": [], "extra": "more"}'
         )
         raw = json.dumps({"result": text_with_small_fragment})

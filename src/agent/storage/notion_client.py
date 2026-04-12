@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import time
 
@@ -32,10 +33,8 @@ class NotionClient:
             except requests.HTTPError as e:
                 last_error = e
                 response_body = ""
-                try:
+                with contextlib.suppress(Exception):
                     response_body = e.response.text[:1000]
-                except Exception:
-                    pass
                 # 4xxはクライアントエラーのためリトライしない
                 if e.response.status_code < 500:
                     logger.error(

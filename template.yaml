@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Catch Expander - AI agent that autonomously researches topics and generates deliverables
+
+Parameters:
+  SlackBotTokenSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret for Slack Bot Token
+  SlackSigningSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret for Slack Signing Secret
+  NotionTokenSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret for Notion Integration Token
+  GitHubTokenSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret for GitHub Fine-grained PAT
+  ClaudeOAuthSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret for Claude Code OAuth credentials
+  NotionDatabaseId:
+    Type: String
+    Description: Notion database ID for deliverables
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository for code deliverables (owner/repo)
+  DynamoDbTablePrefix:
+    Type: String
+    Default: catch-expander
+    Description: Prefix for DynamoDB table names
+  AgentImageUri:
+    Type: String
+    Description: ECR image URI for the agent container
+    Default: ""
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - arm64
+
+Resources:
+  # ==============================================================
+  # VPC
+  # ==============================================================
+  AgentVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: catch-expander-vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AgentVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: catch-expander-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AgentVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: catch-expander-public-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: catch-expander-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AgentVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AgentVpc
+      Tags:
+        - Key: Name
+          Value: catch-expander-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Catch Expander ECS tasks
+      VpcId: !Ref AgentVpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound only
+      Tags:
+        - Key: Name
+          Value: catch-expander-sg
+
+  # ==============================================================
+  # DynamoDB
+  # ==============================================================
+  UserProfilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DynamoDbTablePrefix}-user-profiles
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+
+  WorkflowExecutionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DynamoDbTablePrefix}-workflow-executions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: execution_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: execution_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  WorkflowStepsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DynamoDbTablePrefix}-workflow-steps
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: execution_id
+          AttributeType: S
+        - AttributeName: step_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: execution_id
+          KeyType: HASH
+        - AttributeName: step_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  DeliverablesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DynamoDbTablePrefix}-deliverables
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: execution_id
+          AttributeType: S
+        - AttributeName: deliverable_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: execution_id
+          KeyType: HASH
+        - AttributeName: deliverable_id
+          KeyType: RANGE
+
+  SourcesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DynamoDbTablePrefix}-sources
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: execution_id
+          AttributeType: S
+        - AttributeName: source_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: execution_id
+          KeyType: HASH
+        - AttributeName: source_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ==============================================================
+  # ECR
+  # ==============================================================
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: catch-expander-agent
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only 5 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # ==============================================================
+  # ECS
+  # ==============================================================
+  AgentCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: catch-expander-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+
+  AgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/catch-expander-agent
+      RetentionInDays: 30
+
+  AgentTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CatchExpanderAgentTaskExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SlackBotTokenSecretArn
+                  - !Ref SlackSigningSecretArn
+                  - !Ref NotionTokenSecretArn
+                  - !Ref GitHubTokenSecretArn
+                  - !Ref ClaudeOAuthSecretArn
+
+  AgentTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CatchExpanderAgentTaskRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt UserProfilesTable.Arn
+                  - !GetAtt WorkflowExecutionsTable.Arn
+                  - !GetAtt WorkflowStepsTable.Arn
+                  - !GetAtt DeliverablesTable.Arn
+                  - !GetAtt SourcesTable.Arn
+                  - !Sub ${WorkflowExecutionsTable.Arn}/index/*
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SlackBotTokenSecretArn
+                  - !Ref NotionTokenSecretArn
+                  - !Ref GitHubTokenSecretArn
+                  - !Ref ClaudeOAuthSecretArn
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt AgentLogGroup.Arn
+                  - !Sub ${AgentLogGroup.Arn}:*
+
+  AgentTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: catch-expander-agent
+      Cpu: "1024"
+      Memory: "2048"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt AgentTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt AgentTaskRole.Arn
+      ContainerDefinitions:
+        - Name: agent
+          Image: !If
+            - HasAgentImageUri
+            - !Ref AgentImageUri
+            - !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentRepository}:latest
+          Essential: true
+          Environment:
+            - Name: NOTION_DATABASE_ID
+              Value: !Ref NotionDatabaseId
+            - Name: GITHUB_REPO
+              Value: !Ref GitHubRepo
+            - Name: DYNAMODB_TABLE_PREFIX
+              Value: !Ref DynamoDbTablePrefix
+            - Name: SLACK_BOT_TOKEN_SECRET_ARN
+              Value: !Ref SlackBotTokenSecretArn
+            - Name: NOTION_TOKEN_SECRET_ARN
+              Value: !Ref NotionTokenSecretArn
+            - Name: GITHUB_TOKEN_SECRET_ARN
+              Value: !Ref GitHubTokenSecretArn
+            - Name: CLAUDE_OAUTH_SECRET_ARN
+              Value: !Ref ClaudeOAuthSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AgentLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: agent
+
+  # ==============================================================
+  # Lambda + API Gateway
+  # ==============================================================
+  SlackApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: catch-expander-api
+      StageName: Prod
+      EndpointConfiguration:
+        Type: REGIONAL
+      MethodSettings:
+        - HttpMethod: "*"
+          ResourcePath: "/*"
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+
+  TriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-trigger
+      Handler: app.lambda_handler
+      CodeUri: src/trigger/
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_PREFIX: !Ref DynamoDbTablePrefix
+          ECS_CLUSTER_ARN: !GetAtt AgentCluster.Arn
+          ECS_TASK_DEFINITION_ARN: !Ref AgentTaskDefinition
+          ECS_SUBNET_1: !Ref PublicSubnet1
+          ECS_SUBNET_2: !Ref PublicSubnet2
+          ECS_SECURITY_GROUP: !GetAtt AgentSecurityGroup.GroupId
+          SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
+          SLACK_SIGNING_SECRET_ARN: !Ref SlackSigningSecretArn
+      Events:
+        SlackEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SlackApi
+            Path: /slack/events
+            Method: POST
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource:
+                - !GetAtt WorkflowExecutionsTable.Arn
+            - Effect: Allow
+              Action:
+                - ecs:RunTask
+              Resource:
+                - !Ref AgentTaskDefinition
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:
+                - !GetAtt AgentTaskExecutionRole.Arn
+                - !GetAtt AgentTaskRole.Arn
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref SlackBotTokenSecretArn
+                - !Ref SlackSigningSecretArn
+
+Conditions:
+  HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
+
+Outputs:
+  SlackApiUrl:
+    Description: API Gateway endpoint URL for Slack events
+    Value: !Sub https://${SlackApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/slack/events
+
+  AgentRepositoryUri:
+    Description: ECR repository URI for agent container image
+    Value: !GetAtt AgentRepository.RepositoryUri
+
+  AgentClusterArn:
+    Description: ECS cluster ARN
+    Value: !GetAtt AgentCluster.Arn
+
+  AgentTaskDefinitionArn:
+    Description: ECS task definition ARN
+    Value: !Ref AgentTaskDefinition
