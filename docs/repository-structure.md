@@ -47,6 +47,7 @@ Catch-Expander/
 │   │
 │   └── agent/                         # ECS エージェントアプリケーション
 │       ├── __init__.py
+│       ├── main.py                    # ECSタスクエントリポイント（TASK_TYPE分岐）
 │       ├── orchestrator.py            # オーケストレーターエージェント
 │       ├── feedback/                  # フィードバック学習（F8）
 │       │   ├── __init__.py
@@ -95,7 +96,7 @@ Catch-Expander/
 ```
 
 > **デプロイ時に別途作成するファイル（リポジトリ外管理）**
-> `src/agent/Dockerfile`、`src/agent/main.py`、`src/agent/prompts/*.md`、`src/agent/requirements.txt` は
+> `src/agent/Dockerfile`、`src/agent/prompts/*.md`、`src/agent/requirements.txt` は
 > デプロイ時にリポジトリ外で作成・管理される。設計仕様は `docs/architecture.md` を参照のこと。
 
 ## 3. ディレクトリの役割
@@ -183,4 +184,5 @@ Claude Code CLIを使ってマルチAIエージェントを実行するメイン
 
 | ファイル | 説明 |
 |---------|------|
+| `src/agent/main.py` | ECSタスクエントリポイント。`TASK_TYPE` 環境変数でフィードバック処理とワークフロー実行を分岐 |
 | `src/agent/orchestrator.py` | Claude Code CLIの呼び出し、サブエージェント管理、ワークフロー制御 |
