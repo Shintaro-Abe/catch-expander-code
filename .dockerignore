@@ -1,0 +1,14 @@
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+tests/
+.steering/
+docs/
+.aws-sam/
+.vscode/
+*.md
+samconfig.toml
+requirements-dev.txt
