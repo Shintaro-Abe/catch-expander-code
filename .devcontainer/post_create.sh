@@ -5,3 +5,11 @@ npm install -g @anthropic-ai/claude-code
 curl -LsSf https://astral.sh/uv/install.sh | sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
+
+# inotify-tools: Claude OAuth トークンのファイル監視に必要
+sudo apt-get update -qq && sudo apt-get install -y -qq inotify-tools
+
+# スクリプトに実行権限を付与
+chmod +x "$(dirname "$0")/sync_claude_token.sh"
+chmod +x "$(dirname "$0")/watch_claude_token.sh"
+chmod +x "$(dirname "$0")/post_start.sh"

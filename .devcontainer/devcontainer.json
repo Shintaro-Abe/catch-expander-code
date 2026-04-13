@@ -6,5 +6,6 @@
     "ghcr.io/devcontainers/features/node:1": {},
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
-  "postCreateCommand": ".devcontainer/post_create.sh"
+  "postCreateCommand": ".devcontainer/post_create.sh",
+  "postStartCommand": ".devcontainer/post_start.sh"
 }
