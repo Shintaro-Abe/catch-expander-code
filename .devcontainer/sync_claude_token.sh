@@ -13,11 +13,21 @@ if [ ! -f "$CREDENTIALS_FILE" ]; then
 fi
 
 echo "[sync-claude-token] $(date '+%Y-%m-%d %H:%M:%S') Syncing to Secrets Manager..."
+# --secret-string に直接値を渡すとプロセス一覧 (ps aux / /proc/PID/cmdline) に
+# トークンが露出するため、0600 権限の一時ファイル経由で渡す。
+TMPFILE="$(mktemp)"
+chmod 0600 "$TMPFILE"
+trap 'rm -f "$TMPFILE"' EXIT
+
+jq -n \
+    --arg id "$SECRET_ID" \
+    --rawfile s "$CREDENTIALS_FILE" \
+    '{SecretId: $id, SecretString: $s}' > "$TMPFILE"
+
 aws secretsmanager put-secret-value \
-    --secret-id "$SECRET_ID" \
-    --secret-string "$(cat "$CREDENTIALS_FILE")" \
     --region "$REGION" \
     --output text \
-    --query 'VersionId' 2>&1
+    --query 'VersionId' \
+    --cli-input-json "file://$TMPFILE" 2>&1
 
 echo "[sync-claude-token] $(date '+%Y-%m-%d %H:%M:%S') Sync complete."
