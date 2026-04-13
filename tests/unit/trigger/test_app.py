@@ -513,3 +513,583 @@ class TestFeedbackDetection:
             for e in mock_ecs.run_task.call_args[1]["overrides"]["containerOverrides"][0]["environment"]
         }
         assert env_vars["TOPIC"] == "Terraform入門"
+
+
+# ---------------------------------------------------------------------------
+# F9 成果物履歴管理
+# ---------------------------------------------------------------------------
+
+
+class TestIsHistoryCommand:
+    """_is_history_command のテスト"""
+
+    def test_rekishi_returns_true(self):
+        from app import _is_history_command
+
+        assert _is_history_command("履歴") is True
+
+    def test_rekishi_with_keyword_returns_true(self):
+        from app import _is_history_command
+
+        assert _is_history_command("履歴 Terraform") is True
+
+    def test_rekishi_without_space_returns_true(self):
+        from app import _is_history_command
+
+        assert _is_history_command("履歴Terraform") is True
+
+    def test_history_lowercase_returns_true(self):
+        from app import _is_history_command
+
+        assert _is_history_command("history") is True
+
+    def test_history_titlecase_returns_true(self):
+        from app import _is_history_command
+
+        assert _is_history_command("History k8s") is True
+
+    def test_history_with_compound_keyword_returns_true(self):
+        from app import _is_history_command
+
+        assert _is_history_command("history k8s overview") is True
+
+    def test_regular_topic_returns_false(self):
+        from app import _is_history_command
+
+        assert _is_history_command("Terraform入門") is False
+
+    def test_feedback_keyword_returns_false(self):
+        from app import _is_history_command
+
+        assert _is_history_command("フィードバック") is False
+
+
+class TestExtractHistoryKeyword:
+    """_extract_history_keyword のテスト"""
+
+    def test_rekishi_only_returns_none(self):
+        from app import _extract_history_keyword
+
+        assert _extract_history_keyword("履歴") is None
+
+    def test_rekishi_with_space_keyword(self):
+        from app import _extract_history_keyword
+
+        assert _extract_history_keyword("履歴 Terraform") == "Terraform"
+
+    def test_rekishi_without_space_keyword(self):
+        from app import _extract_history_keyword
+
+        assert _extract_history_keyword("履歴Terraform") == "Terraform"
+
+    def test_history_only_returns_none(self):
+        from app import _extract_history_keyword
+
+        assert _extract_history_keyword("history") is None
+
+    def test_history_with_compound_keyword(self):
+        from app import _extract_history_keyword
+
+        assert _extract_history_keyword("history k8s overview") == "k8s overview"
+
+    def test_history_titlecase_with_keyword(self):
+        from app import _extract_history_keyword
+
+        assert _extract_history_keyword("History Terraform") == "Terraform"
+
+
+class TestQueryCompletedExecutions:
+    """_query_completed_executions のテスト"""
+
+    @patch("app.dynamodb")
+    def test_returns_only_completed_items(self, mock_dynamodb):
+        from app import _query_completed_executions
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [
+                {"execution_id": "e1", "status": "completed", "user_id": "U1"},
+                {"execution_id": "e2", "status": "completed", "user_id": "U1"},
+                {"execution_id": "e3", "status": "completed", "user_id": "U1"},
+                {"execution_id": "e4", "status": "failed", "user_id": "U1"},
+                {"execution_id": "e5", "status": "in_progress", "user_id": "U1"},
+            ]
+        }
+
+        result = _query_completed_executions("U1", "test-prefix")
+
+        assert len(result) == 3
+        assert all(r["status"] == "completed" for r in result)
+
+    @patch("app.dynamodb")
+    def test_returns_empty_list_when_no_items(self, mock_dynamodb):
+        from app import _query_completed_executions
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {"Items": []}
+
+        result = _query_completed_executions("U1", "test-prefix")
+
+        assert result == []
+
+    @patch("app.dynamodb")
+    def test_passes_scan_index_forward_false_and_limit(self, mock_dynamodb):
+        from app import _query_completed_executions
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {"Items": []}
+
+        _query_completed_executions("U1", "test-prefix")
+
+        call_kwargs = mock_table.query.call_args[1]
+        assert call_kwargs["ScanIndexForward"] is False
+        assert call_kwargs["Limit"] == 20
+        assert call_kwargs["IndexName"] == "user-id-index"
+
+
+class TestGetDeliverableUrl:
+    """_get_deliverable_url のテスト"""
+
+    @patch("app.dynamodb")
+    def test_returns_external_url_when_record_exists(self, mock_dynamodb):
+        from app import _get_deliverable_url
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [{"execution_id": "exec-001", "external_url": "https://notion.so/page-123"}]
+        }
+
+        result = _get_deliverable_url("exec-001", "test-prefix")
+
+        assert result == "https://notion.so/page-123"
+
+    @patch("app.dynamodb")
+    def test_returns_none_when_no_record(self, mock_dynamodb):
+        from app import _get_deliverable_url
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {"Items": []}
+
+        result = _get_deliverable_url("exec-001", "test-prefix")
+
+        assert result is None
+
+
+class TestHandleHistoryCommand:
+    """_handle_history_command の統合テスト（外部依存はモック）"""
+
+    @patch("app._post_history_result")
+    @patch("app._get_deliverable_url")
+    @patch("app._query_completed_executions")
+    def test_no_keyword_passes_all_completed_up_to_5(self, mock_query, mock_get_url, mock_post):
+        from app import _handle_history_command
+
+        mock_query.return_value = [
+            {"execution_id": f"e{i}", "topic": f"Topic {i}", "category": "tech", "created_at": "2026-01-01T00:00:00"}
+            for i in range(3)
+        ]
+        mock_get_url.return_value = "https://notion.so/page"
+
+        _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
+
+        mock_post.assert_called_once()
+        items = mock_post.call_args[0][2]
+        assert len(items) == 3
+
+    @patch("app._post_history_result")
+    @patch("app._get_deliverable_url")
+    @patch("app._query_completed_executions")
+    def test_keyword_filters_by_topic(self, mock_query, mock_get_url, mock_post):
+        from app import _handle_history_command
+
+        mock_query.return_value = [
+            {"execution_id": "e1", "topic": "Terraform入門", "category": "infra", "created_at": "2026-01-01T00:00:00"},
+            {"execution_id": "e2", "topic": "Kubernetes概要", "category": "infra", "created_at": "2026-01-02T00:00:00"},
+            {"execution_id": "e3", "topic": "terraform応用", "category": "infra", "created_at": "2026-01-03T00:00:00"},
+        ]
+        mock_get_url.return_value = None
+
+        _handle_history_command("U1", "C1", "111.000", "terraform", "prefix", "token")
+
+        items = mock_post.call_args[0][2]
+        assert len(items) == 2
+        assert all("terraform" in item["topic"].lower() for item in items)
+
+    @patch("app._post_history_result")
+    @patch("app._get_deliverable_url")
+    @patch("app._query_completed_executions")
+    def test_truncates_to_5_items(self, mock_query, mock_get_url, mock_post):
+        from app import _handle_history_command
+
+        mock_query.return_value = [
+            {"execution_id": f"e{i}", "topic": f"Topic {i}", "category": "tech", "created_at": "2026-01-01T00:00:00"}
+            for i in range(8)
+        ]
+        mock_get_url.return_value = "https://notion.so/page"
+
+        _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
+
+        items = mock_post.call_args[0][2]
+        assert len(items) == 5
+
+    @patch("app._post_history_result")
+    @patch("app._get_deliverable_url")
+    @patch("app._query_completed_executions")
+    def test_url_none_is_passed_to_post(self, mock_query, mock_get_url, mock_post):
+        from app import _handle_history_command
+
+        mock_query.return_value = [
+            {"execution_id": "e1", "topic": "Topic", "category": "tech", "created_at": "2026-01-01T00:00:00"}
+        ]
+        mock_get_url.return_value = None
+
+        _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
+
+        items = mock_post.call_args[0][2]
+        assert items[0]["url"] is None
+
+    @patch("app._post_history_result")
+    @patch("app._get_deliverable_url")
+    @patch("app._query_completed_executions")
+    def test_empty_executions_passes_empty_items(self, mock_query, mock_get_url, mock_post):
+        from app import _handle_history_command
+
+        mock_query.return_value = []
+
+        _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
+
+        items = mock_post.call_args[0][2]
+        assert items == []
+        mock_get_url.assert_not_called()
+
+    @patch("app._post_history_result")
+    @patch("app._get_deliverable_url")
+    @patch("app._query_completed_executions")
+    def test_get_deliverable_url_exception_sets_url_none_and_continues(self, mock_query, mock_get_url, mock_post):
+        from app import _handle_history_command
+
+        mock_query.return_value = [
+            {"execution_id": "e1", "topic": "Topic A", "category": "tech", "created_at": "2026-01-01T00:00:00"},
+            {"execution_id": "e2", "topic": "Topic B", "category": "tech", "created_at": "2026-01-02T00:00:00"},
+        ]
+
+        def get_url_side_effect(execution_id, table_prefix):
+            if execution_id == "e1":
+                raise RuntimeError("DynamoDB error")
+            return "https://notion.so/page-e2"
+
+        mock_get_url.side_effect = get_url_side_effect
+
+        _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
+
+        items = mock_post.call_args[0][2]
+        assert len(items) == 2
+        assert items[0]["url"] is None  # e1: exception → None
+        assert items[1]["url"] == "https://notion.so/page-e2"  # e2: unaffected
+
+
+class TestPostHistoryResult:
+    """_post_history_result のテスト"""
+
+    @patch("app.WebClient")
+    def test_empty_no_keyword_posts_no_deliverables_message(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        _post_history_result("C1", "111.000", [], None, "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "📭" in text
+        assert "まだ成果物がありません" in text
+
+    @patch("app.WebClient")
+    def test_empty_with_keyword_posts_not_found_message(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        _post_history_result("C1", "111.000", [], "Terraform", "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "📭" in text
+        assert "Terraform" in text
+        assert "見つかりません" in text
+
+    @patch("app.WebClient")
+    def test_items_no_keyword_uses_default_header(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "url": "https://notion.so/p1"}]
+        _post_history_result("C1", "111.000", items, None, "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "📚 成果物履歴（最新 1 件）" in text
+
+    @patch("app.WebClient")
+    def test_items_with_keyword_uses_keyword_header(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        items = [{"topic": "Terraform入門", "category": "infra", "date": "2026-01-01", "url": None}]
+        _post_history_result("C1", "111.000", items, "Terraform", "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "📚 成果物履歴「Terraform」（最新 1 件）" in text
+
+    @patch("app.WebClient")
+    def test_item_with_url_includes_url_line(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "url": "https://notion.so/p1"}]
+        _post_history_result("C1", "111.000", items, None, "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "   https://notion.so/p1" in text
+
+    @patch("app.WebClient")
+    def test_item_without_url_includes_no_url_line(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "url": None}]
+        _post_history_result("C1", "111.000", items, None, "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "   （URL なし）" in text
+
+    @patch("app.WebClient")
+    def test_multiple_items_are_numbered(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        items = [
+            {"topic": "Topic A", "category": "cat", "date": "2026-01-01", "url": None},
+            {"topic": "Topic B", "category": "cat", "date": "2026-01-02", "url": None},
+        ]
+        _post_history_result("C1", "111.000", items, None, "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "1. Topic A" in text
+        assert "2. Topic B" in text
+
+    @patch("app.WebClient")
+    def test_posts_with_correct_thread_ts(self, mock_webclient_cls):
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        _post_history_result("C1", "999.111", [], None, "token")
+
+        call_kwargs = mock_slack.chat_postMessage.call_args[1]
+        assert call_kwargs["thread_ts"] == "999.111"
+        assert call_kwargs["channel"] == "C1"
+
+
+@pytest.mark.usefixtures("_env_vars")
+class TestHistoryCommandRouting:
+    """lambda_handler の F9 履歴コマンドルーティングのテスト"""
+
+    def _make_secrets_side_effect(self):
+        return lambda SecretId: {  # noqa: N803
+            "arn:aws:secretsmanager:ap-northeast-1:123:secret:signing": {"SecretString": SIGNING_SECRET},
+            "arn:aws:secretsmanager:ap-northeast-1:123:secret:bot-token": {"SecretString": "xoxb-test"},
+        }[SecretId]
+
+    @patch("app.ecs_client")
+    @patch("app._handle_history_command")
+    @patch("app.secrets_client")
+    def test_rekishi_toplevel_calls_history_handler_not_ecs(self, mock_secrets, mock_handle_hist, mock_ecs):
+        """「履歴」トップレベル投稿 → _handle_history_command 呼び出し、ECS 非起動、HTTP 200"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> 履歴",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "111.000",
+            },
+        }
+        result = lambda_handler(_make_event(body), _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_handle_hist.assert_called_once()
+        mock_ecs.run_task.assert_not_called()
+
+    @patch("app.ecs_client")
+    @patch("app._handle_history_command")
+    @patch("app.secrets_client")
+    def test_history_with_keyword_passes_keyword(self, mock_secrets, mock_handle_hist, mock_ecs):
+        """「history Terraform」トップレベル投稿 → keyword="Terraform" で呼び出し"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> history Terraform",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "111.000",
+            },
+        }
+        lambda_handler(_make_event(body), _make_lambda_context())
+
+        call_kwargs = mock_handle_hist.call_args
+        keyword = call_kwargs[0][3]  # positional arg index 3
+        assert keyword == "Terraform"
+
+    @patch("app.ecs_client")
+    @patch("app._handle_history_command")
+    @patch("app.secrets_client")
+    def test_history_uppercase_calls_history_handler(self, mock_secrets, mock_handle_hist, mock_ecs):
+        """「History」大文字始まりでも _handle_history_command が呼ばれること"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> History",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "111.000",
+            },
+        }
+        lambda_handler(_make_event(body), _make_lambda_context())
+
+        mock_handle_hist.assert_called_once()
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app._handle_history_command")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_rekishi_thread_reply_goes_to_f8_flow(
+        self, mock_secrets, mock_webclient_cls, mock_handle_hist, mock_dynamodb, mock_ecs
+    ):
+        """「履歴」スレッド返信 → _handle_history_command 非呼び出し、F8 フロー"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [{"execution_id": "exec-001", "status": "completed", "slack_thread_ts": "111.000"}]
+        }
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> 履歴",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "222.000",
+                "thread_ts": "111.000",
+            },
+        }
+        result = lambda_handler(_make_event(body), _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_handle_hist.assert_not_called()
+        # F8 フィードバックフローが動いていること（ECS 起動）
+        mock_ecs.run_task.assert_called_once()
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app._handle_history_command")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_regular_topic_goes_to_existing_flow(
+        self, mock_secrets, mock_webclient_cls, mock_handle_hist, mock_dynamodb, mock_ecs
+    ):
+        """通常トピック → _handle_history_command 非呼び出し、既存 ECS 起動フロー"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+        mock_slack.chat_postMessage.return_value = {"ts": "555.000"}
+        mock_dynamodb.Table.return_value = MagicMock()
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> Terraform入門",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "555.000",
+            },
+        }
+        result = lambda_handler(_make_event(body), _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_handle_hist.assert_not_called()
+        mock_ecs.run_task.assert_called_once()
+
+    @patch("app.ecs_client")
+    @patch("app.WebClient")
+    @patch("app._handle_history_command")
+    @patch("app.secrets_client")
+    def test_history_command_exception_posts_error_and_returns_200(
+        self, mock_secrets, mock_handle_hist, mock_webclient_cls, mock_ecs
+    ):
+        """_handle_history_command が例外を raise → エラーメッセージ投稿、HTTP 200"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.side_effect = self._make_secrets_side_effect()
+        mock_handle_hist.side_effect = RuntimeError("DynamoDB down")
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> 履歴",
+                "user": "U_USER",
+                "channel": "C_CHANNEL",
+                "ts": "111.000",
+            },
+        }
+        result = lambda_handler(_make_event(body), _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_ecs.run_task.assert_not_called()
+        mock_slack.chat_postMessage.assert_called_once()
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "❌" in text
+        assert "エラー" in text

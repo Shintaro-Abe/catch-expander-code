@@ -41,6 +41,123 @@ def _get_secret(arn: str) -> str:
     return _cached_secrets[arn]
 
 
+# ---------------------------------------------------------------------------
+# F9 成果物履歴管理
+# ---------------------------------------------------------------------------
+
+
+def _is_history_command(text: str) -> bool:
+    """テキストが履歴コマンドかどうかを判定する。
+    「履歴」または「history」（大文字小文字不問）で始まる場合に True を返す。
+    メンション除去済みの topic を受け取ることを前提とする。
+    """
+    lower = text.lower()
+    return lower.startswith("履歴") or lower.startswith("history")
+
+
+def _extract_history_keyword(text: str) -> str | None:
+    """履歴コマンドのキーワード部分を抽出する。
+    「履歴 Terraform」→ "Terraform"
+    「history k8s」    → "k8s"
+    「履歴」           → None
+    """
+    rest = text[7:].strip() if text.lower().startswith("history") else text[2:].strip()
+    return rest if rest else None
+
+
+def _query_completed_executions(user_id: str, table_prefix: str) -> list[dict]:
+    """user-id-index GSI でユーザーの実行履歴を created_at 降順で取得し、
+    status == "completed" のもののみ返す。
+    """
+    table = dynamodb.Table(f"{table_prefix}-workflow-executions")
+    response = table.query(
+        IndexName="user-id-index",
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ScanIndexForward=False,
+        Limit=20,
+    )
+    items = response.get("Items", [])
+    return [item for item in items if item.get("status") == "completed"]
+
+
+def _get_deliverable_url(execution_id: str, table_prefix: str) -> str | None:
+    """deliverables テーブルから対象 execution_id の external_url を取得する。
+    レコードが存在しない場合は None を返す。
+    """
+    table = dynamodb.Table(f"{table_prefix}-deliverables")
+    response = table.query(
+        KeyConditionExpression=Key("execution_id").eq(execution_id),
+        Limit=1,
+    )
+    items = response.get("Items", [])
+    return items[0].get("external_url") if items else None
+
+
+def _handle_history_command(
+    user_id: str,
+    channel: str,
+    msg_ts: str,
+    keyword: str | None,
+    table_prefix: str,
+    slack_token: str,
+) -> None:
+    """履歴コマンドを処理する。ECS タスクは起動しない。"""
+    executions = _query_completed_executions(user_id, table_prefix)
+
+    if keyword:
+        executions = [e for e in executions if keyword.lower() in e.get("topic", "").lower()]
+
+    executions = executions[:5]
+
+    items = []
+    for e in executions:
+        try:
+            url = _get_deliverable_url(e["execution_id"], table_prefix)
+        except Exception:
+            logger.exception(
+                "Failed to get deliverable URL",
+                extra={"execution_id": e["execution_id"]},
+            )
+            url = None
+        items.append(
+            {
+                "topic": e.get("topic", ""),
+                "category": e.get("category", ""),
+                "date": e.get("created_at", "")[:10],
+                "url": url,
+            }
+        )
+
+    _post_history_result(channel, msg_ts, items, keyword, slack_token)
+
+
+def _post_history_result(
+    channel: str,
+    thread_ts: str,
+    items: list[dict],
+    keyword: str | None,
+    slack_token: str,
+) -> None:
+    """成果物一覧を Slack スレッドに投稿する。"""
+    slack_client = WebClient(token=slack_token)
+
+    if not items:
+        if keyword:
+            text = f"📭 「{keyword}」に一致する成果物は見つかりません。"
+        else:
+            text = "📭 まだ成果物がありません。トピックを送信すると調査を開始します。"
+    else:
+        n = len(items)
+        header = f"📚 成果物履歴「{keyword}」（最新 {n} 件）" if keyword else f"📚 成果物履歴（最新 {n} 件）"
+        lines = [header, ""]
+        for i, item in enumerate(items, 1):
+            lines.append(f"{i}. {item['topic']} — {item['category']} — {item['date']}")
+            lines.append(f"   {item['url']}" if item["url"] else "   （URL なし）")
+        text = "\n".join(lines)
+
+    slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
+
 @logger.inject_lambda_context
 def lambda_handler(event: dict, context: object) -> dict:
     """Slackイベントを受信し、ECSタスクを起動するLambdaハンドラー"""
@@ -104,6 +221,23 @@ def lambda_handler(event: dict, context: object) -> dict:
     event_msg_ts = event_data.get("ts", "")
     is_thread_reply = bool(event_thread_ts and event_thread_ts != event_msg_ts)
 
+    # [F9] 履歴コマンド検出（トップレベル投稿のみ）
+    if not is_thread_reply and _is_history_command(topic):
+        table_prefix_hist = os.environ["DYNAMODB_TABLE_PREFIX"]
+        slack_bot_token_hist = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
+        keyword = _extract_history_keyword(topic)
+        try:
+            _handle_history_command(user_id, channel, event_msg_ts, keyword, table_prefix_hist, slack_bot_token_hist)
+        except Exception:
+            logger.exception("History command failed", extra={"user_id": user_id, "keyword": keyword})
+            WebClient(token=slack_bot_token_hist).chat_postMessage(
+                channel=channel,
+                thread_ts=event_msg_ts,
+                text="❌ 履歴の取得中にエラーが発生しました。しばらく経ってから再試行してください。",
+            )
+        return {"statusCode": 200, "body": ""}
+
+    # [既存] F8 フィードバック判定
     if is_thread_reply:
         table_prefix_fb = os.environ["DYNAMODB_TABLE_PREFIX"]
         execution = _find_completed_execution(user_id, event_thread_ts, table_prefix_fb)

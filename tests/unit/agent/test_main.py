@@ -1,6 +1,6 @@
-import pytest
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # _setup_claude_credentials
@@ -108,9 +108,7 @@ class TestRunOrchestrator:
         mock_cls.assert_called_once_with(
             mock_slack, mock_db, "notion-token", "notion-db-id", "github-token", "owner/repo"
         )
-        mock_orchestrator.run.assert_called_once_with(
-            "exec-999", "U789", "Terraform入門", "C111", "9999999999.000001"
-        )
+        mock_orchestrator.run.assert_called_once_with("exec-999", "U789", "Terraform入門", "C111", "9999999999.000001")
 
     def test_sets_completed_on_success(self, monkeypatch):
         self._set_env(monkeypatch)

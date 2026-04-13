@@ -793,7 +793,83 @@ src/agent/feedback/
 
 `learned_preferences` が空の場合はセクション自体を追記しない（既存動作を維持）。
 
-## 7. エラーハンドリング
+## 7. F9 成果物履歴管理
+
+### フロー概要
+
+```
+[ユーザー] Slack に「履歴」または「history」（オプションでキーワード付き）を投稿
+      ↓
+[Lambda] 履歴コマンド検出 → ECS 起動なし
+      ↓
+[Lambda] DynamoDB: user-id-index GSI でユーザーの完了済み実行を取得（降順・最大 20 件）
+      ↓
+[Lambda] キーワードフィルタ（指定時）→ 先頭 5 件に絞る
+      ↓
+[Lambda] DynamoDB: deliverables テーブルで各 execution_id の external_url を解決
+      ↓
+[Lambda] フォーマット済み一覧を Slack スレッドに投稿
+      ↓
+[Lambda] HTTP 200 を返す（ECS 起動なし）
+```
+
+### コマンド仕様
+
+| コマンド | 動作 |
+|---------|------|
+| `履歴` | 最新 5 件の完了済み成果物一覧を返す |
+| `履歴 {keyword}` | topic に keyword を含む成果物のみ絞り込んで返す（大文字小文字不問） |
+| `history` | `履歴` と同じ（英語コマンド） |
+| `history {keyword}` | `履歴 {keyword}` と同じ |
+
+コマンドはトップレベル投稿のみ有効。スレッド返信の場合は F8 フィードバック判定フローへ。
+
+### 履歴コマンド検出ロジック（Lambda）
+
+コマンド判定の優先順位（`lambda_handler` 内）：
+
+```
+1. bot_id / retry-num チェック → 無視（既存）
+2. 履歴コマンド判定：text が「履歴」または「history」で始まる + is_thread_reply == False
+3. F8 フィードバック判定（既存）
+4. 新規トピックフロー（既存）
+```
+
+### 追加コンポーネント（`src/trigger/app.py`）
+
+| 関数 | 役割 |
+|------|------|
+| `_is_history_command(text)` | 履歴コマンドかどうかの判定 |
+| `_extract_history_keyword(text)` | コマンド文字列からキーワード部分を抽出 |
+| `_query_completed_executions(user_id, table_prefix)` | `user-id-index` GSI で完了済み実行を取得 |
+| `_get_deliverable_url(execution_id, table_prefix)` | `deliverables` テーブルから Notion URL を取得 |
+| `_handle_history_command(user_id, channel, msg_ts, keyword, table_prefix, slack_token)` | 上記を組み合わせた履歴コマンド処理 |
+| `_post_history_result(channel, thread_ts, items, keyword, slack_token)` | 成果物一覧を Slack スレッドに投稿 |
+
+**新規 AWS リソースなし**。既存の `user-id-index` GSI と `deliverables` テーブルを読み取りのみで使用する。
+
+### Slack 返信フォーマット
+
+**成果物 1 件以上の場合：**
+```
+📚 成果物履歴（最新 N 件）
+
+1. {topic} — {category} — {YYYY-MM-DD}
+   {notion_url}
+
+2. {topic} — {category} — {YYYY-MM-DD}
+   （URL なし）
+```
+
+**キーワード指定時のヘッダー：** `📚 成果物履歴「{keyword}」（最新 N 件）`
+
+**成果物なし（キーワードなし）：** `📭 まだ成果物がありません。トピックを送信すると調査を開始します。`
+
+**成果物なし（キーワードあり）：** `📭 「{keyword}」に一致する成果物は見つかりません。`
+
+**エラー発生時：** `❌ 履歴の取得中にエラーが発生しました。しばらく経ってから再試行してください。`
+
+## 8. エラーハンドリング
 
 ### エラー種別と対応
 
