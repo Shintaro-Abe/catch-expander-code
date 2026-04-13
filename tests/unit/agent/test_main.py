@@ -137,6 +137,53 @@ class TestRunOrchestrator:
 
 
 # ---------------------------------------------------------------------------
+# _notify_task_failure
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyTaskFailure:
+    def test_posts_error_to_slack_thread(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        mock_slack = MagicMock()
+
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token")
+
+        mock_slack.post_error.assert_called_once()
+        args = mock_slack.post_error.call_args
+        assert args[0][0] == "C123"
+        assert args[0][1] == "111.222"
+        assert "Claude OAuth" in args[0][2]
+
+    def test_does_nothing_when_channel_missing(self, monkeypatch):
+        monkeypatch.delenv("SLACK_CHANNEL", raising=False)
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        mock_slack = MagicMock()
+
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token")
+
+        mock_slack.post_error.assert_not_called()
+
+    def test_silently_ignores_slack_error(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        mock_slack = MagicMock()
+        mock_slack.post_error.side_effect = Exception("Slack down")
+
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            # 例外が外に伝播しないこと
+            _notify_task_failure("slack-token")
+
+
+# ---------------------------------------------------------------------------
 # main() — TASK_TYPE ルーティング
 # ---------------------------------------------------------------------------
 
@@ -191,6 +238,27 @@ class TestMain:
 
         mock_orch.assert_called_once()
         mock_feedback.assert_not_called()
+
+    def test_notifies_slack_and_reraises_on_failure(self, monkeypatch):
+        self._set_common_env(monkeypatch)
+        monkeypatch.setenv("SLACK_CHANNEL", "C999")
+        monkeypatch.setenv("SLACK_THREAD_TS", "000.001")
+        monkeypatch.delenv("TASK_TYPE", raising=False)
+
+        with (
+            patch("main._get_secret", return_value="secret"),
+            patch("main._setup_claude_credentials"),
+            patch("main.SlackClient"),
+            patch("main.DynamoDbClient"),
+            patch("main._run_orchestrator", side_effect=RuntimeError("boom")),
+            patch("main._notify_task_failure") as mock_notify,
+        ):
+            from main import main
+
+            with pytest.raises(RuntimeError, match="boom"):
+                main()
+
+        mock_notify.assert_called_once_with("secret")
 
     def test_fetches_all_four_secrets(self, monkeypatch):
         self._set_common_env(monkeypatch)
