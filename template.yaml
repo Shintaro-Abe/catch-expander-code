@@ -449,6 +449,13 @@ Resources:
                 - !GetAtt WorkflowExecutionsTable.Arn
             - Effect: Allow
               Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt WorkflowExecutionsTable.Arn
+                - !Sub ${WorkflowExecutionsTable.Arn}/index/*
+                - !GetAtt DeliverablesTable.Arn
+            - Effect: Allow
+              Action:
                 - ecs:RunTask
               Resource:
                 - !Ref AgentTaskDefinition
