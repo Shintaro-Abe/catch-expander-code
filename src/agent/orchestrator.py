@@ -45,15 +45,14 @@ def call_claude(prompt: str, allowed_tools: list[str] | None = None, model: str 
         except subprocess.CalledProcessError as e:
             last_error = e
             wait = 2 ** (attempt + 1)
+            stderr_snippet = e.stderr[:500] if e.stderr else ""
+            stdout_snippet = e.stdout[:500] if e.stdout else ""
             logger.warning(
-                "Claude CLI error, retrying",
-                extra={
-                    "attempt": attempt + 1,
-                    "wait_seconds": wait,
-                    "returncode": e.returncode,
-                    "stderr": e.stderr[:500] if e.stderr else "",
-                    "stdout": e.stdout[:500] if e.stdout else "",
-                },
+                "Claude CLI error, retrying | rc=%s | stderr=%s | stdout=%s",
+                e.returncode,
+                stderr_snippet,
+                stdout_snippet,
+                extra={"attempt": attempt + 1, "wait_seconds": wait},
             )
             time.sleep(wait)
 
