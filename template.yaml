@@ -32,6 +32,9 @@ Parameters:
     Type: String
     Description: ECR image URI for the agent container
     Default: ""
+  SlackNotificationChannelId:
+    Type: String
+    Description: Slack channel ID for operational notifications (e.g. Claude OAuth token expiry)
 
 Globals:
   Function:
@@ -471,6 +474,40 @@ Resources:
               Resource:
                 - !Ref SlackBotTokenSecretArn
                 - !Ref SlackSigningSecretArn
+
+  # ==============================================================
+  # Token Monitor (Claude OAuth 失効チェック)
+  # ==============================================================
+  TokenMonitorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-token-monitor
+      Handler: handler.lambda_handler
+      CodeUri: src/token_monitor/
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          CLAUDE_OAUTH_SECRET_ARN: !Ref ClaudeOAuthSecretArn
+          SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
+          SLACK_NOTIFICATION_CHANNEL_ID: !Ref SlackNotificationChannelId
+          STALE_THRESHOLD_HOURS: "24"
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(12 hours)
+            Description: Periodic check of Claude OAuth token staleness
+            Enabled: true
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref ClaudeOAuthSecretArn
+                - !Ref SlackBotTokenSecretArn
 
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]

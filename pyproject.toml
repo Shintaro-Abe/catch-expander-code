@@ -19,4 +19,4 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src/trigger", "src/agent"]
+pythonpath = ["src/trigger", "src/agent", "src/token_monitor"]
