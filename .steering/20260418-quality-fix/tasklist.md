@@ -64,22 +64,22 @@
 
 ### S1: レビュアーの検証カバレッジ戦略
 
-- [ ] **S1-1** `src/agent/prompts/reviewer.md` に「検証カバレッジ方針」セクションを追加（priority 1 優先 / 最低 30% or 10件 / 上限 15件）
-- [ ] **S1-2** `reviewer.md` の quality_metadata 出力例に `sources_total` フィールドを追加
-- [ ] **S1-3** `orchestrator.py:_build_quality_metadata_block` に `sources_total` 表示ロジック追加（`{verified}/{total}` 形式）
-- [ ] **S1-4** `tests/test_orchestrator.py` の `test_build_quality_metadata_block_*` 系に sources_total 分岐テスト追加
+- [x] **S1-1** `src/agent/prompts/reviewer.md` に「検証カバレッジ方針」セクションを追加（priority 1 優先 / 最低 30% or 10件 / 上限 15件）
+- [x] **S1-2** `reviewer.md` の quality_metadata 出力例に `sources_total` フィールドを追加
+- [x] **S1-3** `orchestrator.py:_build_quality_metadata_block` に `sources_total` 表示ロジック追加（`{verified}/{total}` 形式・互換フォールバック付き）
+- [x] **S1-4** `tests/test_orchestrator.py::TestBuildQualityMetadataBlock` に sources_total 分岐テスト4件を新規追加
 
 ### S2: `published_at` 欠損時のフォールバック
 
-- [ ] **S2-1** `src/agent/prompts/researcher.md` に「published_at の扱い」セクションを追加（ISO 8601 / `"unknown"` / `"continuously-updated"`、null 使用禁止）
-- [ ] **S2-2** `src/agent/prompts/reviewer.md` の `newest_source_date` / `oldest_source_date` 集計ルールを追加（日付以外の値は除外）
-- [ ] **S2-3** `orchestrator.py:_build_quality_metadata_block` の鮮度表示ロジックを null / unknown 分岐に改修
-- [ ] **S2-4** `tests/test_orchestrator.py` に鮮度表示テストを追加（null の場合 / unknown 混在の場合 / 正常日付の場合）
+- [x] **S2-1** `src/agent/prompts/researcher.md` に「published_at の扱い」セクションを追加（ISO 8601 / `"unknown"` / `"continuously-updated"`、null 使用禁止）
+- [x] **S2-2** `src/agent/prompts/reviewer.md` の `newest_source_date` / `oldest_source_date` 集計ルールを追加（日付以外の値は除外）
+- [x] **S2-3** `orchestrator.py` に `_format_freshness_line` を追加し、null / unknown / continuously-updated を「取得日不明のソースが含まれます」表示に切替
+- [x] **S2-4** `tests/test_orchestrator.py::TestBuildQualityMetadataBlock` に鮮度表示テスト5件（両側null/キー欠損/unknownマーカー/片側null/正常）を追加
 
 ### フェーズ 2 完了条件
 
-- [ ] **P2-1** ユニットテスト全件パス
-- [ ] **P2-2** S1/S2 を個別の commit に分割
+- [x] **P2-1** ユニットテスト全件パス（173 passed）
+- [x] **P2-2** S1/S2 を個別の commit に分割（S1: `e520885` / S2: `632f448`）
 
 ## フェーズ 3: 実機検証
 
