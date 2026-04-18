@@ -83,29 +83,46 @@
 
 ## フェーズ 3: 実機検証
 
-- [ ] **V-1** デプロイ後、同一トピック「API GatewayとLambdaの組み合わせについて」を Slack から投入し新 execution を実行
-- [ ] **V-2** DynamoDB `workflow-executions` から新 execution の `storage` を取得し、`"notion+github"` であることを確認
-- [ ] **V-3** DynamoDB `sources` テーブルで新 execution の `source_id` が `{step_id}:src-NNN` 形式で一意になっていることを確認
-- [ ] **V-4** CloudWatch Logs で `"Code files generated"` が `code_type` ごとに出ていること・`"Code file generation returned empty result"` が消えていることを確認
-- [ ] **V-5** Slack 完了通知の品質情報が以下を満たすこと:
-  - 検証ステータスに `sources_total` が併記される（例: `検証済み: N/M 件`）
-  - 情報の鮮度が `"N/A"` ではなく、日付または「取得日不明のソースが含まれます」のいずれかで表示される
-  - 注意事項の src-001 重複が消える
-- [ ] **V-6** GitHub リポジトリに新 execution 向けディレクトリが作成され、`iac_code` / `program_code` のファイルが push されている
-- [ ] **V-7** Notion ページ本文中の `[src-XXX]` 参照と出典一覧の source_id が一致
-- [ ] **V-8** 受け入れ条件（requirements.md の AC-1〜AC-7）を評価し、tasklist に結果を記録
+検証対象 execution: `exec-20260418044855-00a18b82`（投入 13:48 / 所要 15:34 / Slack 完了通知あり）
+
+- [x] **V-1** デプロイ後、同一トピック「API GatewayとLambdaの組み合わせについて」を Slack から投入し新 execution を実行
+- [x] **V-2** ❌ `storage = "notion"` のみ（`"notion+github"` 不可）。code 生成 parse error で GitHub push が skip された（V-4 と同根）
+- [x] **V-3** ✓ 48 件すべて `{step_id}:src-NNN` 形式で重複なし
+- [x] **V-4** ⚠ M3 のタイプ別ループは正しく実行されたが、`iac_code` / `program_code` 共に Claude 応答が parse error → `code_files_merged` 空のまま完了。`"Code file generation returned empty result"` 系の旧症状は出ていない
+- [x] **V-5** ✓ S1/S2 改修内容は反映:
+  - 検証ステータス `sources_total=49 / sources_verified=10`（10/49 形式で表示）
+  - 鮮度 `2024-06-04 〜 2024-07-18`（ISO 日付で表示、`N/A` 解消）
+  - src-001 重複なし
+- [x] **V-6** ❌ GitHub リポジトリに新規ディレクトリ無し（V-2/V-4 の影響）
+- [x] **V-7** ✓ ユーザー確認済み（Notion ページ本文 `[src-XXX]` と出典一覧 source_id が一致）
+- [x] **V-8** AC 評価結果を下表に記録
+
+### V-8 受け入れ条件評価（requirements.md AC-1〜AC-7）
+
+| AC | 評価 | 根拠 |
+|----|------|------|
+| AC-1 検証カバレッジ向上 | ✓ | sources_verified=10（修正前 3）。reviewer.md の検証カバレッジ方針が機能 |
+| AC-2 storage=notion+github | ❌ | code 生成（iac_code/program_code）が Claude 応答 parse error で失敗、GitHub push skip |
+| AC-3 source_id 一意化 | ✓ | 48 件全て一意、`{step_id}:src-NNN` 形式統一（M1 修正反映） |
+| AC-4 review fix 反映 | N/A | 今回 review が初回 pass、fix loop 未発火のため M2 修正の動作確認は未実施 |
+| AC-5 全テストパス | ✓ | 173 tests pass（push 時点） |
+| AC-6 sources_total 表示 | ✓ | Slack 通知に `10/49` 表示（S1 修正反映） |
+| AC-7 鮮度フォールバック | ✓ | ISO 日付で newest/oldest 表示（S2 修正反映） |
+
+**総括**: Must AC（AC-1〜AC-5）は AC-2 が未充足、それ以外は達成。AC-2 失敗は M3 の構造変更後に顕在化した「code 生成の parse error」という新症状で、今回の quality-fix スコープ（応答サイズ超過対策）とは別の root cause。AC-4 は fix loop が未発火だったため次回 fix 発生時に再評価する。
 
 ## フェーズ 4: 後続（保留判断）
 
-- [ ] **N1** （任意）`fix_prompt` の差分修正化を実装。V-1〜V-8 完了後の review loop 実行時間・トークン消費量を基準に要否判断
-- [ ] **Followup** V-1〜V-8 の結果を元に `.steering/[YYYYMMDD]-workflow-judgment-improvement/` の要否判断（オーケストレーターの判断質改善）
+- [ ] **N1** （任意）`fix_prompt` の差分修正化を実装。今回 fix loop 未発火のため判断保留（次回 fix 発生時に効果測定）
+- [ ] **Followup-A** AC-2 未達（code 生成 parse error）に対する新 steering 起票。`.steering/[YYYYMMDD]-code-generation-parse-error/` で iac_code / program_code 応答の安定化を扱う
+- [ ] **Followup-B** AC-4（review fix 反映）の追検証。次回 fix loop 発火時に deliverables への修正反映を確認
 
 ## 完了条件（全体）
 
-- フェーズ 1 の P1-1〜P1-3 全達成
-- フェーズ 2 の P2-1〜P2-2 全達成（または明示的に保留と判断）
-- フェーズ 3 の V-1〜V-8 全達成
-- requirements.md の受け入れ条件 AC-1〜AC-5（Must）が全て充足
+- フェーズ 1 の P1-1〜P1-3 全達成 ✓
+- フェーズ 2 の P2-1〜P2-2 全達成 ✓
+- フェーズ 3 の V-1〜V-8 全実施完了 ✓（V-2/V-6 失敗、V-4 警告、AC-2 未達）
+- requirements.md の受け入れ条件 AC-1〜AC-5（Must）: AC-2 未達のため未充足。Followup-A で別 steering へ移管
 
 ## リスクと対処
 
