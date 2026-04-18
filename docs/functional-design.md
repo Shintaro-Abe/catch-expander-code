@@ -96,6 +96,7 @@ graph TB
 | Slack Bot App | ユーザーとのインターフェース（入力受付・通知） | Slack |
 | API Gateway | Slackイベントの受信・ルーティング | API Gateway |
 | トリガー関数 | Slack署名検証、ACK応答、ECSタスク起動、フィードバック検出 | Lambda |
+| トークンモニター関数 | Claude OAuth トークン失効の定期監視・Slack通知 | Lambda（EventBridge 定期トリガー） |
 | オーケストレーターエージェント | トピック解析、ワークフロー設計、全体制御（learned_preferences 反映） | ECS Container（Claude Code CLI） |
 | リサーチャーエージェント（×N） | Web検索による情報収集・要約 | ECS Container（Claude Code Agentツール） |
 | ジェネレーターエージェント | 成果物の生成・推敲 | ECS Container（Claude Code Agentツール） |
@@ -165,7 +166,7 @@ erDiagram
     }
 
     SOURCE {
-        string source_id PK
+        string source_id PK "{step_id}:src-NNN 形式（システムワイド一意）"
         string execution_id FK
         string url "出典URL"
         string title "タイトル"
@@ -341,12 +342,14 @@ orchestrator.py（Pythonプロセス）
 - 調査・要約に特化したシステムプロンプト
 - ソース優先順位ルールを含む
 - 出典URLの記録を必須とする指示
+- 呼び出し元から与えられた `step_id` を出力 JSON にそのまま設定する指示
+- 出典の `source_id` は `src-001, src-002, ...` の形式でゼロから付番（他リサーチャーとの重複はオーケストレーター側で名前空間化して解消）
 
 #### 処理フロー
 
 ```
 入力: オーケストレーターからの調査指示
-  （ステップ定義、検索ヒント、カテゴリ、ソース優先順位）
+  （ステップ定義、ステップID、検索ヒント、カテゴリ、ソース優先順位）
   ↓
 1. [Sonnet] 検索クエリを生成（ステップ定義→検索キーワード）
   ↓
@@ -359,7 +362,8 @@ orchestrator.py（Pythonプロセス）
 5. 出典情報（URL、タイトル、公開日、ソース種別）を記録
   ↓
 出力: オーケストレーターへ返却
-  （要約テキスト + 出典リスト）
+  （要約テキスト + 出典リスト。source_id は後段で
+   {step_id}:src-NNN 形式にリマップされる）
 ```
 
 #### 並列実行
@@ -380,12 +384,13 @@ orchestrator.py（Pythonプロセス）
 
 ### 3.3 ジェネレーターエージェント
 
-成果物生成専門のサブエージェント。全調査結果を受け取り、成果物を生成・推敲する。
+成果物生成専門のサブエージェント。全調査結果を受け取り、**テキスト成果物のみ** を生成・推敲する。コード成果物はオーケストレーターが成果物タイプごとに独立したプロンプトで別途生成する（3.3b 参照）。
 
 #### 専門プロンプト
-- 文書生成・コード生成に特化したシステムプロンプト
-- 成果物タイプ別の構造化ルールを含む
+- 文書生成に特化したシステムプロンプト
+- テキスト成果物（Notionブロック形式）の構造化ルールを含む
 - ユーザープロファイルに基づくカスタマイズ指示
+- 出力は `content_blocks` + `summary` のみ（`code_files` は出力しない旨を明示）
 
 #### 処理フロー
 
@@ -393,8 +398,8 @@ orchestrator.py（Pythonプロセス）
 入力: オーケストレーターからの生成指示
   （調査結果一式 + ワークフロー計画 + ユーザープロファイル）
   ↓
-1. [Sonnet] 下書き生成
-   - 調査結果を成果物タイプごとに整理
+1. [Sonnet] 下書き生成（テキスト成果物）
+   - 調査結果を Notion ブロック形式で整理
    - ユーザープロファイルに基づくカスタマイズ
   ↓
 2. [Sonnet] 推敲
@@ -403,21 +408,42 @@ orchestrator.py（Pythonプロセス）
    - 出典URLの挿入
   ↓
 出力: オーケストレーターへ返却
-  （成果物一式：レポート、コード、設計書等）
-  ※ code_filesがnullの場合、オーケストレーターがコード専用の追加呼び出しを実施
+  （content_blocks + summary のみ。code_files は返さない）
 ```
 
 #### 成果物タイプ別の生成仕様
 
-**テキスト成果物**
+**テキスト成果物（ジェネレーター本体が生成）**
 - Notion APIのブロック形式で生成（heading, paragraph, bulleted_list, table, code等）
 - Mermaid図は`/mermaid`ブロックとして生成
 
-**コード成果物**
+**コード成果物（3.3b 参照）**
+- オーケストレーターが `iac_code` / `program_code` ごとに独立した Claude 呼び出しで生成
+- 各呼び出しの `files` をマージし、README は成果物タイプ別のセクションに分けて結合
+
+### 3.3b コード成果物の独立生成
+
+ワークフロー計画の `deliverable_types` に `iac_code` / `program_code` が含まれ、かつ `storage_targets` に `github` が含まれる場合、オーケストレーターは成果物タイプごとに `_build_code_generation_prompt(code_type)` を呼び出してコード成果物を生成する。
+
+**背景**: 単一プロンプトでテキスト成果物＋コード成果物をまとめて生成すると応答サイズが肥大化し、JSON パース失敗によりコード成果物が欠落する事象が発生したため、タイプごとに独立呼び出しに分離した（M3）。
+
+**処理**:
+```
+for code_type in (iac_code, program_code):
+  1. [Sonnet] _build_code_generation_prompt(code_type) を実行
+  2. 応答を JSON パースし、files / readme_content を取得
+  3. 成功: files_merged に統合、readme_parts にタイプ別 README を追記
+  4. 失敗（parse_error）: warning ログを出力し、他タイプの生成は継続
+finally:
+  files_merged が非空なら deliverables["code_files"] にセット
+```
+
+**コード成果物ルール**（各プロンプト内で適用）
 - ファイル単位で生成（main.tf, variables.tf等）
 - 各ファイルにコメントで説明を付与
 - README.mdに使用手順を記載
 - GitHub APIでリポジトリにpushする形式で出力
+- ファイル数は最大5ファイル / タイプに抑制
 
 ### 3.4 レビュアーエージェント
 
@@ -462,6 +488,8 @@ orchestrator.py（Pythonプロセス）
 ```
 
 レビュアーとジェネレーターは別のコンテキストで動作するため、ジェネレーターが「自分の出力は正しい」と思い込むバイアスを排除できる。
+
+**修正成果物の永続化**: `_run_review_loop` は `(review_result, final_deliverables)` のタプルを返し、ループ内で適用された修正結果を Notion / GitHub 出力パスに確実に引き継ぐ。修正応答が JSON パースできなかった場合は直前の成果物を保持し、warning ログを出力する（M2）。
 
 ## 4. 外部連携設計
 
@@ -541,7 +569,7 @@ Properties:
 
 - **100ブロック上限**: Notion APIの `append_block_children` は1リクエストあたり100ブロックが上限。`create_page()` は `content_blocks` を100ブロック単位に分割してチャンク投稿する。
 - **`create_page()` 戻り値**: `tuple[str, str]`（`page_url, page_id`）を返す。`page_id` はステータス更新（`update_page_status()`）に使用する。
-- **出典のURL重複排除**: `put_sources()` はURLをキーに重複を除去し、各エントリに新規UUIDの `source_id` を付与してからDynamoDB `batch_writer()` で一括登録する。
+- **出典の `source_id` は呼び出し元で一意化済み**: オーケストレーターが `{step_id}:src-NNN` 形式に名前空間化して `put_sources()` に渡す（M1）。`put_sources()` は UUID 付与は行わず、同じ `source_id` / URL のエントリはスキップしてから DynamoDB `batch_writer()` で一括登録する。
 
 ### 4.3 GitHub連携
 
@@ -608,8 +636,8 @@ claude -p "プロンプト" --model sonnet --allowedTools "WebSearch,WebFetch,Re
 | オーケストレーター | 1 | トピック解析 | Sonnet | トピックテキスト | JSON（カテゴリ、意図、観点リスト） |
 | オーケストレーター | 2 | ワークフロー設計 | Sonnet | 解析結果 + プロファイル | JSON（ステップリスト、成果物タイプ） |
 | リサーチャー（×N） | 3 | 調査要約 | Sonnet | 検索結果テキスト | 要約テキスト + 出典リスト |
-| ジェネレーター | 4 | 成果物生成（下書き→推敲） | Sonnet | 調査結果 + 計画 + プロファイル | 成果物テキスト/コード |
-| ジェネレーター | 4b | コード成果物独立生成（code_filesがnullの場合のみ） | Sonnet | 調査結果 + code_types | `{"files": {...}, "readme_content": "..."}` JSON |
+| ジェネレーター | 4 | テキスト成果物生成（下書き→推敲） | Sonnet | 調査結果 + 計画 + プロファイル | `content_blocks` + `summary` |
+| ジェネレーター | 4b | コード成果物独立生成（成果物タイプごと） | Sonnet | 調査結果 + `code_type`（iac_code / program_code 各1回） | `{"files": {...}, "readme_content": "..."}` JSON |
 | レビュアー | 5 | ソース検証 + チェックリスト評価 | **Opus** | 成果物 + 出典 + チェックリスト | JSON（合否判定、修正指示） |
 | ジェネレーター | 6 | 修正（0〜2回） | Sonnet | 成果物 + 修正指示 | 修正済み成果物 |
 | レビュアー | 7 | 再レビュー（0〜2回） | **Opus** | 修正済み成果物 + チェックリスト | JSON（合否判定） |
@@ -624,16 +652,20 @@ claude -p "プロンプト" --model sonnet --allowedTools "WebSearch,WebFetch,Re
   レビュアー:       1（レビュー）              Opus
   合計: N + 4
 
-標準（技術トピック・コード生成あり・レビュー合格）:
+標準（技術トピック・コード生成あり: iac_code のみ・レビュー合格）:
   上記 + コード独立生成 1回（Sonnet）
   合計: N + 5
 
-最大（技術トピック・コード生成あり・修正2回）:
+標準（技術トピック・コード生成あり: iac_code + program_code・レビュー合格）:
+  上記 + コード独立生成 2回（Sonnet, タイプごと）
+  合計: N + 6
+
+最大（技術トピック・iac_code + program_code・修正2回）:
   オーケストレーター: 2                        Sonnet
   リサーチャー×N:    N                         Sonnet
-  ジェネレーター:    1 + 1 + 2（生成 + コード + 修正2回） Sonnet
+  ジェネレーター:    1 + 2 + 2（生成 + コード×2タイプ + 修正2回） Sonnet
   レビュアー:       1 + 2（レビュー + 再レビュー2回）    Opus
-  合計: N + 9
+  合計: N + 10
   ※ N = 調査ステップ数（通常3〜5）
 ```
 

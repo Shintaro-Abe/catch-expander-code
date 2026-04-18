@@ -45,10 +45,22 @@ Catch-Expander/
 │   │   ├── slack_verify.py            # Slack署名検証
 │   │   └── requirements.txt           # Python依存パッケージ
 │   │
+│   ├── token_monitor/                 # Claude OAuth トークン失効監視 Lambda
+│   │   ├── __init__.py
+│   │   ├── handler.py                 # EventBridge定期トリガーで発火
+│   │   └── requirements.txt
+│   │
 │   └── agent/                         # ECS エージェントアプリケーション
 │       ├── __init__.py
+│       ├── Dockerfile                 # ECS Fargate 用コンテナ定義
 │       ├── main.py                    # ECSタスクエントリポイント（TASK_TYPE分岐）
 │       ├── orchestrator.py            # オーケストレーターエージェント
+│       ├── requirements.txt           # Python依存パッケージ
+│       ├── prompts/                   # サブエージェント用プロンプト
+│       │   ├── orchestrator.md
+│       │   ├── researcher.md
+│       │   ├── generator.md
+│       │   └── reviewer.md
 │       ├── feedback/                  # フィードバック学習（F8）
 │       │   ├── __init__.py
 │       │   └── feedback_processor.py  # フィードバック解析・プロファイル更新
@@ -71,10 +83,16 @@ Catch-Expander/
 │   │   │   ├── __init__.py
 │   │   │   ├── conftest.py            # botocore[crt]依存問題の回避
 │   │   │   └── test_app.py
+│   │   ├── token_monitor/
+│   │   │   ├── __init__.py
+│   │   │   ├── conftest.py
+│   │   │   └── test_app.py
 │   │   └── agent/
 │   │       ├── __init__.py
+│   │       ├── test_main.py
 │   │       ├── test_orchestrator.py
 │   │       ├── test_feedback_processor.py  # F8 フィードバック学習テスト
+│   │       ├── test_dynamodb_client.py     # source_id 一意化（M1）
 │   │       ├── test_notion_client.py
 │   │       ├── test_github_client.py
 │   │       └── test_slack_client.py
@@ -95,9 +113,10 @@ Catch-Expander/
     └── commands/
 ```
 
-> **デプロイ時に別途作成するファイル（リポジトリ外管理）**
+> **備考**
 > `src/agent/Dockerfile`、`src/agent/prompts/*.md`、`src/agent/requirements.txt` は
-> デプロイ時にリポジトリ外で作成・管理される。設計仕様は `docs/architecture.md` を参照のこと。
+> いずれもリポジトリ内で管理する。ECS Fargate 用のコンテナイメージは SAM ビルド時に
+> これらのファイルを使ってビルドされる。設計仕様は `docs/architecture.md` を参照のこと。
 
 ## 3. ディレクトリの役割
 
@@ -116,6 +135,10 @@ Catch-Expander/
 ### `src/trigger/` — Lambda トリガー関数
 
 Slackイベントを受信し、署名検証・ACK応答・ECSタスク起動を行うLambda関数。SAMテンプレートから参照される。
+
+### `src/token_monitor/` — トークンモニター Lambda
+
+EventBridge の定期スケジュールで発火し、Secrets Manager に保管された Claude OAuth トークンの失効・残期限を監視する。しきい値を割り込んだ場合は Slack 通知で再ログインを促す。
 
 ### `src/agent/` — ECS エージェントアプリケーション
 

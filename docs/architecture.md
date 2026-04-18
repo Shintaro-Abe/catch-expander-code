@@ -8,6 +8,7 @@
 |---------|------|------|
 | エージェント実行 | ECS Fargate | Claude Code CLIを実行するコンテナ |
 | トリガー | AWS Lambda | Slackイベント受信 → ECSタスク起動 |
+| トークンモニター | AWS Lambda + EventBridge Scheduler | Claude OAuth トークン失効の定期監視 |
 | APIエンドポイント | Amazon API Gateway（REST API） | Slackイベントの受信・署名検証 |
 | 状態管理 | Amazon DynamoDB | ワークフロー実行状態・ユーザープロファイルの永続化 |
 | シークレット管理 | AWS Secrets Manager | APIキー・トークンの安全な保管 |
@@ -216,6 +217,27 @@ ENTRYPOINT ["python3", "main.py"]
 | タイムアウト | 10秒 |
 | 実行ロール | LambdaTriggerRole（ECS RunTask, DynamoDB, Secrets Manager） |
 
+### トークンモニター関数
+
+```
+入力: EventBridge 定期スケジュールイベント
+処理:
+  1. Secrets Manager から Claude OAuth トークン情報を取得
+  2. 残り有効期限を算出し、しきい値（既定: 3日）を下回ったか判定
+  3. 既に失効している場合 / しきい値を下回った場合は Slack に再ログイン依頼を通知
+出力: なし（Slack通知のみ）
+```
+
+| 項目 | 値 |
+|------|-----|
+| ランタイム | Python 3.13 |
+| メモリ | 256 MB |
+| タイムアウト | 60秒 |
+| トリガー | EventBridge Scheduler（定期実行） |
+| 実行ロール | TokenMonitorRole（Secrets Manager 読み取り） |
+
+実装は `src/token_monitor/handler.py`。
+
 ## 5. DynamoDBテーブル設計
 
 ### テーブル一覧
@@ -226,7 +248,7 @@ ENTRYPOINT ["python3", "main.py"]
 | `{prefix}-workflow-executions` | ワークフロー実行状態 | PK: `execution_id` |
 | `{prefix}-workflow-steps` | ワークフローステップ | PK: `execution_id`, SK: `step_id` |
 | `{prefix}-deliverables` | 成果物メタデータ | PK: `execution_id`, SK: `deliverable_id` |
-| `{prefix}-sources` | 出典情報 | PK: `execution_id`, SK: `source_id` |
+| `{prefix}-sources` | 出典情報 | PK: `execution_id`, SK: `source_id`（`{step_id}:src-NNN` 形式でシステムワイド一意） |
 
 ### キャパシティ設計
 
