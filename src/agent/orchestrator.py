@@ -154,6 +154,53 @@ _CODE_TYPE_LABELS = {
     "program_code": "プログラムコード（Python またはユーザープロファイルの技術スタック）",
 }
 
+_CODE_FAILURE_PREVIEW_LIMIT = 500
+_CODE_FAILURE_TOP_KEYS_LIMIT = 10
+
+
+def _build_code_failure_diagnostics(raw: str, parsed: object) -> dict:
+    """コード生成失敗時の診断情報を組み立てる。
+
+    ロガーの formatter が extra を出力しないため、警告メッセージ本文に
+    埋め込む形で root cause 判定に必要な観測項目を返す。
+    """
+    raw_text = raw if isinstance(raw, str) else ""
+    response_chars = len(raw_text)
+    response_preview = raw_text[:_CODE_FAILURE_PREVIEW_LIMIT]
+
+    if not isinstance(parsed, dict):
+        return {
+            "parse_error": True,
+            "files_kind": "<not-dict>",
+            "files_count": 0,
+            "top_level_keys": [],
+            "response_chars": response_chars,
+            "response_preview": response_preview,
+        }
+
+    parse_error = bool(parsed.get("parse_error", False))
+    top_level_keys = list(parsed.keys())[:_CODE_FAILURE_TOP_KEYS_LIMIT]
+
+    if "files" not in parsed:
+        files_kind = "missing"
+        files_count = 0
+    else:
+        files_value = parsed["files"]
+        files_kind = type(files_value).__name__
+        if isinstance(files_value, (dict, list)):
+            files_count = len(files_value)
+        else:
+            files_count = 0
+
+    return {
+        "parse_error": parse_error,
+        "files_kind": files_kind,
+        "files_count": files_count,
+        "top_level_keys": top_level_keys,
+        "response_chars": response_chars,
+        "response_preview": response_preview,
+    }
+
 
 def _build_code_generation_prompt(
     topic: str,
@@ -381,15 +428,19 @@ class Orchestrator:
                         },
                     )
                 else:
+                    diag = _build_code_failure_diagnostics(code_raw, code_result)
                     logger.warning(
-                        "Code generation failed for type",
-                        extra={
-                            "execution_id": execution_id,
-                            "code_type": code_type,
-                            "parse_error": code_result.get("parse_error", False)
-                            if isinstance(code_result, dict)
-                            else True,
-                        },
+                        "Code generation failed for type | execution_id=%s code_type=%s "
+                        "parse_error=%s files_kind=%s files_count=%s top_level_keys=%s "
+                        "response_chars=%d response_preview=%r",
+                        execution_id,
+                        code_type,
+                        diag["parse_error"],
+                        diag["files_kind"],
+                        diag["files_count"],
+                        diag["top_level_keys"],
+                        diag["response_chars"],
+                        diag["response_preview"],
                     )
             if code_files_merged:
                 deliverables["code_files"] = {

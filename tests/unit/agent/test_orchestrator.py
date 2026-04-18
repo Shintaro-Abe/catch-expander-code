@@ -864,3 +864,76 @@ class TestBuildQualityMetadataBlock:
         )
         text = self._block_text(blocks)
         assert "情報の鮮度: 最新 2026-04-02 / 最古 不明" in text
+
+
+class TestBuildCodeFailureDiagnostics:
+    """_build_code_failure_diagnostics の観測項目テスト（Followup-A Phase A）"""
+
+    def test_parse_error_flag_true_when_parsed_marks_parse_error(self):
+        from orchestrator import _build_code_failure_diagnostics
+
+        diag = _build_code_failure_diagnostics(
+            "raw text", {"parse_error": True, "raw_text": "raw text"}
+        )
+        assert diag["parse_error"] is True
+        assert diag["files_kind"] == "missing"
+        assert diag["files_count"] == 0
+        assert diag["top_level_keys"] == ["parse_error", "raw_text"]
+        assert diag["response_chars"] == len("raw text")
+        assert diag["response_preview"] == "raw text"
+
+    def test_missing_files_key_marks_files_kind_missing(self):
+        from orchestrator import _build_code_failure_diagnostics
+
+        parsed = {"summary": "ok", "content_blocks": []}
+        diag = _build_code_failure_diagnostics("{}", parsed)
+        assert diag["parse_error"] is False
+        assert diag["files_kind"] == "missing"
+        assert diag["files_count"] == 0
+        assert "summary" in diag["top_level_keys"]
+        assert "content_blocks" in diag["top_level_keys"]
+
+    def test_empty_files_dict_reports_zero_count(self):
+        from orchestrator import _build_code_failure_diagnostics
+
+        diag = _build_code_failure_diagnostics(
+            '{"files": {}}', {"files": {}, "readme_content": ""}
+        )
+        assert diag["parse_error"] is False
+        assert diag["files_kind"] == "dict"
+        assert diag["files_count"] == 0
+
+    def test_files_as_list_reports_list_kind(self):
+        from orchestrator import _build_code_failure_diagnostics
+
+        diag = _build_code_failure_diagnostics(
+            '{"files": [1, 2, 3]}', {"files": [1, 2, 3]}
+        )
+        assert diag["files_kind"] == "list"
+        assert diag["files_count"] == 3
+
+    def test_response_preview_truncated_to_500_chars(self):
+        from orchestrator import _build_code_failure_diagnostics
+
+        long_raw = "x" * 1500
+        diag = _build_code_failure_diagnostics(long_raw, {"files": None})
+        assert diag["response_chars"] == 1500
+        assert len(diag["response_preview"]) == 500
+        assert diag["files_kind"] == "NoneType"
+        assert diag["files_count"] == 0
+
+    def test_non_dict_parsed_marks_parse_error_true(self):
+        from orchestrator import _build_code_failure_diagnostics
+
+        diag = _build_code_failure_diagnostics("[1,2,3]", [1, 2, 3])
+        assert diag["parse_error"] is True
+        assert diag["files_kind"] == "<not-dict>"
+        assert diag["files_count"] == 0
+        assert diag["top_level_keys"] == []
+
+    def test_top_level_keys_capped_at_ten(self):
+        from orchestrator import _build_code_failure_diagnostics
+
+        parsed = {f"k{i}": i for i in range(15)}
+        diag = _build_code_failure_diagnostics("{}", parsed)
+        assert len(diag["top_level_keys"]) == 10

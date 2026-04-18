@@ -131,6 +131,21 @@ logger = logging.getLogger("catch-expander-agent")
 logger.info("Workflow started", extra={"execution_id": execution_id, "topic": topic})
 ```
 
+### コード生成失敗ログの読み方
+
+ECS の標準 `logging` は formatter が `extra` を出力しないため、`Code generation failed for type` 警告は診断情報をメッセージ本文に直接埋め込む形式で出力する。CloudWatch でメッセージ本文だけで root cause を判別できるようにするためで、orchestrator の `_build_code_failure_diagnostics` が以下の項目を組み立てる。
+
+| フィールド | 意味 | root cause 判定の手がかり |
+|------------|------|--------------------------|
+| `parse_error` | `_parse_claude_response` の戦略 1〜4 が全失敗 | `True` なら CLI 応答が JSON 化できない（応答破損 / 大幅な形式違い）|
+| `files_kind` | パース後の `files` フィールドの型名 | `missing` ならスキーマ違い、`list` / `str` 等なら型違い、`dict` なら空 dict 確認へ |
+| `files_count` | `files` の要素数 | `dict` かつ `0` なら空応答 |
+| `top_level_keys` | パース結果のトップレベルキー（最大 10 件） | 期待外のキーがあれば応答スキーマがプロンプトと不整合 |
+| `response_chars` | 応答テキストの文字数 | 極端に大きければ応答サイズ超過の部分パースが疑わしい |
+| `response_preview` | 応答テキスト先頭 500 文字 | 上記からだけでは判別できないとき直接確認する |
+
+新しい root cause が観測された場合は `.steering/` 配下の関連ステアリングに種別を追記してから対応に着手する。
+
 ### ログへのシークレット漏洩防止
 
 | ルール | 説明 |
