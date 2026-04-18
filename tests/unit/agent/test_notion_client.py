@@ -1,6 +1,106 @@
+import copy
 from unittest.mock import patch
 
 import pytest
+
+
+class TestSplitLongRichText:
+    """_split_long_rich_text のテスト"""
+
+    def _split(self, blocks):
+        from storage.notion_client import _split_long_rich_text
+
+        return _split_long_rich_text(blocks)
+
+    def _make_code_block(self, content: str, language: str = "terraform") -> dict:
+        return {
+            "type": "code",
+            "code": {
+                "rich_text": [{"type": "text", "text": {"content": content}}],
+                "language": language,
+            },
+        }
+
+    def test_split_short_rich_text_unchanged(self):
+        blocks = [self._make_code_block("short content")]
+        result = self._split(blocks)
+        assert result == blocks
+
+    def test_split_exactly_2000_chars_unchanged(self):
+        blocks = [self._make_code_block("x" * 2000)]
+        result = self._split(blocks)
+        assert len(result[0]["code"]["rich_text"]) == 1
+        assert result[0]["code"]["rich_text"][0]["text"]["content"] == "x" * 2000
+
+    def test_split_over_2000_code_block(self):
+        blocks = [self._make_code_block("x" * 3921)]
+        result = self._split(blocks)
+        rich_text = result[0]["code"]["rich_text"]
+        assert len(rich_text) == 2
+        assert rich_text[0]["text"]["content"] == "x" * 2000
+        assert rich_text[1]["text"]["content"] == "x" * 1921
+
+    def test_split_preserves_language_and_annotations(self):
+        blocks = [self._make_code_block("y" * 2500, language="python")]
+        result = self._split(blocks)
+        assert result[0]["type"] == "code"
+        assert result[0]["code"]["language"] == "python"
+
+    def test_split_preserves_other_rich_text_fields(self):
+        blocks = [
+            {
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {"content": "z" * 2500, "link": {"url": "https://example.com"}},
+                            "annotations": {"bold": True, "color": "red"},
+                        }
+                    ]
+                },
+            }
+        ]
+        result = self._split(blocks)
+        rich_text = result[0]["paragraph"]["rich_text"]
+        assert len(rich_text) == 2
+        for chunk in rich_text:
+            assert chunk["type"] == "text"
+            assert chunk["annotations"] == {"bold": True, "color": "red"}
+            assert chunk["text"]["link"] == {"url": "https://example.com"}
+
+    def test_split_handles_multiple_blocks(self):
+        blocks = [
+            self._make_code_block("short"),
+            self._make_code_block("a" * 4500),
+            self._make_code_block("also short"),
+        ]
+        result = self._split(blocks)
+        assert len(result) == 3
+        assert len(result[0]["code"]["rich_text"]) == 1
+        assert len(result[1]["code"]["rich_text"]) == 3  # 2000 + 2000 + 500
+        assert len(result[2]["code"]["rich_text"]) == 1
+
+    def test_split_handles_block_without_rich_text(self):
+        blocks = [{"type": "divider", "divider": {}}]
+        result = self._split(blocks)
+        assert result == blocks
+
+    def test_split_handles_unknown_type_safely(self):
+        blocks = [
+            {"type": "mystery", "other_key": "value"},
+            {"no_type_field": True},
+            {"type": "code", "code": "not-a-dict"},
+            {"type": "code", "code": {"rich_text": "not-a-list"}},
+        ]
+        result = self._split(blocks)
+        assert result == blocks
+
+    def test_split_does_not_mutate_input(self):
+        blocks = [self._make_code_block("x" * 3921)]
+        snapshot = copy.deepcopy(blocks)
+        self._split(blocks)
+        assert blocks == snapshot
 
 
 class TestNotionClient:

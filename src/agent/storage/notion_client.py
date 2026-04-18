@@ -9,6 +9,61 @@ logger = logging.getLogger("catch-expander-agent")
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 MAX_RETRIES = 3
+_NOTION_RICH_TEXT_MAX_CHARS = 2000
+
+
+def _split_long_rich_text(blocks: list[dict]) -> list[dict]:
+    """rich_text[N].text.content が 2000 文字を超える要素を 2000 文字単位で分割した新しい list を返す。
+
+    入力 list / dict は mutate せず、必要な箇所のみ shallow copy で再構築する。
+    block["type"] を動的キーとして使い、対応キーが存在しない / 不正構造はスキップして堅牢化する。
+    """
+    result: list[dict] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            result.append(block)
+            continue
+        block_type = block.get("type")
+        type_payload = block.get(block_type) if isinstance(block_type, str) else None
+        if not isinstance(type_payload, dict):
+            result.append(block)
+            continue
+        rich_text = type_payload.get("rich_text")
+        if not isinstance(rich_text, list):
+            result.append(block)
+            continue
+
+        new_rich_text: list[dict] = []
+        changed = False
+        for element in rich_text:
+            if not isinstance(element, dict):
+                new_rich_text.append(element)
+                continue
+            text_field = element.get("text")
+            content = text_field.get("content") if isinstance(text_field, dict) else None
+            if not isinstance(content, str) or len(content) <= _NOTION_RICH_TEXT_MAX_CHARS:
+                new_rich_text.append(element)
+                continue
+
+            changed = True
+            for i in range(0, len(content), _NOTION_RICH_TEXT_MAX_CHARS):
+                chunk = content[i : i + _NOTION_RICH_TEXT_MAX_CHARS]
+                new_element = dict(element)
+                new_text = dict(text_field)
+                new_text["content"] = chunk
+                new_element["text"] = new_text
+                new_rich_text.append(new_element)
+
+        if not changed:
+            result.append(block)
+            continue
+
+        new_type_payload = dict(type_payload)
+        new_type_payload["rich_text"] = new_rich_text
+        new_block = dict(block)
+        new_block[block_type] = new_type_payload
+        result.append(new_block)
+    return result
 
 
 class NotionClient:
@@ -71,6 +126,7 @@ class NotionClient:
         slack_user: str,
     ) -> tuple[str, str]:
         """成果物ページを作成し、(ページURL, ページID)を返す"""
+        content_blocks = _split_long_rich_text(content_blocks)
         properties: dict = {
             "タイトル": {"title": [{"text": {"content": title}}]},
             "カテゴリ": {"select": {"name": category}},
@@ -110,5 +166,6 @@ class NotionClient:
 
     def append_blocks(self, page_id: str, blocks: list[dict]) -> None:
         """ページにブロックを追記する"""
+        blocks = _split_long_rich_text(blocks)
         payload = {"children": blocks}
         self._request_with_retry("PATCH", f"{NOTION_API_BASE}/blocks/{page_id}/children", payload)
