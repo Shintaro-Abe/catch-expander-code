@@ -635,7 +635,12 @@ class Orchestrator:
 
         verified = metadata.get("sources_verified", 0)
         unverified = metadata.get("sources_unverified", 0)
-        lines.append(f"検証ステータス: ✅ 出典検証済み: {verified}件")
+        # sources_total は reviewer 側で常時併記される想定。互換性のため未指定時は verified を分母にフォールバック
+        total = metadata.get("sources_total")
+        if isinstance(total, int) and total >= verified:
+            lines.append(f"検証ステータス: ✅ 出典検証済み: {verified}/{total} 件")
+        else:
+            lines.append(f"検証ステータス: ✅ 出典検証済み: {verified}件")
         if unverified > 0:
             details = metadata.get("unverified_details", [])
             lines.append(f"  ⚠️ 未検証の記述: {unverified}件（{', '.join(details)}）")

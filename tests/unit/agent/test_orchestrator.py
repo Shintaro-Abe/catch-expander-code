@@ -710,3 +710,91 @@ class TestLearnedPreferencesInProfileText:
 
         first_prompt = mock_call_claude.call_args_list[0][0][0]
         assert "蓄積された好み" not in first_prompt
+
+
+class TestBuildQualityMetadataBlock:
+    """_build_quality_metadata_block の表示ロジックテスト（S1, S2）"""
+
+    def _block_text(self, blocks: list[dict]) -> str:
+        """ブロック列から本文テキストを取り出す"""
+        for block in blocks:
+            if block.get("type") == "paragraph":
+                return block["paragraph"]["rich_text"][0]["text"]["content"]
+        return ""
+
+    def _make_orch(self):
+        from orchestrator import Orchestrator
+
+        return Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+    # --- S1: sources_total 分岐 ---
+
+    def test_displays_verified_over_total_when_total_present(self):
+        """sources_total が指定されていれば verified/total 形式で表示する"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 12,
+                "sources_total": 49,
+                "sources_unverified": 0,
+                "newest_source_date": "2026-04-02",
+                "oldest_source_date": "2024-11-15",
+                "checklist_passed": 5,
+                "checklist_total": 5,
+            }
+        )
+        text = self._block_text(blocks)
+        assert "出典検証済み: 12/49 件" in text
+
+    def test_falls_back_to_count_only_when_total_missing(self):
+        """sources_total が無い場合は従来通り件数のみ表示（後方互換）"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 5,
+                "sources_unverified": 0,
+                "newest_source_date": "2026-04-01",
+                "oldest_source_date": "2025-01-01",
+                "checklist_passed": 4,
+                "checklist_total": 4,
+            }
+        )
+        text = self._block_text(blocks)
+        assert "出典検証済み: 5件" in text
+        assert "/" not in text.split("出典検証済み:")[1].split("\n")[0]
+
+    def test_falls_back_to_count_only_when_total_smaller_than_verified(self):
+        """異常値（total < verified）の場合は分母を信頼せず件数のみ表示"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 10,
+                "sources_total": 3,  # 異常値
+                "sources_unverified": 0,
+                "newest_source_date": "2026-04-01",
+                "oldest_source_date": "2025-01-01",
+                "checklist_passed": 1,
+                "checklist_total": 1,
+            }
+        )
+        text = self._block_text(blocks)
+        assert "出典検証済み: 10件" in text
+
+    def test_unverified_details_appended_when_present(self):
+        """sources_unverified > 0 の場合、未検証セクションが追加される"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 4,
+                "sources_total": 10,
+                "sources_unverified": 2,
+                "unverified_details": ["セクション3の市場規模", "セクション5の予測"],
+                "newest_source_date": "2026-04-01",
+                "oldest_source_date": "2025-01-01",
+                "checklist_passed": 5,
+                "checklist_total": 5,
+            }
+        )
+        text = self._block_text(blocks)
+        assert "未検証の記述: 2件" in text
+        assert "セクション3の市場規模" in text
