@@ -311,8 +311,11 @@ class TestReviewLoop:
         db = MagicMock()
         orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
 
-        result = orch._run_review_loop("prompt", {"content_blocks": []}, [], "技術", "gen_prompt", "C1", "ts1")
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", {"content_blocks": []}, [], "技術", "gen_prompt", "C1", "ts1"
+        )
         assert result["passed"] is True
+        assert final_deliverables == {"content_blocks": []}
         assert mock_claude.call_count == 1
 
     @patch("orchestrator.call_claude")
@@ -355,9 +358,115 @@ class TestReviewLoop:
         db = MagicMock()
         orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
 
-        result = orch._run_review_loop("prompt", {"content_blocks": []}, [], "技術", "gen_prompt", "C1", "ts1")
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", {"content_blocks": []}, [], "技術", "gen_prompt", "C1", "ts1"
+        )
         assert result["passed"] is True
+        assert final_deliverables.get("summary") == "fixed"
         assert mock_claude.call_count == 3
+
+    @patch("orchestrator.call_claude")
+    def test_run_review_loop_returns_fixed_deliverables_on_passed(self, mock_claude):
+        """修正後に合格した場合、修正済み成果物を返す"""
+        from orchestrator import Orchestrator
+
+        responses = [
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "passed": False,
+                            "issues": [
+                                {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+                            ],
+                            "quality_metadata": {},
+                        }
+                    )
+                }
+            ),
+            json.dumps({"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})}),
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "passed": True,
+                            "issues": [],
+                            "quality_metadata": {"sources_verified": 3, "sources_unverified": 0},
+                        }
+                    )
+                }
+            ),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
+        )
+        assert result["passed"] is True
+        assert final_deliverables["content_blocks"] == [{"t": "fixed"}]
+        assert final_deliverables["summary"] == "修正版"
+
+    @patch("orchestrator.call_claude")
+    def test_run_review_loop_returns_fixed_deliverables_on_max_loop(self, mock_claude):
+        """ループ上限到達でも、最後に適用された修正版を返す"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+        failing_review = {"passed": False, "issues": [issue], "quality_metadata": {}}
+
+        responses = [
+            json.dumps({"result": json.dumps(failing_review)}),
+            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-1"})}),
+            json.dumps({"result": json.dumps(failing_review)}),
+            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-2"})}),
+            json.dumps({"result": json.dumps(failing_review)}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original = {"content_blocks": [], "summary": "初版"}
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
+        )
+        assert result["passed"] is False
+        assert final_deliverables["summary"] == "fix-2"
+        notes = result["quality_metadata"]["notes"]
+        assert any("レビュー修正上限" in n for n in notes)
+
+    @patch("orchestrator.call_claude")
+    def test_run_review_loop_keeps_previous_on_parse_error(self, mock_claude):
+        """fix 応答が parse_error の場合、前回成果物を保持する"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+        failing_review = {"passed": False, "issues": [issue], "quality_metadata": {}}
+        passing_review = {
+            "passed": True,
+            "issues": [],
+            "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
+        }
+
+        responses = [
+            json.dumps({"result": json.dumps(failing_review)}),
+            # fix response は不正な JSON → parse_error になる
+            json.dumps({"result": "this is not valid json at all"}),
+            json.dumps({"result": json.dumps(passing_review)}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
+        )
+        assert result["passed"] is True
+        # parse_error のため original を保持
+        assert final_deliverables == original
 
 
 class TestLearnedPreferencesInProfileText:

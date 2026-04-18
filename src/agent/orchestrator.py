@@ -374,7 +374,7 @@ class Orchestrator:
         for r in research_results:
             all_sources.extend(r.get("sources", []))
 
-        review_result = self._run_review_loop(
+        review_result, deliverables = self._run_review_loop(
             reviewer_prompt, deliverables, all_sources, category, gen_prompt, slack_channel, slack_thread_ts
         )
         quality_metadata = review_result.get("quality_metadata", {})
@@ -535,8 +535,12 @@ class Orchestrator:
         gen_prompt: str,
         slack_channel: str,
         slack_thread_ts: str,
-    ) -> dict:
-        """レビューループを実行する（最大2回）"""
+    ) -> tuple[dict, dict]:
+        """レビューループを実行する（最大2回）
+
+        Returns:
+            (review_result, final_deliverables) — 修正が適用された場合は最終版成果物を返す
+        """
         current_deliverables = deliverables
         sources_text = json.dumps(sources, ensure_ascii=False)
 
@@ -553,7 +557,7 @@ class Orchestrator:
 
             if review_result.get("passed", False):
                 logger.info("Review passed", extra={"loop": loop})
-                return review_result
+                return review_result, current_deliverables
 
             errors = [i for i in review_result.get("issues", []) if i.get("severity") == "error"]
             if not errors or loop >= MAX_REVIEW_LOOPS:
@@ -563,7 +567,7 @@ class Orchestrator:
                     notes.append(f"レビュー修正上限（{MAX_REVIEW_LOOPS}回）に到達。未修正の指摘: {len(errors)}件")
                     review_result.setdefault("quality_metadata", {})["notes"] = notes
                 logger.info("Review loop limit reached", extra={"loop": loop, "remaining_errors": len(errors)})
-                return review_result
+                return review_result, current_deliverables
 
             # 修正指示でジェネレーターを再実行
             self.slack.post_progress(
@@ -578,9 +582,20 @@ class Orchestrator:
                 f"現在の成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```"
             )
             fix_raw = call_claude(fix_prompt)
-            current_deliverables = _parse_claude_response(fix_raw)
+            parsed = _parse_claude_response(fix_raw)
+            if parsed.get("parse_error"):
+                logger.warning(
+                    "Fix attempt produced unparseable response, keeping previous deliverables",
+                    extra={"loop": loop, "issues_count": len(errors)},
+                )
+            else:
+                current_deliverables = parsed
+                logger.info(
+                    "Deliverables updated by review fix",
+                    extra={"loop": loop, "issues_count": len(errors)},
+                )
 
-        return review_result
+        return review_result, current_deliverables
 
     def _build_quality_metadata_block(self, metadata: dict) -> list[dict]:
         """品質メタデータをNotionブロック形式で構築する"""

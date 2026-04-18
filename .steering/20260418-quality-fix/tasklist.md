@@ -11,31 +11,31 @@
 
 ### M1: source_id をシステム全体で一意化
 
-- [ ] **M1-1** `src/agent/orchestrator.py` に `_namespace_source_ids(result, step_id)` ユーティリティ関数を追加（`result.step_id` 補正 + `sources[].source_id` を `{step_id}:{source_id}` に書換）
-- [ ] **M1-2** `_execute_research` 内の researcher プロンプト組立に `"あなたのステップID: {step_id}"` 行を追加
-- [ ] **M1-3** `_execute_research` で `_parse_claude_response` 直後に `_namespace_source_ids(result, step_id)` を呼ぶ
-- [ ] **M1-4** `src/agent/state/dynamodb_client.py:put_sources` から `item["source_id"] = str(uuid.uuid4())` を削除し、`seen_ids` による source_id dedup に差し替える
-- [ ] **M1-5** `src/agent/prompts/researcher.md` の出力形式セクションを、`step_id` フィールドに与えられた ID を使う旨・source_id は src-001 から付番で可（prefix はシステム側で付ける）旨に更新
-- [ ] **M1-6** `tests/test_orchestrator.py` に以下のテストを追加:
+- [x] **M1-1** `src/agent/orchestrator.py` に `_namespace_source_ids(result, step_id)` ユーティリティ関数を追加（`result.step_id` 補正 + `sources[].source_id` を `{step_id}:{source_id}` に書換）
+- [x] **M1-2** `_execute_research` 内の researcher プロンプト組立に `"あなたのステップID: {step_id}"` 行を追加
+- [x] **M1-3** `_execute_research` で `_parse_claude_response` 直後に `_namespace_source_ids(result, step_id)` を呼ぶ
+- [x] **M1-4** `src/agent/state/dynamodb_client.py:put_sources` から `item["source_id"] = str(uuid.uuid4())` を削除し、`seen_ids` による source_id dedup に差し替える
+- [x] **M1-5** `src/agent/prompts/researcher.md` の出力形式セクションを、`step_id` フィールドに与えられた ID を使う旨・source_id は src-001 から付番で可（prefix はシステム側で付ける）旨に更新
+- [x] **M1-6** `tests/test_orchestrator.py` に以下のテストを追加:
   - `test_namespace_source_ids_applies_step_id_prefix`
   - `test_namespace_source_ids_corrects_wrong_step_id`
   - `test_namespace_source_ids_handles_missing_sources`
-- [ ] **M1-7** `tests/test_dynamodb_client.py` の既存 `test_put_sources_*` を「source_id そのまま保存・重複時スキップ」仕様に更新
-- [ ] **M1-8** `pytest tests/` 全件パス確認
+- [x] **M1-7** `tests/test_dynamodb_client.py` の既存 `test_put_sources_*` を「source_id そのまま保存・重複時スキップ」仕様に更新
+- [x] **M1-8** `pytest tests/` 全件パス確認
 
 ### M2: `_run_review_loop` の修正結果を永続化
 
-- [ ] **M2-1** `_run_review_loop` の戻り値型を `tuple[dict, dict]` に変更（全 `return` 文を `return review_result, current_deliverables` 形式に）
-- [ ] **M2-2** `current_deliverables = _parse_claude_response(fix_raw)` を `parse_error` チェック付きのロジックに置換（parse_error 時は rebind しない + warning ログ）
-- [ ] **M2-3** `orchestrator.py:352-355` 呼び出し元を `review_result, deliverables = self._run_review_loop(...)` に更新
-- [ ] **M2-4** "Deliverables updated by review fix" ログを追加（loop, issues_count）
-- [ ] **M2-5** `tests/test_orchestrator.py` 既存の `_run_review_loop` 関連テストを tuple 戻り値に対応
-- [ ] **M2-6** 以下のテストを追加:
+- [x] **M2-1** `_run_review_loop` の戻り値型を `tuple[dict, dict]` に変更（全 `return` 文を `return review_result, current_deliverables` 形式に）
+- [x] **M2-2** `current_deliverables = _parse_claude_response(fix_raw)` を `parse_error` チェック付きのロジックに置換（parse_error 時は rebind しない + warning ログ）
+- [x] **M2-3** `orchestrator.py:352-355` 呼び出し元を `review_result, deliverables = self._run_review_loop(...)` に更新
+- [x] **M2-4** "Deliverables updated by review fix" ログを追加（loop, issues_count）
+- [x] **M2-5** `tests/test_orchestrator.py` 既存の `_run_review_loop` 関連テストを tuple 戻り値に対応
+- [x] **M2-6** 以下のテストを追加:
   - `test_run_review_loop_returns_fixed_deliverables_on_passed`
   - `test_run_review_loop_returns_fixed_deliverables_on_max_loop`
   - `test_run_review_loop_keeps_previous_on_parse_error`
   - `test_run_integrates_fixed_deliverables_into_notion_content`（統合テスト）
-- [ ] **M2-7** `pytest tests/` 全件パス確認
+- [x] **M2-7** `pytest tests/` 全件パス確認
 
 ### M3: コード成果物生成を成果物タイプ別に完全分離
 

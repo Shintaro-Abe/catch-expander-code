@@ -214,3 +214,95 @@ class TestWorkflowE2E:
         )
 
         slack.post_completion.assert_called_once()
+
+    @patch("orchestrator.call_claude")
+    @patch("storage.notion_client.requests.request")
+    def test_run_integrates_fixed_deliverables_into_notion_content(self, mock_notion_request, mock_claude, mock_clients):
+        """レビュー修正後の deliverables が Notion 送信ペイロードに反映される"""
+        from orchestrator import Orchestrator
+
+        slack, db = mock_clients
+
+        analysis = {"category": "技術", "intent": "test", "perspectives": [], "deliverable_types": ["research_report"]}
+        workflow = {
+            "research_steps": [
+                {"step_id": "r-1", "step_name": "概要", "description": "test", "search_hints": []},
+            ],
+            "generate_steps": [{"step_id": "g-1", "step_name": "レポート", "deliverable_type": "research_report"}],
+            "storage_targets": ["notion"],
+        }
+        research = {"step_id": "r-1", "summary": "初期調査", "sources": []}
+        original_deliverables = {
+            "content_blocks": [
+                {
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": "ORIGINAL_TEXT"}}]},
+                }
+            ],
+            "code_files": None,
+            "summary": "初版サマリ",
+        }
+        fixed_deliverables = {
+            "content_blocks": [
+                {
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": "FIXED_TEXT"}}]},
+                }
+            ],
+            "code_files": None,
+            "summary": "修正版サマリ",
+        }
+        failing_review = {
+            "passed": False,
+            "issues": [
+                {"item": "本文", "severity": "error", "description": "不正確", "fix_instruction": "修正して"}
+            ],
+            "quality_metadata": {},
+        }
+        passing_review = {
+            "passed": True,
+            "issues": [],
+            "quality_metadata": {
+                "sources_verified": 0,
+                "sources_unverified": 0,
+                "checklist_passed": 3,
+                "checklist_total": 3,
+                "notes": [],
+            },
+        }
+
+        responses = [
+            json.dumps({"result": json.dumps(analysis)}),
+            json.dumps({"result": json.dumps(workflow)}),
+            json.dumps({"result": json.dumps(research)}),
+            json.dumps({"result": json.dumps(original_deliverables)}),
+            json.dumps({"result": json.dumps(failing_review)}),
+            json.dumps({"result": json.dumps(fixed_deliverables)}),
+            json.dumps({"result": json.dumps(passing_review)}),
+        ]
+        mock_claude.side_effect = responses
+
+        mock_notion_response = mock_notion_request.return_value
+        mock_notion_response.status_code = 200
+        mock_notion_response.raise_for_status.return_value = None
+        mock_notion_response.json.return_value = {"id": "page-789", "url": "https://notion.so/page-789"}
+
+        orch = Orchestrator(slack, db, "ntn_token", "db_id", "gh_token", "owner/repo")
+        orch.run(
+            execution_id="exec-test-003",
+            user_id="U_TEST",
+            topic="修正テスト",
+            slack_channel="C_TEST",
+            slack_thread_ts="ts789",
+        )
+
+        # Notion へ送信されたペイロードを集約して検証
+        payloads = []
+        for call in mock_notion_request.call_args_list:
+            kwargs = call.kwargs
+            if kwargs.get("json"):
+                payloads.append(json.dumps(kwargs["json"], ensure_ascii=False))
+        combined = "\n".join(payloads)
+
+        assert "FIXED_TEXT" in combined
+        assert "ORIGINAL_TEXT" not in combined
