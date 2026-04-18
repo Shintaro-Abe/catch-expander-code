@@ -22,6 +22,31 @@ def _load_prompt(name: str) -> str:
     return (PROMPTS_DIR / f"{name}.md").read_text()
 
 
+def _namespace_source_ids(result: dict, step_id: str) -> None:
+    """リサーチャー結果の source_id を {step_id}:{source_id} 形式にリマップする（in-place）
+
+    並列実行されるリサーチャーが独立に src-001.. を付番するため、統合時の重複を防ぐ。
+    LLM が自身の step_id を誤って別値で返すケースも補正する。
+    既に prefix が付与済みの場合は再付与しない（冪等性）。
+    """
+    if not isinstance(result, dict):
+        return
+    result["step_id"] = step_id
+    sources = result.get("sources")
+    if not isinstance(sources, list):
+        return
+    prefix = f"{step_id}:"
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        original = src.get("source_id")
+        if not isinstance(original, str) or not original:
+            continue
+        if original.startswith(prefix):
+            continue
+        src["source_id"] = f"{prefix}{original}"
+
+
 def call_claude(prompt: str, allowed_tools: list[str] | None = None, model: str = "sonnet") -> str:
     """Claude Code CLIを呼び出し、結果を返す（リトライ付き）
 
@@ -457,6 +482,7 @@ class Orchestrator:
                 prompt = (
                     f"{researcher_prompt}\n\n"
                     f"## 調査指示\n\n"
+                    f"あなたのステップID: {step_id}\n"
                     f"カテゴリ: {category}\n"
                     f"ステップ: {step['step_name']}\n"
                     f"内容: {step['description']}\n"
@@ -464,6 +490,7 @@ class Orchestrator:
                 )
                 raw = call_claude(prompt, allowed_tools=["WebSearch", "WebFetch"])
                 result = _parse_claude_response(raw)
+                _namespace_source_ids(result, step_id)
                 self.db.update_step_status(execution_id, step_id, "completed", result)
                 return result
             except Exception as e:

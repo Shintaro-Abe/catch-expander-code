@@ -1,5 +1,4 @@
 import logging
-import uuid
 from datetime import UTC, datetime
 
 import boto3
@@ -114,21 +113,33 @@ class DynamoDbClient:
     # 出典
     # ============================
     def put_sources(self, execution_id: str, sources: list[dict]) -> None:
-        """出典レコードを一括保存する"""
+        """出典レコードを一括保存する
+
+        source_id は呼び出し元で system-wide に一意化済み（step_id prefix）である前提。
+        source_id / URL の重複分はスキップする。
+        """
         table = self._table("sources")
         ttl = self._ttl_timestamp()
+        seen_ids: set[str] = set()
         seen_urls: set[str] = set()
         with table.batch_writer() as batch:
             for source in sources:
-                # 重複URLを除外
+                source_id = source.get("source_id", "")
                 url = source.get("url", "")
+                if not source_id:
+                    logger.warning(
+                        "Skipping source without source_id",
+                        extra={"execution_id": execution_id, "url": url},
+                    )
+                    continue
+                if source_id in seen_ids:
+                    continue
                 if url and url in seen_urls:
                     continue
+                seen_ids.add(source_id)
                 if url:
                     seen_urls.add(url)
                 item = dict(source)
                 item["execution_id"] = execution_id
-                # 並列リサーチャー間でsource_idが重複するためUUIDで上書き
-                item["source_id"] = str(uuid.uuid4())
                 item["ttl"] = ttl
                 batch.put_item(Item=item)

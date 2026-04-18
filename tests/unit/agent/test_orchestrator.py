@@ -61,6 +61,87 @@ class TestCallClaude:
         assert mock_run.call_count == 3
 
 
+class TestNamespaceSourceIds:
+    """_namespace_source_ids関数のテスト"""
+
+    def test_applies_step_id_prefix_to_sources(self):
+        from orchestrator import _namespace_source_ids
+
+        result = {
+            "step_id": "research-1",
+            "summary": "...",
+            "sources": [
+                {"source_id": "src-001", "url": "https://a"},
+                {"source_id": "src-002", "url": "https://b"},
+            ],
+        }
+        _namespace_source_ids(result, "research-1")
+        assert result["sources"][0]["source_id"] == "research-1:src-001"
+        assert result["sources"][1]["source_id"] == "research-1:src-002"
+
+    def test_corrects_wrong_step_id(self):
+        """LLM が別の step_id を返してきた場合、指定値に強制書き換えする"""
+        from orchestrator import _namespace_source_ids
+
+        result = {
+            "step_id": "research-1",  # LLM が誤って research-1 を返した
+            "sources": [{"source_id": "src-001"}],
+        }
+        _namespace_source_ids(result, "research-2")
+        assert result["step_id"] == "research-2"
+        assert result["sources"][0]["source_id"] == "research-2:src-001"
+
+    def test_handles_missing_sources(self):
+        """sources キーがない、あるいは空リストでも例外を起こさない"""
+        from orchestrator import _namespace_source_ids
+
+        result1 = {"step_id": "research-1", "summary": "no sources key"}
+        _namespace_source_ids(result1, "research-1")
+        assert result1["step_id"] == "research-1"
+        assert "sources" not in result1
+
+        result2 = {"step_id": "research-1", "sources": []}
+        _namespace_source_ids(result2, "research-1")
+        assert result2["sources"] == []
+
+    def test_idempotent_when_prefix_already_applied(self):
+        """既に prefix が付いている source_id は再付与しない"""
+        from orchestrator import _namespace_source_ids
+
+        result = {
+            "step_id": "research-1",
+            "sources": [
+                {"source_id": "research-1:src-001"},
+                {"source_id": "src-002"},
+            ],
+        }
+        _namespace_source_ids(result, "research-1")
+        assert result["sources"][0]["source_id"] == "research-1:src-001"
+        assert result["sources"][1]["source_id"] == "research-1:src-002"
+
+    def test_skips_non_dict_result(self):
+        from orchestrator import _namespace_source_ids
+
+        # 例外を発生させずに no-op で戻ることを確認
+        _namespace_source_ids(None, "research-1")  # type: ignore[arg-type]
+        _namespace_source_ids("not a dict", "research-1")  # type: ignore[arg-type]
+
+    def test_skips_source_without_source_id(self):
+        """source_id が欠けている出典はスキップする（ログのみ）"""
+        from orchestrator import _namespace_source_ids
+
+        result = {
+            "step_id": "research-1",
+            "sources": [
+                {"url": "https://a"},  # source_id なし
+                {"source_id": "src-002", "url": "https://b"},
+            ],
+        }
+        _namespace_source_ids(result, "research-1")
+        assert "source_id" not in result["sources"][0]
+        assert result["sources"][1]["source_id"] == "research-1:src-002"
+
+
 class TestParseClaudeResponse:
     """_parse_claude_response関数のテスト"""
 
