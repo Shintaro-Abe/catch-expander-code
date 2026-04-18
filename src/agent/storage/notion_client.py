@@ -11,6 +11,44 @@ NOTION_VERSION = "2022-06-28"
 MAX_RETRIES = 3
 _NOTION_RICH_TEXT_MAX_CHARS = 2000
 
+_CLOUDFLARE_BLOCK_SIGNATURES = (
+    "Attention Required! | Cloudflare",
+    "cdn-cgi/styles/cf.errors.css",
+)
+_CF_HEADER_KEYS = ("CF-Ray", "cf-mitigated", "cf-cache-status", "Server")
+_SENSITIVE_HEADER_KEYS = {"set-cookie", "authorization"}
+
+
+class NotionCloudflareBlockError(Exception):
+    """Notion 前段の Cloudflare がリクエストを 403 でブロックしたことを示す例外。
+
+    IP reputation / User-Agent / JA3 fingerprint / Payload pattern 等の複合要因で
+    Cloudflare が automation と判定したケースをまとめて扱う。Notion 本体の
+    権限エラー（JSON で返る 403）はこの例外では扱わない。
+    """
+
+    def __init__(self, message: str, cf_ray: str | None = None) -> None:
+        super().__init__(message)
+        self.cf_ray = cf_ray
+
+
+def _is_cloudflare_block(status_code: int, body: str) -> bool:
+    if status_code != 403:
+        return False
+    return any(sig in body for sig in _CLOUDFLARE_BLOCK_SIGNATURES)
+
+
+def _extract_cf_headers(headers) -> dict:
+    """Cloudflare 識別用ヘッダを dict で返す。機微ヘッダは除外する。"""
+    result: dict = {}
+    for key in _CF_HEADER_KEYS:
+        value = headers.get(key)
+        if value is not None:
+            result[key.lower().replace("-", "_")] = value
+    safe_headers = {k: v for k, v in headers.items() if k.lower() not in _SENSITIVE_HEADER_KEYS}
+    result["response_headers"] = str(safe_headers)[:1000]
+    return result
+
 
 def _split_long_rich_text(blocks: list[dict]) -> list[dict]:
     """rich_text[N].text.content が 2000 文字を超える要素を 2000 文字単位で分割した新しい list を返す。
@@ -92,6 +130,23 @@ class NotionClient:
                     response_body = e.response.text[:1000]
                 # 4xxはクライアントエラーのためリトライしない
                 if e.response.status_code < 500:
+                    if _is_cloudflare_block(e.response.status_code, response_body):
+                        cf_headers = _extract_cf_headers(e.response.headers)
+                        cf_ray = cf_headers.get("cf_ray")
+                        logger.warning(
+                            "Notion request blocked by Cloudflare | method=%s url=%s status=403",
+                            method,
+                            url,
+                            extra={
+                                **cf_headers,
+                                "user_agent_sent": self.headers.get("User-Agent", "<default>"),
+                                "body_snippet": response_body[:200],
+                            },
+                        )
+                        raise NotionCloudflareBlockError(
+                            f"Notion request blocked by Cloudflare (CF-Ray={cf_ray})",
+                            cf_ray=cf_ray,
+                        ) from e
                     logger.error(
                         "Notion API client error | method=%s url=%s status=%d response_body=%r",
                         method,

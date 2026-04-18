@@ -8,6 +8,7 @@ from feedback.feedback_processor import FeedbackProcessor
 from notify.slack_client import SlackClient
 from orchestrator import Orchestrator
 from state.dynamodb_client import DynamoDbClient
+from storage.notion_client import NotionCloudflareBlockError
 
 logger = logging.getLogger("catch-expander-agent")
 
@@ -80,11 +81,12 @@ def _run_orchestrator(
         raise
 
 
-def _notify_task_failure(slack_token: str) -> None:
+def _notify_task_failure(slack_token: str, exc: BaseException | None = None) -> None:
     """タスク失敗時にSlackスレッドへ通知する。
 
     通知自体の失敗はログに留め、元の例外を隠さない。
     SLACK_CHANNEL / SLACK_THREAD_TS が未設定の場合は何もしない。
+    NotionCloudflareBlockError の場合はリトライ案内、それ以外は汎用（OAuth 切れ）文言を送る。
     """
     channel = os.environ.get("SLACK_CHANNEL", "")
     thread_ts = os.environ.get("SLACK_THREAD_TS", "")
@@ -92,10 +94,19 @@ def _notify_task_failure(slack_token: str) -> None:
         logger.warning("SLACK_CHANNEL or SLACK_THREAD_TS not set, skipping failure notification")
         return
 
-    message = (
-        "タスクの処理中にエラーが発生しました。\n"
-        "Claude OAuthトークンが期限切れの場合は、開発環境で `claude` コマンドを実行して再ログインしてください。"
-    )
+    if isinstance(exc, NotionCloudflareBlockError):
+        execution_id = os.environ.get("EXECUTION_ID", "<unknown>")
+        message = (
+            "Notion 前段（Cloudflare）でリクエストが拒否されたため、保存に失敗しました。\n"
+            "数分〜数十分ほど時間を空けて再投入をお試しください。\n"
+            "繰り返し失敗する場合はログを確認しますのでお知らせください。\n"
+            f"execution_id: `{execution_id}`"
+        )
+    else:
+        message = (
+            "タスクの処理中にエラーが発生しました。\n"
+            "Claude OAuthトークンが期限切れの場合は、開発環境で `claude` コマンドを実行して再ログインしてください。"
+        )
     try:
         SlackClient(slack_token).post_error(channel, thread_ts, message)
     except Exception:
@@ -123,9 +134,9 @@ def main() -> None:
             _run_feedback(slack_client, db_client)
         else:
             _run_orchestrator(slack_client, db_client, notion_token, github_token)
-    except Exception:
+    except Exception as exc:
         logger.exception("Task failed")
-        _notify_task_failure(slack_token)
+        _notify_task_failure(slack_token, exc)
         raise
 
 

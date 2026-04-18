@@ -182,6 +182,42 @@ class TestNotifyTaskFailure:
             # 例外が外に伝播しないこと
             _notify_task_failure("slack-token")
 
+    def test_cloudflare_exception_sends_retry_message(self, monkeypatch):
+        from storage.notion_client import NotionCloudflareBlockError
+
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-cf-1")
+        mock_slack = MagicMock()
+
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            exc = NotionCloudflareBlockError("blocked", cf_ray="r-1")
+            _notify_task_failure("slack-token", exc)
+
+        mock_slack.post_error.assert_called_once()
+        message = mock_slack.post_error.call_args[0][2]
+        assert "Notion 前段（Cloudflare）" in message
+        assert "再投入" in message
+        assert "exec-cf-1" in message
+        assert "Claude OAuth" not in message
+
+    def test_generic_exception_sends_oauth_message(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        mock_slack = MagicMock()
+
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", RuntimeError("boom"))
+
+        mock_slack.post_error.assert_called_once()
+        message = mock_slack.post_error.call_args[0][2]
+        assert "Claude OAuth" in message
+        assert "Cloudflare" not in message
+
 
 # ---------------------------------------------------------------------------
 # main() — TASK_TYPE ルーティング
@@ -258,7 +294,10 @@ class TestMain:
             with pytest.raises(RuntimeError, match="boom"):
                 main()
 
-        mock_notify.assert_called_once_with("secret")
+        mock_notify.assert_called_once()
+        call_args = mock_notify.call_args
+        assert call_args[0][0] == "secret"
+        assert isinstance(call_args[0][1], RuntimeError)
 
     def test_fetches_all_four_secrets(self, monkeypatch):
         self._set_common_env(monkeypatch)

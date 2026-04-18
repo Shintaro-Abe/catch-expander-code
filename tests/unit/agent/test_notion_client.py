@@ -227,3 +227,171 @@ class TestNotionClient:
 
         assert mock_request.call_count == 3
         assert mock_sleep.call_count == 3
+
+
+class TestCloudflareBlockDetection:
+    """_request_with_retry の Cloudflare 403 検知テスト"""
+
+    _CF_BLOCK_HTML = (
+        '<!DOCTYPE html><html lang="en-US"><head>'
+        "<title>Attention Required! | Cloudflare</title>"
+        '<link rel="stylesheet" href="/cdn-cgi/styles/cf.errors.css" />'
+        "</head><body>blocked</body></html>"
+    )
+    _CF_CSS_ONLY_HTML = '<html><head><link href="/cdn-cgi/styles/cf.errors.css" /></head></html>'
+
+    def _make_client(self):
+        from storage.notion_client import NotionClient
+
+        return NotionClient("ntn_test_token", "db-id-123")
+
+    def _make_error_response(self, status_code: int, text: str, headers: dict | None = None):
+        import requests
+
+        response = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        response.status_code = status_code
+        response.text = text
+        response.headers = headers or {}
+        response.raise_for_status.side_effect = requests.HTTPError(response=response)
+        return response
+
+    @patch("storage.notion_client.requests.request")
+    def test_cloudflare_block_raises_dedicated_exception(self, mock_request):
+        from storage.notion_client import NotionCloudflareBlockError
+
+        mock_request.return_value = self._make_error_response(
+            403, self._CF_BLOCK_HTML, {"CF-Ray": "abc123-NRT", "Server": "cloudflare"}
+        )
+
+        client = self._make_client()
+        with pytest.raises(NotionCloudflareBlockError):
+            client.create_page("Test", "技術", [], None, "U1")
+
+        assert mock_request.call_count == 1
+
+    @patch("storage.notion_client.requests.request")
+    def test_cloudflare_css_signature_also_detected(self, mock_request):
+        from storage.notion_client import NotionCloudflareBlockError
+
+        mock_request.return_value = self._make_error_response(
+            403, self._CF_CSS_ONLY_HTML, {"CF-Ray": "xyz999"}
+        )
+
+        client = self._make_client()
+        with pytest.raises(NotionCloudflareBlockError):
+            client.create_page("Test", "技術", [], None, "U1")
+
+    @patch("storage.notion_client.requests.request")
+    def test_cloudflare_block_exposes_cf_ray(self, mock_request):
+        from storage.notion_client import NotionCloudflareBlockError
+
+        mock_request.return_value = self._make_error_response(
+            403, self._CF_BLOCK_HTML, {"CF-Ray": "ray-value-42", "Server": "cloudflare"}
+        )
+
+        client = self._make_client()
+        with pytest.raises(NotionCloudflareBlockError) as exc_info:
+            client.create_page("Test", "技術", [], None, "U1")
+
+        assert exc_info.value.cf_ray == "ray-value-42"
+
+    @patch("storage.notion_client.requests.request")
+    def test_notion_json_403_is_not_cloudflare(self, mock_request):
+        """Notion 本体からの JSON 403（権限不足等）は従来通り HTTPError"""
+        import requests
+
+        from storage.notion_client import NotionCloudflareBlockError
+
+        mock_request.return_value = self._make_error_response(
+            403,
+            '{"object":"error","status":403,"code":"restricted_resource","message":"Missing permissions"}',
+            {"Content-Type": "application/json"},
+        )
+
+        client = self._make_client()
+        with pytest.raises(requests.HTTPError) as exc_info:
+            client.create_page("Test", "技術", [], None, "U1")
+
+        assert not isinstance(exc_info.value, NotionCloudflareBlockError)
+
+    @patch("storage.notion_client.requests.request")
+    def test_401_is_not_cloudflare(self, mock_request):
+        import requests
+
+        from storage.notion_client import NotionCloudflareBlockError
+
+        mock_request.return_value = self._make_error_response(401, "Unauthorized", {})
+
+        client = self._make_client()
+        with pytest.raises(requests.HTTPError) as exc_info:
+            client.create_page("Test", "技術", [], None, "U1")
+
+        assert not isinstance(exc_info.value, NotionCloudflareBlockError)
+
+    @patch("storage.notion_client.time.sleep")
+    @patch("storage.notion_client.requests.request")
+    def test_500_retries_as_before(self, mock_request, mock_sleep):
+        """500 は既存リトライ動作のまま（Cloudflare 判定の影響を受けない）"""
+        import requests
+
+        mock_request.return_value = self._make_error_response(500, "Server Error", {})
+
+        client = self._make_client()
+        with pytest.raises(requests.HTTPError):
+            client.create_page("Test", "技術", [], None, "U1")
+
+        assert mock_request.call_count == 3
+        assert mock_sleep.call_count == 3
+
+    @patch("storage.notion_client.requests.request")
+    def test_cloudflare_block_logs_cf_headers(self, mock_request, caplog):
+        import logging
+
+        from storage.notion_client import NotionCloudflareBlockError
+
+        mock_request.return_value = self._make_error_response(
+            403,
+            self._CF_BLOCK_HTML,
+            {"CF-Ray": "log-ray-1", "cf-mitigated": "challenge", "Server": "cloudflare"},
+        )
+
+        client = self._make_client()
+        with caplog.at_level(logging.WARNING, logger="catch-expander-agent"):
+            with pytest.raises(NotionCloudflareBlockError):
+                client.create_page("Test", "技術", [], None, "U1")
+
+        records = [r for r in caplog.records if "blocked by Cloudflare" in r.getMessage()]
+        assert len(records) == 1
+        record = records[0]
+        assert getattr(record, "cf_ray", None) == "log-ray-1"
+        assert getattr(record, "cf_mitigated", None) == "challenge"
+        assert getattr(record, "user_agent_sent", None) == "<default>"
+
+    @patch("storage.notion_client.requests.request")
+    def test_sensitive_headers_are_not_logged(self, mock_request, caplog):
+        import logging
+
+        from storage.notion_client import NotionCloudflareBlockError
+
+        mock_request.return_value = self._make_error_response(
+            403,
+            self._CF_BLOCK_HTML,
+            {
+                "CF-Ray": "sec-ray",
+                "Set-Cookie": "__cf_bm=SECRET-COOKIE; Path=/",
+                "Authorization": "Bearer LEAKED",
+                "Server": "cloudflare",
+            },
+        )
+
+        client = self._make_client()
+        with caplog.at_level(logging.WARNING, logger="catch-expander-agent"):
+            with pytest.raises(NotionCloudflareBlockError):
+                client.create_page("Test", "技術", [], None, "U1")
+
+        records = [r for r in caplog.records if "blocked by Cloudflare" in r.getMessage()]
+        assert len(records) == 1
+        response_headers_log = getattr(records[0], "response_headers", "")
+        assert "SECRET-COOKIE" not in response_headers_log
+        assert "LEAKED" not in response_headers_log
+        assert "__cf_bm" not in response_headers_log
