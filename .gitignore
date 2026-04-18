@@ -23,9 +23,18 @@ credentials.json
 
 # IDE
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
+
+# Claude Code (local settings / session-scoped)
+.claude/agents/
+.claude/commands/prompt_catchexpander_002.md
+.claude/settings.local.json
+
+# mypy
+.mypy_cache/
 
 # OS
 .DS_Store
