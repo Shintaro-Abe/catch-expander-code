@@ -87,6 +87,12 @@
 
 検証結果を集約し、品質メタデータを構成してください。
 
+#### newest_source_date / oldest_source_date の集計ルール
+
+- `published_at` が **ISO 8601 日付文字列**の出典のみを対象に最新・最古を算出する
+- `"unknown"` / `"continuously-updated"` などの非日付値は集計から**除外**する
+- 日付情報を持つ出典が1件もない場合は両フィールドに `null` を設定する
+
 ## 出力形式
 
 以下のJSON形式で出力してください。

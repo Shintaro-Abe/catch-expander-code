@@ -629,6 +629,25 @@ class Orchestrator:
 
         return review_result, current_deliverables
 
+    @staticmethod
+    def _format_freshness_line(metadata: dict) -> str:
+        """情報の鮮度行を組み立てる。日付値が無い場合は注意書きにフォールバックする。
+
+        reviewer 側で `published_at` が "unknown" / "continuously-updated" の出典は
+        newest/oldest 集計から除外され null になる前提。表示側でも null と
+        非日付文字列を「日付情報なし」として同じ表記に寄せる。
+        """
+        newest = metadata.get("newest_source_date")
+        oldest = metadata.get("oldest_source_date")
+        non_date = {None, "", "unknown", "continuously-updated", "N/A"}
+        newest_valid = newest not in non_date
+        oldest_valid = oldest not in non_date
+        if not newest_valid and not oldest_valid:
+            return "情報の鮮度: 取得日不明のソースが含まれます"
+        newest_text = newest if newest_valid else "不明"
+        oldest_text = oldest if oldest_valid else "不明"
+        return f"情報の鮮度: 最新 {newest_text} / 最古 {oldest_text}"
+
     def _build_quality_metadata_block(self, metadata: dict) -> list[dict]:
         """品質メタデータをNotionブロック形式で構築する"""
         lines = ["■ 品質情報\n"]
@@ -645,9 +664,7 @@ class Orchestrator:
             details = metadata.get("unverified_details", [])
             lines.append(f"  ⚠️ 未検証の記述: {unverified}件（{', '.join(details)}）")
 
-        newest = metadata.get("newest_source_date", "N/A")
-        oldest = metadata.get("oldest_source_date", "N/A")
-        lines.append(f"\n情報の鮮度: 最新 {newest} / 最古 {oldest}")
+        lines.append(f"\n{self._format_freshness_line(metadata)}")
 
         passed = metadata.get("checklist_passed", 0)
         total = metadata.get("checklist_total", 0)

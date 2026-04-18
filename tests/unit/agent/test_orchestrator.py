@@ -798,3 +798,69 @@ class TestBuildQualityMetadataBlock:
         text = self._block_text(blocks)
         assert "未検証の記述: 2件" in text
         assert "セクション3の市場規模" in text
+
+    # --- S2: published_at フォールバック ---
+
+    def test_freshness_displays_date_range_when_both_present(self):
+        """正常な日付ペアはそのまま「最新 X / 最古 Y」で表示する"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 3,
+                "sources_total": 10,
+                "newest_source_date": "2026-04-02",
+                "oldest_source_date": "2024-11-15",
+            }
+        )
+        text = self._block_text(blocks)
+        assert "情報の鮮度: 最新 2026-04-02 / 最古 2024-11-15" in text
+
+    def test_freshness_falls_back_when_both_null(self):
+        """newest/oldest が両方 null/欠損の場合、注意書きに切り替わる"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 3,
+                "sources_total": 10,
+                "newest_source_date": None,
+                "oldest_source_date": None,
+            }
+        )
+        text = self._block_text(blocks)
+        assert "情報の鮮度: 取得日不明のソースが含まれます" in text
+        assert "N/A" not in text
+
+    def test_freshness_falls_back_when_keys_missing(self):
+        """newest/oldest キー自体が無い場合も注意書きに切り替わる"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block({"sources_verified": 0})
+        text = self._block_text(blocks)
+        assert "情報の鮮度: 取得日不明のソースが含まれます" in text
+
+    def test_freshness_treats_unknown_marker_as_missing(self):
+        """"unknown" / "continuously-updated" は日付として扱わず注意書きに切り替わる"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 3,
+                "sources_total": 10,
+                "newest_source_date": "continuously-updated",
+                "oldest_source_date": "unknown",
+            }
+        )
+        text = self._block_text(blocks)
+        assert "情報の鮮度: 取得日不明のソースが含まれます" in text
+
+    def test_freshness_shows_partial_when_one_side_missing(self):
+        """片側のみ日付が取れた場合は欠損側を「不明」と表示する"""
+        orch = self._make_orch()
+        blocks = orch._build_quality_metadata_block(
+            {
+                "sources_verified": 3,
+                "sources_total": 10,
+                "newest_source_date": "2026-04-02",
+                "oldest_source_date": None,
+            }
+        )
+        text = self._block_text(blocks)
+        assert "情報の鮮度: 最新 2026-04-02 / 最古 不明" in text
