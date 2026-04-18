@@ -39,20 +39,20 @@
 
 ### M3: コード成果物生成を成果物タイプ別に完全分離
 
-- [ ] **M3-1** `src/agent/prompts/generator.md` から `code_files` に関する出力指示・構造化ルールを削除、出力形式を `content_blocks + summary` のみに改訂
-- [ ] **M3-2** `_build_code_generation_prompt` シグネチャを `code_type: str`（単一）に変更、`code_type_labels` を内部で保持
-- [ ] **M3-3** `orchestrator.py` の 5〜5b セクションを改訂:
+- [x] **M3-1** `src/agent/prompts/generator.md` から `code_files` に関する出力指示・構造化ルールを削除、出力形式を `content_blocks + summary` のみに改訂
+- [x] **M3-2** `_build_code_generation_prompt` シグネチャを `code_type: str`(単一) に変更、`code_type_labels` を内部で保持
+- [x] **M3-3** `orchestrator.py` の 5〜5b セクションを改訂:
   - 初回 `call_claude(gen_prompt)` の結果 `deliverables` に code_files 期待を削除
   - `code_types` がある場合は常にタイプ別ループで `_build_code_generation_prompt` を呼び、結果を `code_files_merged` と `readme_parts` に蓄積
   - 最後に `deliverables["code_files"] = {"files": code_files_merged, "readme_content": ...}` をセット（空なら設定しない）
-- [ ] **M3-4** 各タイプ成功時に `"Code files generated"` ログ（code_type, files_count）
-- [ ] **M3-5** タイプ失敗時に `"Code generation failed for type"` warning
-- [ ] **M3-6** `tests/test_orchestrator.py` に以下のテスト追加:
+- [x] **M3-4** 各タイプ成功時に `"Code files generated"` ログ（code_type, files_count）
+- [x] **M3-5** タイプ失敗時に `"Code generation failed for type"` warning
+- [x] **M3-6** `tests/test_orchestrator.py` に以下のテスト追加:
   - `test_code_generation_per_type_merges_files`
   - `test_code_generation_partial_failure_keeps_successful_types`
   - `test_generator_no_longer_returns_code_files`（generator.md 改訂検証）
-- [ ] **M3-7** 既存の code_files fallback テストを「常に独立生成」パスに更新
-- [ ] **M3-8** `pytest tests/` 全件パス確認
+- [x] **M3-7** 既存の code_files fallback テストを「常に独立生成」パスに更新（該当する既存テストはなく、新規パスを上記で網羅）
+- [x] **M3-8** `pytest tests/` 全件パス確認（164 passed）
 
 ### フェーズ 1 完了条件
 

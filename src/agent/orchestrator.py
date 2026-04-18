@@ -149,22 +149,25 @@ def _parse_claude_response(raw: str) -> dict:
     return {"raw_text": text, "parse_error": True}
 
 
+_CODE_TYPE_LABELS = {
+    "iac_code": "IaCコード（Terraform または CloudFormation）",
+    "program_code": "プログラムコード（Python またはユーザープロファイルの技術スタック）",
+}
+
+
 def _build_code_generation_prompt(
     topic: str,
     category: str,
     research_results: list[dict],
     profile_text: str,
-    code_types: list[str],
+    code_type: str,
 ) -> str:
-    """コード成果物生成専用プロンプトを構築する
+    """単一タイプのコード成果物生成専用プロンプトを構築する
 
-    コード生成をテキスト成果物生成から分離することで、応答サイズ超過によるJSON解析失敗を防ぐ。
+    コード生成をテキスト成果物生成から、さらにタイプごとに分離することで、
+    応答サイズ超過によるJSON解析失敗を防ぐ。
     """
-    code_type_labels = {
-        "iac_code": "IaCコード（Terraform または CloudFormation）",
-        "program_code": "プログラムコード（Python またはユーザープロファイルの技術スタック）",
-    }
-    requested_types = "\n".join(f"- {code_type_labels.get(t, t)}" for t in code_types)
+    requested_type = _CODE_TYPE_LABELS.get(code_type, code_type)
 
     # 調査サマリーのみ抽出（ソース一覧は省略してプロンプトサイズを抑制）
     research_summary = "\n\n".join(
@@ -184,7 +187,8 @@ def _build_code_generation_prompt(
         f"カテゴリ: {category}\n"
         f"ユーザープロファイル:\n{profile_text}\n\n"
         "## 生成するコード種別\n\n"
-        f"{requested_types}\n\n"
+        f"- {requested_type}\n\n"
+        "このプロンプトでは上記 **1種類のみ** を生成してください。\n\n"
         "## 調査結果サマリー\n\n"
         f"{research_summary}\n\n"
         "## 出力形式\n\n"
@@ -340,30 +344,58 @@ class Orchestrator:
         )
         gen_raw = call_claude(gen_prompt)
         deliverables = _parse_claude_response(gen_raw)
+        # ジェネレーターは text 成果物のみを返す。code_files は常に独立生成する
+        deliverables.pop("code_files", None)
 
-        # 5b. コード成果物の独立生成
-        # ジェネレーターがコードを含む大きな応答を1回で返せない場合のフォールバック:
-        # code_files が null のとき、コード生成専用プロンプトで再試行する
+        # 5b. コード成果物のタイプ別独立生成
+        # テキスト成果物と分離し、さらに iac_code / program_code ごとに個別の Claude 呼び出しに分割して
+        # 応答サイズ超過による JSON 解析失敗を防ぐ
         generate_step_types = [s.get("deliverable_type") for s in workflow.get("generate_steps", [])]
         code_types = [t for t in generate_step_types if t in ("iac_code", "program_code")]
-        if code_types and "github" in storage_targets and not deliverables.get("code_files"):
-            logger.info(
-                "Generating code files separately",
-                extra={"execution_id": execution_id, "code_types": code_types},
-            )
+        if code_types and "github" in storage_targets:
             self.slack.post_progress(slack_channel, slack_thread_ts, "⚙️ コード成果物を生成中...")
-            code_raw = call_claude(
-                _build_code_generation_prompt(topic, category, research_results, profile_text, code_types)
-            )
-            code_result = _parse_claude_response(code_raw)
-            if isinstance(code_result, dict) and code_result.get("files"):
-                deliverables["code_files"] = code_result
-                logger.info("Code files generated successfully", extra={"execution_id": execution_id})
-            else:
-                logger.warning(
-                    "Code file generation returned empty result",
-                    extra={"execution_id": execution_id, "parse_error": code_result.get("parse_error", False)},
+            code_files_merged: dict[str, str] = {}
+            readme_parts: list[str] = []
+            for code_type in code_types:
+                logger.info(
+                    "Generating code files for type",
+                    extra={"execution_id": execution_id, "code_type": code_type},
                 )
+                code_raw = call_claude(
+                    _build_code_generation_prompt(topic, category, research_results, profile_text, code_type)
+                )
+                code_result = _parse_claude_response(code_raw)
+                files = code_result.get("files") if isinstance(code_result, dict) else None
+                if isinstance(files, dict) and files:
+                    code_files_merged.update(files)
+                    readme = code_result.get("readme_content") if isinstance(code_result, dict) else None
+                    if isinstance(readme, str) and readme.strip():
+                        label = _CODE_TYPE_LABELS.get(code_type, code_type)
+                        readme_parts.append(f"## {label}\n\n{readme}")
+                    logger.info(
+                        "Code files generated",
+                        extra={
+                            "execution_id": execution_id,
+                            "code_type": code_type,
+                            "files_count": len(files),
+                        },
+                    )
+                else:
+                    logger.warning(
+                        "Code generation failed for type",
+                        extra={
+                            "execution_id": execution_id,
+                            "code_type": code_type,
+                            "parse_error": code_result.get("parse_error", False)
+                            if isinstance(code_result, dict)
+                            else True,
+                        },
+                    )
+            if code_files_merged:
+                deliverables["code_files"] = {
+                    "files": code_files_merged,
+                    "readme_content": "\n\n".join(readme_parts) if readme_parts else "",
+                }
 
         # 6. レビュアー起動 + レビューループ
         self.db.update_execution_status(execution_id, "reviewing")

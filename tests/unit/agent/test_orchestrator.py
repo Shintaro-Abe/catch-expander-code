@@ -469,6 +469,168 @@ class TestReviewLoop:
         assert final_deliverables == original
 
 
+class TestCodeGeneration:
+    """コード成果物のタイプ別独立生成テスト（M3）"""
+
+    def _make_analysis_and_workflow(self, deliverable_types: list[str]):
+        analysis = {
+            "category": "技術",
+            "intent": "test",
+            "perspectives": [],
+            "deliverable_types": deliverable_types,
+        }
+        workflow = {
+            "research_steps": [
+                {"step_id": "r-1", "step_name": "概要", "description": "test", "search_hints": []},
+            ],
+            "generate_steps": [{"step_id": f"g-{i}", "step_name": t, "deliverable_type": t} for i, t in enumerate(deliverable_types)],
+            "storage_targets": ["github"],
+        }
+        research = {"step_id": "r-1", "summary": "調査結果", "sources": []}
+        return analysis, workflow, research
+
+    def test_generator_no_longer_returns_code_files(self):
+        """generator.md から code_files 関連の出力指示が削除されている"""
+        from pathlib import Path
+
+        # プロンプトファイル直読（_load_prompt を経由しないことで CI 環境差異を回避）
+        prompt_path = Path(__file__).resolve().parents[3] / "src" / "agent" / "prompts" / "generator.md"
+        content = prompt_path.read_text(encoding="utf-8")
+
+        # 出力形式セクションに code_files が含まれていない（フィールド定義として）
+        assert '"code_files":' not in content
+        # README として code_files 禁止の方針が書かれている
+        assert "code_files" in content  # 文脈上の言及は OK（禁止の明示など）
+        # コード成果物の構造化ルールセクションが削除されている
+        assert "コード成果物の構造化ルール" not in content
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_code_generation_per_type_merges_files(self, mock_call_claude, _mock_load):
+        """iac_code と program_code が個別呼び出しでマージされる"""
+        from orchestrator import Orchestrator
+
+        analysis, workflow, research = self._make_analysis_and_workflow(["iac_code", "program_code"])
+        text_deliverables = {"content_blocks": [], "summary": "完成"}
+        review = {"passed": True, "issues": [], "quality_metadata": {}}
+
+        iac_result = {"files": {"main.tf": "# iac"}, "readme_content": "IaC README"}
+        prog_result = {"files": {"app.py": "# program"}, "readme_content": "Program README"}
+
+        mock_call_claude.side_effect = [
+            json.dumps({"result": json.dumps(analysis)}),
+            json.dumps({"result": json.dumps(workflow)}),
+            json.dumps({"result": json.dumps(research)}),
+            json.dumps({"result": json.dumps(text_deliverables)}),
+            json.dumps({"result": json.dumps(iac_result)}),
+            json.dumps({"result": json.dumps(prog_result)}),
+            json.dumps({"result": json.dumps(review)}),
+        ]
+
+        db = MagicMock()
+        db.get_user_profile.return_value = None
+        db._table.return_value = MagicMock()
+        slack = MagicMock()
+
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+        orch.github.push_files.return_value = "https://github.com/owner/repo"
+
+        orch.run("exec-1", "U1", "テスト", "C1", "ts1")
+
+        orch.github.push_files.assert_called_once()
+        files_arg = orch.github.push_files.call_args.args[1]
+        assert "main.tf" in files_arg
+        assert "app.py" in files_arg
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_code_generation_partial_failure_keeps_successful_types(self, mock_call_claude, _mock_load):
+        """一方のタイプが parse_error でも、もう一方は push される"""
+        from orchestrator import Orchestrator
+
+        analysis, workflow, research = self._make_analysis_and_workflow(["iac_code", "program_code"])
+        text_deliverables = {"content_blocks": [], "summary": "完成"}
+        review = {"passed": True, "issues": [], "quality_metadata": {}}
+
+        iac_result = {"files": {"main.tf": "# iac"}, "readme_content": "IaC README"}
+        # program_code は壊れた JSON
+        prog_broken = "not a json"
+
+        mock_call_claude.side_effect = [
+            json.dumps({"result": json.dumps(analysis)}),
+            json.dumps({"result": json.dumps(workflow)}),
+            json.dumps({"result": json.dumps(research)}),
+            json.dumps({"result": json.dumps(text_deliverables)}),
+            json.dumps({"result": json.dumps(iac_result)}),
+            json.dumps({"result": prog_broken}),
+            json.dumps({"result": json.dumps(review)}),
+        ]
+
+        db = MagicMock()
+        db.get_user_profile.return_value = None
+        db._table.return_value = MagicMock()
+        slack = MagicMock()
+
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+        orch.github.push_files.return_value = "https://github.com/owner/repo"
+
+        orch.run("exec-1", "U1", "テスト", "C1", "ts1")
+
+        orch.github.push_files.assert_called_once()
+        files_arg = orch.github.push_files.call_args.args[1]
+        assert "main.tf" in files_arg
+        assert "app.py" not in files_arg
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_generator_code_files_always_discarded(self, mock_call_claude, _mock_load):
+        """ジェネレーターが誤って code_files を返しても、システム側で破棄される"""
+        from orchestrator import Orchestrator
+
+        analysis, workflow, research = self._make_analysis_and_workflow(["iac_code"])
+        # 旧仕様のような code_files 混入を模擬
+        text_deliverables = {
+            "content_blocks": [],
+            "code_files": {"files": {"LEAK.tf": "# must not be used"}, "readme_content": ""},
+            "summary": "完成",
+        }
+        review = {"passed": True, "issues": [], "quality_metadata": {}}
+        iac_result = {"files": {"main.tf": "# iac"}, "readme_content": "IaC README"}
+
+        mock_call_claude.side_effect = [
+            json.dumps({"result": json.dumps(analysis)}),
+            json.dumps({"result": json.dumps(workflow)}),
+            json.dumps({"result": json.dumps(research)}),
+            json.dumps({"result": json.dumps(text_deliverables)}),
+            json.dumps({"result": json.dumps(iac_result)}),
+            json.dumps({"result": json.dumps(review)}),
+        ]
+
+        db = MagicMock()
+        db.get_user_profile.return_value = None
+        db._table.return_value = MagicMock()
+        slack = MagicMock()
+
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+        orch.github.push_files.return_value = "https://github.com/owner/repo"
+
+        orch.run("exec-1", "U1", "テスト", "C1", "ts1")
+
+        orch.github.push_files.assert_called_once()
+        files_arg = orch.github.push_files.call_args.args[1]
+        assert "main.tf" in files_arg
+        assert "LEAK.tf" not in files_arg
+
+
 class TestLearnedPreferencesInProfileText:
     """learned_preferences が profile_text に反映されるテスト"""
 
