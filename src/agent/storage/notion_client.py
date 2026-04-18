@@ -38,19 +38,23 @@ class NotionClient:
                 # 4xxはクライアントエラーのためリトライしない
                 if e.response.status_code < 500:
                     logger.error(
-                        "Notion API client error",
-                        extra={"status": e.response.status_code, "response_body": response_body},
+                        "Notion API client error | method=%s url=%s status=%d response_body=%r",
+                        method,
+                        url,
+                        e.response.status_code,
+                        response_body,
                     )
                     raise
                 wait = 2**attempt
                 logger.warning(
-                    "Notion API server error, retrying",
-                    extra={
-                        "attempt": attempt + 1,
-                        "wait_seconds": wait,
-                        "status": e.response.status_code,
-                        "response_body": response_body,
-                    },
+                    "Notion API server error, retrying | attempt=%d wait_seconds=%d "
+                    "method=%s url=%s status=%d response_body=%r",
+                    attempt + 1,
+                    wait,
+                    method,
+                    url,
+                    e.response.status_code,
+                    response_body,
                 )
                 time.sleep(wait)
         if last_error:

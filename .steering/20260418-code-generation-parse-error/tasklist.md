@@ -52,10 +52,11 @@ PA-5 の分類結果に応じて該当ブランチのみ実装（複数該当時
 
 ### B-2: スキーマ正規化（root cause = R2 or R3）
 
-- [ ] **B2-1** `src/agent/orchestrator.py` に `_normalize_code_files_payload(parsed: dict) -> dict` を追加。`code_files.files` / `output.files` / トップレベル `*.tf` 直接配置 などの揺れを `{"files": dict, "readme_content": str}` に揃える
-- [ ] **B2-2** コード生成ループ内 `code_result = _parse_claude_response(code_raw)` 直後に正規化を挟む
-- [ ] **B2-3** 正規化はコード生成パスに限定（テキスト成果物パスへ波及させない）
-- [ ] **B2-4** 各揺れパターン別のユニットテスト追加（`code_files.files` ネスト / トップレベル `*.tf` 直接配置 / `output.files` 等）
+- [x] **B2-1** `src/agent/orchestrator.py` に `_normalize_code_files_payload(parsed)` と `_looks_like_file_path(key)` を追加。トップレベル `*.tf` / `*.py` 直接配置を `{"files": dict, "readme_content": str}` に変換
+- [x] **B2-2** コード生成ループ内 `code_result = _parse_claude_response(code_raw)` 直後に正規化を挟む
+- [x] **B2-3** 正規化はコード生成パスに限定（テキスト成果物パスへ波及させない）。`_parse_claude_response` 自体は無変更
+- [x] **B2-4** ユニットテスト 11 件追加（`TestNormalizeCodeFilesPayload`）。観測例 / readme 保持 / 既存 wrapped 形式 passthrough / 誤検知抑制（少数派ファイルキー / 単一ファイル / 値が dict）/ ヘルパー個別テスト
+- [x] **B2-5（追加）** B-2 push 前の検証実行で Notion 400 失敗が新規発覚。同 commit に `notion_client.py` の `Notion API client error` / `Notion API server error` ログを Phase A 同様の本文埋込形式に書換（method / url / status / response_body）。AC-3 検証時に Notion 失敗 root cause も同時観測する
 
 ### B-3: プロンプト改訂（root cause = R4）
 
@@ -92,17 +93,20 @@ PA-5 の分類結果に応じて該当ブランチのみ実装（複数該当時
 - requirements.md の AC-1〜AC-3（Must）が全て充足
 - AC-4（回帰テスト）/ AC-5（ドキュメント追記）が達成
 
-## Phase A 観測ログ（PA-5 で記入）
+## Phase A 観測ログ（PA-5 完了）
 
 | 項目 | 値 |
 |------|-----|
-| 観測日時 | （未記入）|
-| execution_id | （未記入）|
-| iac_code root cause | （未記入: R1/R2/R3/R4/R5/その他）|
-| program_code root cause | （未記入）|
-| 適用予定ブランチ | （未記入: B-1/B-2/B-3/B-4 の組合せ）|
-| 観測した応答プレビュー（iac_code） | （未記入）|
-| 観測した応答プレビュー（program_code） | （未記入）|
+| 観測日時 | 2026-04-18 07:46-07:50 UTC（16:46-16:50 JST）|
+| execution_id | `exec-20260418073748-2c27bb2f` |
+| iac_code root cause | **R2（スキーマ違い）** `parse_error=False` / `files_kind=missing` / トップレベルキーがファイル名（`bin/app.ts` 等）|
+| program_code root cause | **R2（スキーマ違い）** `parse_error=False` / `files_kind=missing` / トップレベルキーがファイル名（`app.py` 等）|
+| 適用予定ブランチ | **B-2（スキーマ正規化）** 単独。B-1/B-3/B-4 不要 |
+| 観測した top_level_keys（iac_code） | `['bin/app.ts', 'lib/api-lambda-stack.ts', 'lambda/handler.ts', 'package.json', 'cdk.json']` |
+| 観測した top_level_keys（program_code） | `['app.py', 'stacks/api_gateway_lambda_stack.py', 'lambda/handler.py', 'lambda/authorizer.py', 'requirements.txt']` |
+| 応答サイズ | iac_code: 17,396 chars / program_code: 25,828 chars（サイズ要因ではない）|
+
+**判定根拠:** 両 code_type とも JSON パースは成功しており、Claude が `{"files": {...}, "readme_content": ...}` 形式ではなく、トップレベルにファイルパスをキーとして直接配置した dict を返した。プロンプトの出力形式例（`{"files": {"ファイルパス": "ファイル内容"}}`）を Claude が省略形に解釈した可能性が高い。
 
 ## リスクと対処
 

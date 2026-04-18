@@ -157,6 +157,68 @@ _CODE_TYPE_LABELS = {
 _CODE_FAILURE_PREVIEW_LIMIT = 500
 _CODE_FAILURE_TOP_KEYS_LIMIT = 10
 
+_FILE_EXTENSIONS = {
+    ".tf", ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".txt", ".md",
+    ".yaml", ".yml", ".go", ".rs", ".java", ".toml", ".sh", ".env",
+    ".cfg", ".ini", ".html", ".css", ".rb", ".kt", ".swift",
+}
+_FILENAME_EXACT = {"Dockerfile", "Makefile", "Procfile", ".gitignore", ".env.example"}
+_RESERVED_META_KEYS = {"readme_content", "summary", "parse_error", "raw_text", "files"}
+_FILE_KEY_RATIO_THRESHOLD = 0.8
+_FILE_KEY_MIN_COUNT = 2
+
+
+def _looks_like_file_path(key: str) -> bool:
+    """キーがファイルパスらしいか判定する（`/` 含む or 既知拡張子 or 既知ファイル名）"""
+    if not isinstance(key, str) or not key:
+        return False
+    if "/" in key:
+        return True
+    name = key.rsplit("/", 1)[-1]
+    if name in _FILENAME_EXACT:
+        return True
+    if "." not in name:
+        return False
+    suffix = "." + name.rsplit(".", 1)[-1]
+    return suffix in _FILE_EXTENSIONS
+
+
+def _normalize_code_files_payload(parsed: object) -> object:
+    """コード生成応答が files キーをラップせず、ファイルパスを直接トップレベルに置いた場合に正規化する。
+
+    Phase A 観測（exec-20260418073748-2c27bb2f）で iac_code / program_code 共に
+    `{"bin/app.ts": "...", "package.json": "..."}` 形式で返ったケースを救済する。
+    既に `{"files": {...}}` 形式 / dict でない / parse_error の場合は無変更。
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    if "files" in parsed:
+        return parsed
+    if parsed.get("parse_error"):
+        return parsed
+
+    file_keys: list[str] = []
+    other_keys: list[str] = []
+    for key, value in parsed.items():
+        if key in _RESERVED_META_KEYS:
+            continue
+        if _looks_like_file_path(key) and isinstance(value, str):
+            file_keys.append(key)
+        else:
+            other_keys.append(key)
+
+    total_non_meta = len(file_keys) + len(other_keys)
+    if len(file_keys) < _FILE_KEY_MIN_COUNT or total_non_meta == 0:
+        return parsed
+    if len(file_keys) / total_non_meta < _FILE_KEY_RATIO_THRESHOLD:
+        return parsed
+
+    normalized: dict = {"files": {key: parsed[key] for key in file_keys}}
+    readme = parsed.get("readme_content")
+    if isinstance(readme, str):
+        normalized["readme_content"] = readme
+    return normalized
+
 
 def _build_code_failure_diagnostics(raw: str, parsed: object) -> dict:
     """コード生成失敗時の診断情報を組み立てる。
@@ -412,6 +474,7 @@ class Orchestrator:
                     _build_code_generation_prompt(topic, category, research_results, profile_text, code_type)
                 )
                 code_result = _parse_claude_response(code_raw)
+                code_result = _normalize_code_files_payload(code_result)
                 files = code_result.get("files") if isinstance(code_result, dict) else None
                 if isinstance(files, dict) and files:
                     code_files_merged.update(files)

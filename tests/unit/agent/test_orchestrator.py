@@ -937,3 +937,127 @@ class TestBuildCodeFailureDiagnostics:
         parsed = {f"k{i}": i for i in range(15)}
         diag = _build_code_failure_diagnostics("{}", parsed)
         assert len(diag["top_level_keys"]) == 10
+
+
+class TestNormalizeCodeFilesPayload:
+    """_normalize_code_files_payload のスキーマ正規化テスト（Followup-A B-2）"""
+
+    def test_passes_through_already_wrapped(self):
+        from orchestrator import _normalize_code_files_payload
+
+        original = {"files": {"main.tf": "..."}, "readme_content": "doc"}
+        result = _normalize_code_files_payload(original)
+        assert result is original
+
+    def test_wraps_observed_iac_pattern(self):
+        """exec-20260418073748-2c27bb2f の iac_code 観測例"""
+        from orchestrator import _normalize_code_files_payload
+
+        parsed = {
+            "bin/app.ts": "// app entry",
+            "lib/api-lambda-stack.ts": "// stack",
+            "lambda/handler.ts": "// handler",
+            "package.json": "{}",
+            "cdk.json": "{}",
+        }
+        result = _normalize_code_files_payload(parsed)
+        assert "files" in result
+        assert len(result["files"]) == 5
+        assert result["files"]["bin/app.ts"] == "// app entry"
+        assert result["files"]["package.json"] == "{}"
+        assert "readme_content" not in result
+
+    def test_wraps_observed_program_pattern(self):
+        """exec-20260418073748-2c27bb2f の program_code 観測例"""
+        from orchestrator import _normalize_code_files_payload
+
+        parsed = {
+            "app.py": "import x",
+            "stacks/api_gateway_lambda_stack.py": "class Stack: pass",
+            "lambda/handler.py": "def handler(): pass",
+            "lambda/authorizer.py": "def auth(): pass",
+            "requirements.txt": "boto3",
+        }
+        result = _normalize_code_files_payload(parsed)
+        assert len(result["files"]) == 5
+        assert result["files"]["app.py"] == "import x"
+        assert result["files"]["requirements.txt"] == "boto3"
+
+    def test_preserves_readme_content_when_present(self):
+        from orchestrator import _normalize_code_files_payload
+
+        parsed = {
+            "main.tf": "resource ...",
+            "variables.tf": "variable ...",
+            "readme_content": "## Setup\n...",
+        }
+        result = _normalize_code_files_payload(parsed)
+        assert result["files"] == {"main.tf": "resource ...", "variables.tf": "variable ..."}
+        assert result["readme_content"] == "## Setup\n..."
+
+    def test_passes_through_parse_error(self):
+        from orchestrator import _normalize_code_files_payload
+
+        parsed = {"parse_error": True, "raw_text": "..."}
+        result = _normalize_code_files_payload(parsed)
+        assert result is parsed
+
+    def test_passes_through_non_dict(self):
+        from orchestrator import _normalize_code_files_payload
+
+        for value in [None, "raw text", [1, 2, 3], 42]:
+            assert _normalize_code_files_payload(value) is value
+
+    def test_does_not_wrap_when_majority_non_file_keys(self):
+        """ファイル風キーが少数派の場合は誤検知を避ける"""
+        from orchestrator import _normalize_code_files_payload
+
+        parsed = {
+            "main.tf": "resource ...",
+            "title": "x",
+            "description": "y",
+            "category": "z",
+            "metadata": "w",
+        }
+        result = _normalize_code_files_payload(parsed)
+        assert result is parsed
+
+    def test_does_not_wrap_with_only_one_file_key(self):
+        """ファイル風キーが1つのみだと誤検知の可能性が高いため正規化しない"""
+        from orchestrator import _normalize_code_files_payload
+
+        parsed = {"main.tf": "resource ..."}
+        result = _normalize_code_files_payload(parsed)
+        assert result is parsed
+
+    def test_wraps_when_value_is_string_only(self):
+        """値が string のものだけ files に含める（dict や list は除外）"""
+        from orchestrator import _normalize_code_files_payload
+
+        parsed = {
+            "main.tf": "resource ...",
+            "variables.tf": "variable ...",
+            "config.json": {"nested": "object"},
+        }
+        result = _normalize_code_files_payload(parsed)
+        # config.json は値が dict なので files から除外、結果として 2 ファイル のみ
+        # ただし非ファイルキー扱いになるため比率 2/3 = 0.67 で閾値 0.8 未満 → 正規化しない
+        assert result is parsed
+
+    def test_looks_like_file_path_recognizes_extensions(self):
+        from orchestrator import _looks_like_file_path
+
+        assert _looks_like_file_path("main.tf")
+        assert _looks_like_file_path("app.py")
+        assert _looks_like_file_path("README.md")
+        assert _looks_like_file_path("config.yaml")
+
+    def test_looks_like_file_path_recognizes_paths(self):
+        from orchestrator import _looks_like_file_path
+
+        assert _looks_like_file_path("lib/stack.ts")
+        assert _looks_like_file_path("a/b/c/d.go")
+        assert _looks_like_file_path("Dockerfile")
+        assert not _looks_like_file_path("")
+        assert not _looks_like_file_path("plain_text")
+        assert not _looks_like_file_path("title.x")  # unknown extension
