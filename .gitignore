@@ -34,6 +34,9 @@ credentials.json
 # Dev Container (local dev environment)
 .devcontainer/
 
+# Obsidian (personal knowledge notes)
+obsidian/
+
 # mypy
 .mypy_cache/
 
