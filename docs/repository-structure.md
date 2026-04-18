@@ -101,17 +101,13 @@ Catch-Expander/
 │       ├── conftest.py                # _load_prompt モック（プロンプトファイル不在対応）
 │       └── test_workflow.py
 │
-├── .devcontainer/                     # Dev Container設定
-│   ├── devcontainer.json
-│   └── post_create.sh
-│
-├── .github/                           # GitHub設定
-│   └── workflows/
-│
-└── .claude/                           # Claude Code設定
-    ├── settings.local.json
-    └── commands/
+└── .github/                           # GitHub設定
+    └── workflows/
 ```
+
+> **備考**
+> `.devcontainer/` と `.claude/` はローカル開発環境・エディタ固有設定のため
+> `.gitignore` で追跡対象外としている（公開リポジトリにはアプリケーションコードのみを含める方針）。
 
 > **備考**
 > `src/agent/Dockerfile`、`src/agent/prompts/*.md`、`src/agent/requirements.txt` は

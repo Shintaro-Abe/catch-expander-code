@@ -28,10 +28,11 @@ credentials.json
 *.swo
 *~
 
-# Claude Code (local settings / session-scoped)
-.claude/agents/
-.claude/commands/prompt_catchexpander_002.md
-.claude/settings.local.json
+# Claude Code (local agent settings, skills, session state)
+.claude/
+
+# Dev Container (local dev environment)
+.devcontainer/
 
 # mypy
 .mypy_cache/
