@@ -71,6 +71,7 @@
 | 用語（日本語） | 用語（英語） | 定義 | コード上の命名 |
 |--------------|------------|------|--------------|
 | トリガー関数 | Trigger Function | Slackイベントを受信しECSタスクを起動するLambda関数 | `trigger` |
+| トークンモニター関数 | Token Monitor | Claude OAuth トークンの失効を定期監視し、失効時に Slack へ再ログイン依頼を通知する Lambda 関数 | `token_monitor` |
 | エージェントコンテナ | Agent Container | Claude Code CLIを実行するECS Fargateタスク | `agent` |
 | プロファイルDB | Profile DB | ユーザープロファイルを格納するDynamoDBテーブル | `user_profiles` |
 | 成果物DB | Deliverables DB | Notionのデータベース。全トピックの成果物ページを格納 | `notion_database` |
@@ -93,7 +94,16 @@
 | 完了 | Completed | ワークフローが正常に完了した状態 | `completed` |
 | 失敗 | Failed | ワークフローがエラーで中断した状態 | `failed` |
 
-## 5. 略語・略称
+## 5. エラー・例外
+
+| 用語（日本語） | 用語（英語） | 定義 | コード上の命名 |
+|--------------|------------|------|--------------|
+| Cloudflare ブロック | Cloudflare Block | Notion API 前段の Cloudflare WAF が ECS Fargate からのリクエストを 403 で拒否する事象。HTML ボディに「Attention Required! \| Cloudflare」または `cdn-cgi/styles/cf.errors.css` のシグネチャを含む | `cloudflare_block` |
+| Cloudflare ブロック例外 | Notion Cloudflare Block Error | Cloudflare ブロックを検知したときに `notion_client._request_with_retry` が送出する専用例外。`cf_ray` 属性を保持 | `NotionCloudflareBlockError` |
+| トークン失効 | Token Stale | Claude OAuth トークンの `expiresAt` を現在時刻が `STALE_THRESHOLD_HOURS`（既定 24 時間）以上超過した状態。Token Monitor が Slack 通知を投げる起点 | `is_stale` |
+| OAuth 自動同期 | OAuth Auto Sync | DevContainer 上で `claude login` 実行後に `~/.claude/.credentials.json` の変更を検出し、Secrets Manager `catch-expander/claude-oauth` を自動更新する仕組み（`watch_claude_token.sh` / `sync_claude_token.sh`） | `sync_claude_token` |
+
+## 6. 略語・略称
 
 | 略語 | 正式名称 | 用途 |
 |------|---------|------|
@@ -104,7 +114,7 @@
 | SAM | Serverless Application Model | AWSのサーバーレスIaCフレームワーク |
 | ECR | Elastic Container Registry | AWSのコンテナイメージレジストリ |
 
-## 6. 命名の注意事項
+## 7. 命名の注意事項
 
 ### 使い分けが必要な用語
 

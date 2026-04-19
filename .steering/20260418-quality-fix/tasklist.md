@@ -56,9 +56,9 @@
 
 ### フェーズ 1 完了条件
 
-- [ ] **P1-1** ユニットテスト全件パス
-- [ ] **P1-2** M1/M2/M3 を個別の commit に分割
-- [ ] **P1-3** `git push origin main` でデプロイパイプライン起動（※ push の最終承認はユーザー判断）
+- [x] **P1-1** ユニットテスト全件パス（M3-8 時点で 164 passed）
+- [x] **P1-2** M1/M2/M3 を個別の commit に分割（M1: `f724b3f` / M2: `49d11a2` / M3: `d951ecc`）
+- [x] **P1-3** `git push origin main` でデプロイパイプライン起動済み
 
 ## フェーズ 2: Should 修正（品質向上）
 
@@ -113,9 +113,9 @@
 
 ## フェーズ 4: 後続（保留判断）
 
-- [ ] **N1** （任意）`fix_prompt` の差分修正化を実装。今回 fix loop 未発火のため判断保留（次回 fix 発生時に効果測定）
-- [ ] **Followup-A** AC-2 未達（code 生成 parse error）に対する新 steering 起票。`.steering/[YYYYMMDD]-code-generation-parse-error/` で iac_code / program_code 応答の安定化を扱う
-- [ ] **Followup-B** AC-4（review fix 反映）の追検証。次回 fix loop 発火時に deliverables への修正反映を確認
+- [ ] **N1** （任意）`fix_prompt` の差分修正化を実装。次回 fix loop 発火時に効果測定したうえで判断（保留継続）
+- [x] **Followup-A** `.steering/20260418-code-generation-parse-error/` 起票済み。Phase B-2 まで実装完了、AC-3（storage=notion+github 2 連続）は受動観測待ち
+- [x] **Followup-B** `.steering/20260418-review-fix-reflection-verification/` 起票済み。fix loop 発火を受動観測中
 
 ## 完了条件（全体）
 

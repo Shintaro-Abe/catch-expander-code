@@ -10,27 +10,27 @@
 
 ### T1: 例外クラスと判定ヘルパーの追加
 
-- [ ] **T1-1** `src/agent/storage/notion_client.py` に `NotionCloudflareBlockError(Exception)` を定義（`cf_ray` 属性を保持）
-- [ ] **T1-2** 定数 `_CLOUDFLARE_BLOCK_SIGNATURES = ("Attention Required! | Cloudflare", "cdn-cgi/styles/cf.errors.css")` を追加
-- [ ] **T1-3** `_is_cloudflare_block(status_code: int, body: str) -> bool` をモジュールレベルに追加
-- [ ] **T1-4** 定数 `_CF_HEADER_KEYS = ("CF-Ray", "cf-mitigated", "cf-cache-status", "Server")` / `_SENSITIVE_HEADER_KEYS = {"set-cookie", "authorization"}` を追加
-- [ ] **T1-5** `_extract_cf_headers(headers) -> dict[str, str]` をモジュールレベルに追加（`CF-Ray` 等を個別キーで、機微ヘッダ除外した全体を `response_headers` として str 化 1000 char truncate で格納）
+- [x] **T1-1** `src/agent/storage/notion_client.py` に `NotionCloudflareBlockError(Exception)` を定義（`cf_ray` 属性を保持）
+- [x] **T1-2** 定数 `_CLOUDFLARE_BLOCK_SIGNATURES = ("Attention Required! | Cloudflare", "cdn-cgi/styles/cf.errors.css")` を追加
+- [x] **T1-3** `_is_cloudflare_block(status_code: int, body: str) -> bool` をモジュールレベルに追加
+- [x] **T1-4** 定数 `_CF_HEADER_KEYS = ("CF-Ray", "cf-mitigated", "cf-cache-status", "Server")` / `_SENSITIVE_HEADER_KEYS = {"set-cookie", "authorization"}` を追加
+- [x] **T1-5** `_extract_cf_headers(headers) -> dict[str, str]` をモジュールレベルに追加（`CF-Ray` 等を個別キーで、機微ヘッダ除外した全体を `response_headers` として str 化 1000 char truncate で格納）
 
 ### T2: `_request_with_retry` への組み込み
 
-- [ ] **T2-1** 既存の 4xx 分岐冒頭で `_is_cloudflare_block(e.response.status_code, response_body)` を判定
-- [ ] **T2-2** true の場合、既存 `logger.error` は**出さず**、`logger.warning("Notion request blocked by Cloudflare | method=... url=... status=403", extra={**cf_headers, "user_agent_sent": ..., "body_snippet": response_body[:200]})` を出力
-- [ ] **T2-3** `raise NotionCloudflareBlockError(f"... (CF-Ray={cf_ray})", cf_ray=cf_ray) from e` で送出
-- [ ] **T2-4** false の場合（通常 403 / 401 等）は既存の `logger.error` + `raise` を維持
-- [ ] **T2-5** 5xx 分岐（リトライ）は無変更であることを確認
+- [x] **T2-1** 既存の 4xx 分岐冒頭で `_is_cloudflare_block(e.response.status_code, response_body)` を判定
+- [x] **T2-2** true の場合、既存 `logger.error` は**出さず**、`logger.warning("Notion request blocked by Cloudflare | method=... url=... status=403", extra={**cf_headers, "user_agent_sent": ..., "body_snippet": response_body[:200]})` を出力
+- [x] **T2-3** `raise NotionCloudflareBlockError(f"... (CF-Ray={cf_ray})", cf_ray=cf_ray) from e` で送出
+- [x] **T2-4** false の場合（通常 403 / 401 等）は既存の `logger.error` + `raise` を維持
+- [x] **T2-5** 5xx 分岐（リトライ）は無変更であることを確認
 
 ### T3: `main._notify_task_failure` の分岐対応
 
-- [ ] **T3-1** `src/agent/main.py` に `from storage.notion_client import NotionCloudflareBlockError` を追加
-- [ ] **T3-2** `_notify_task_failure(slack_token: str, exc: BaseException | None = None)` にシグネチャ変更（`exc` は省略可能でデフォルト `None`）
-- [ ] **T3-3** `isinstance(exc, NotionCloudflareBlockError)` の分岐で専用メッセージを組み立て（requirements.md AC-2 の文言例に従う）
-- [ ] **T3-4** それ以外は既存の OAuth 文言を維持
-- [ ] **T3-5** `main()` の `except Exception` を `except Exception as exc:` に変更し `_notify_task_failure(slack_token, exc)` で呼ぶ
+- [x] **T3-1** `src/agent/main.py` に `from storage.notion_client import NotionCloudflareBlockError` を追加
+- [x] **T3-2** `_notify_task_failure(slack_token: str, exc: BaseException | None = None)` にシグネチャ変更（`exc` は省略可能でデフォルト `None`）
+- [x] **T3-3** `isinstance(exc, NotionCloudflareBlockError)` の分岐で専用メッセージを組み立て（requirements.md AC-2 の文言例に従う）
+- [x] **T3-4** それ以外は既存の OAuth 文言を維持
+- [x] **T3-5** `main()` の `except Exception` を `except Exception as exc:` に変更し `_notify_task_failure(slack_token, exc)` で呼ぶ
 
 ## フェーズ 2: テスト
 
@@ -38,53 +38,55 @@
 
 既存 `tests/unit/agent/test_notion_client.py` に `TestCloudflareBlockDetection` クラスとして追加。
 
-- [ ] **T4-1** `test_cloudflare_block_raises_dedicated_exception` — 403 + body に `Attention Required! | Cloudflare` → `NotionCloudflareBlockError` 送出
-- [ ] **T4-2** `test_cloudflare_css_signature_also_detected` — 403 + body に `cdn-cgi/styles/cf.errors.css` のみ → `NotionCloudflareBlockError` 送出
-- [ ] **T4-3** `test_cloudflare_block_exposes_cf_ray` — 送出例外の `cf_ray` 属性にヘッダ値が入る
-- [ ] **T4-4** `test_notion_json_403_is_not_cloudflare` — 403 + JSON body（`{"object":"error","status":403,...}`）→ `NotionCloudflareBlockError` ではなく `HTTPError` が送出される
-- [ ] **T4-5** `test_401_is_not_cloudflare` — 401 → `HTTPError`
-- [ ] **T4-6** `test_500_retries_as_before` — 500 で既存リトライ回数が変わらない（回帰チェック）
-- [ ] **T4-7** `test_cloudflare_block_logs_cf_headers` — caplog で `cf_ray` / `cf_mitigated` / `user_agent_sent` が `extra` に含まれる
-- [ ] **T4-8** `test_sensitive_headers_are_not_logged` — `Set-Cookie` / `Authorization` が `response_headers` ログに出ないことを確認
+- [x] **T4-1** `test_cloudflare_block_raises_dedicated_exception` — 403 + body に `Attention Required! | Cloudflare` → `NotionCloudflareBlockError` 送出
+- [x] **T4-2** `test_cloudflare_css_signature_also_detected` — 403 + body に `cdn-cgi/styles/cf.errors.css` のみ → `NotionCloudflareBlockError` 送出
+- [x] **T4-3** `test_cloudflare_block_exposes_cf_ray` — 送出例外の `cf_ray` 属性にヘッダ値が入る
+- [x] **T4-4** `test_notion_json_403_is_not_cloudflare` — 403 + JSON body（`{"object":"error","status":403,...}`）→ `NotionCloudflareBlockError` ではなく `HTTPError` が送出される
+- [x] **T4-5** `test_401_is_not_cloudflare` — 401 → `HTTPError`
+- [x] **T4-6** `test_500_retries_as_before` — 500 で既存リトライ回数が変わらない（回帰チェック）
+- [x] **T4-7** `test_cloudflare_block_logs_cf_headers` — caplog で `cf_ray` / `cf_mitigated` / `user_agent_sent` が `extra` に含まれる
+- [x] **T4-8** `test_sensitive_headers_are_not_logged` — `Set-Cookie` / `Authorization` が `response_headers` ログに出ないことを確認
 
 ### T5: `main` 側ユニットテスト追加
 
 `tests/unit/agent/test_main.py` が既存であれば追記、無ければ新規作成。
 
-- [ ] **T5-1** 既存テストの有無を `ls tests/unit/agent/test_main.py` で確認
-- [ ] **T5-2** `test_notify_task_failure_cloudflare_sends_retry_message` — `exc=NotionCloudflareBlockError("...", cf_ray="abc")` で `SlackClient.post_error` に渡される message が「Notion 前段（Cloudflare）」で始まることを確認（`execution_id` 含有もチェック）
-- [ ] **T5-3** `test_notify_task_failure_generic_sends_oauth_message` — `exc=RuntimeError("boom")` で従来の OAuth 文言が送られる
-- [ ] **T5-4** `test_notify_task_failure_no_channel_skips` — `SLACK_CHANNEL` 未設定で早期 return（回帰チェック）
+- [x] **T5-1** 既存テストの有無を確認（既存あり）
+- [x] **T5-2** `test_cloudflare_exception_sends_retry_message` — `exc=NotionCloudflareBlockError("...", cf_ray="r-1")` で `SlackClient.post_error` に渡される message が「Notion 前段（Cloudflare）」含有 + `execution_id` 含有を確認
+- [x] **T5-3** `test_generic_exception_sends_oauth_message` — `exc=RuntimeError("boom")` で従来の OAuth 文言が送られる
+- [x] **T5-4** 既存 `test_notifies_slack_and_reraises_on_failure` のシグネチャ変更対応（回帰チェック）
 
 ### T6: テスト全件パス確認
 
-- [ ] **T6-1** `pytest tests/ -q` で全件パス（既存 200 + 新規 11 前後 → 計 211 前後）
+- [x] **T6-1** `pytest tests/ -q` で全件パス（計 **210 passed**: 既存 200 + 新規 10）
 
 ## フェーズ 3: コミット & デプロイ
 
-- [ ] **C1** 単一 commit を作成（T1〜T6 の成果物を包含）
-- [ ] **C2** `git push origin main` で GitHub Actions `build-agent.yml` 経由デプロイ
-- [ ] **C3** デプロイ完了確認（Actions run の success、所要時間は過去実績 3〜4 分）
+- [x] **C1** 単一 commit を作成（`e148df1`: "feat: detect Cloudflare block on Notion 403 and guide slack retry"、7 files / +855 -8）
+- [x] **C2** `git push origin main`（2e62d25..e148df1）
+- [x] **C3** GitHub Actions run `24607025977` success（3m32s / 14:43:12〜14:46:44 UTC）
 
 ## フェーズ 4: 実機検証（AC-6）
 
 ### V1: Slack 投入と結果判定
 
-- [ ] **V1-1** Slack でトピックを 1 件投入（通常の投入で問題ない。Cloudflare 再現は確率的）
-- [ ] **V1-2** CloudWatch で `Notion page created` が出れば → Cloudflare 非再現。V2 へ
-- [ ] **V1-3** CloudWatch で `Notion request blocked by Cloudflare` warning が出れば → V3 へ
-- [ ] **V1-4** いずれも出ず他エラーの場合 → 本 steering 対象外として記録し終了
+- [x] **V1-1** Slack 投入（23:48 JST = 14:48:43 UTC `exec-20260418144822-33a2a5ab` / 00:09 JST = 15:09:11 UTC `exec-20260418150911-13b8268d` の計 2 件）
+- [x] **V1-2** CloudWatch で `Notion page created` 確認（両 execution ともに出力）→ Cloudflare 非再現、V2 へ分岐
+- [x] **V1-3** `Notion request blocked by Cloudflare` warning は**出力されず**
+- [x] **V1-4** 他の致命的エラーも無し
 
 ### V2: Cloudflare 非再現時
 
-- [ ] **V2-1** 本 steering は「潜在問題として残置」扱いで完了。次回再現時に AC-5 ログから AC-7 を実施
-- [ ] **V2-2** 必要であれば追加で 1〜2 回投入し、一定期間（例: 1 週間）ゼロなら正式に完了扱い
+- [x] **V2-1** 本 steering は「潜在問題として残置」扱いで完了。次回再現時に AC-5 ログから AC-7 を実施
+- [x] **V2-2** 2 件で非再現確認済み。追加投入は不要と判断
 
-### V3: Cloudflare 再現時
+### V3: Cloudflare 再現時（今回対象外）
 
-- [ ] **V3-1** Slack スレッドに「Notion 前段（Cloudflare）で拒否〜」メッセージが届いていることを確認（AC-2 達成）
+今回は非再現のため本フェーズは未実施。次回再現観測時に実施する。
+
+- [ ] **V3-1** Slack スレッドに「Notion 前段（Cloudflare）で拒否〜」メッセージが届いていることを確認
 - [ ] **V3-2** DynamoDB `catch-expander-workflow-executions` の status=`failed`
-- [ ] **V3-3** CloudWatch ログに `cf_ray` / `cf_mitigated` / `user_agent_sent` / `response_headers` が `extra` として残っていることを確認（AC-5 達成）
+- [ ] **V3-3** CloudWatch ログに `cf_ray` / `cf_mitigated` / `user_agent_sent` / `response_headers` が `extra` として残っていることを確認
 - [ ] **V3-4** ユーザーに「時間を空けて再投入してください」旨が伝わる形になっているか目視で最終確認
 
 ## フェーズ 5: 根本原因特定（AC-7）
@@ -139,6 +141,17 @@
 ## 観測結果
 
 （再現観測のたびに追記）
+
+### 実機検証（非再現）
+
+| 日時 (UTC) | execution_id | git SHA | status | storage | 備考 |
+|-----------|--------------|---------|--------|---------|------|
+| 2026-04-18 14:48:43 | exec-20260418144822-33a2a5ab | e148df1 | completed | notion+github | Cloudflare 非再現、15m44s で完了 |
+| 2026-04-18 15:09:11 | exec-20260418150911-13b8268d | e148df1 | completed | notion | Cloudflare 非再現、コード生成なしトピック |
+
+### Cloudflare 再現観測
+
+（再現したらここへ追記）
 
 | 日時 (UTC) | execution_id | git SHA | cf_ray | cf_mitigated | user_agent_sent | 仮説判定 | 備考 |
 |-----------|--------------|---------|--------|--------------|-----------------|---------|------|

@@ -222,10 +222,34 @@ claude login
 # 2. 認証ファイルの内容をSecrets Managerに登録
 aws secretsmanager create-secret \
   --name "catch-expander/claude-oauth" \
-  --secret-string file://~/.claude/credentials.json
+  --secret-string file://~/.claude/.credentials.json
 ```
 
-認証ファイルのパスとフォーマットの詳細は実装フェーズで検証する。
+実際の認証ファイルパスは `~/.claude/.credentials.json`（先頭ドット）。
+
+### 4.4 OAuth トークンの自動同期と失効監視
+
+#### 自動同期（DevContainer）
+
+`.devcontainer/sync_claude_token.sh` と `.devcontainer/watch_claude_token.sh` により、
+DevContainer 内で `claude` コマンドにより `~/.claude/.credentials.json` が更新されると、
+変更を検知して Secrets Manager `catch-expander/claude-oauth` を自動的に
+`put-secret-value` で更新する。
+
+セキュリティ上の注意:
+
+- `--secret-string` に直接値を渡すとプロセス一覧（`ps aux` / `/proc/PID/cmdline`）に
+  OAuth トークンが露出するため、0600 権限の一時ファイル経由で `--cli-input-json file://...`
+  として渡している（`sync_claude_token.sh` 参照）。
+
+#### 失効監視（Token Monitor Lambda）
+
+Secrets Manager に格納された Claude OAuth トークンは、Token Monitor Lambda
+（`src/token_monitor/handler.py`、EventBridge Scheduler 起動）により定期的に
+`expiresAt` を確認される。`now > expiresAt + STALE_THRESHOLD_HOURS`（既定 24 時間）の
+ときに失効と判定し、Slack 通知チャンネルへ「DevContainer で `claude` コマンドを実行 →
+自動で Secrets Manager に同期」案内を投稿する。詳細は `architecture.md` 4 「Lambda 設計」
+の「トークンモニター関数」を参照。
 
 #### 不採用とした方式
 

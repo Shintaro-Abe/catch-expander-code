@@ -44,25 +44,25 @@
 
 ## フェーズ 3: コミット & デプロイ
 
-- [ ] **C1** 単一 commit を作成（実装 + テスト）
-- [ ] **C2** `git push origin main` で GitHub Actions build-agent.yml 経由デプロイ
-- [ ] **C3** デプロイ完了確認（GitHub Actions の build-agent.yml ジョブ success）
+- [x] **C1** 単一 commit を作成（`2e62d25`: 実装 + テスト）
+- [x] **C2** `git push origin main` で GitHub Actions build-agent.yml 経由デプロイ済み
+- [x] **C3** デプロイ完了確認
 
 ## フェーズ 4: 実機検証
 
 ### V1: AC-2 確認
 
-- [ ] **V1-1** Slack で「API GatewayとLambdaの組み合わせについて」を投入（長尺コード再現が見込めるトピック）
-- [ ] **V1-2** CloudWatch ログから `Notion API client error.*status=400` が出ていないことを確認
-- [ ] **V1-3** `Notion page created` が出ていることを確認
-- [ ] **V1-4** DynamoDB `catch-expander-workflow-executions` の status=`completed`
-- [ ] **V1-5** DynamoDB `catch-expander-deliverables` の storage=`notion+github`
-- [ ] **V1-6** Notion ページを目視で開き、長尺 code ブロックが連続した 1 個のコードブロックとして自然に表示されていることを確認
+- [x] **V1-1** Slack で「API GatewayとLambdaの組み合わせについて」を投入（exec-20260418144822-33a2a5ab）
+- [x] **V1-2** CloudWatch ログから `Notion API client error.*status=400` が出ていないことを確認
+- [x] **V1-3** `Notion page created` が出ていることを確認
+- [x] **V1-4** DynamoDB `catch-expander-workflow-executions` の status=`completed`
+- [x] **V1-5** DynamoDB `catch-expander-deliverables` の storage=`notion+github`
+- [x] **V1-6** Notion ページを目視確認済み（長尺 code ブロックが自然表示）
 
 ### V2: 関連 steering 同時観測（任意）
 
-- [ ] **V2-1** Followup-A AC-3（storage=notion+github 2 連続）達成のため、別トピックで 1 回追加投入
-- [ ] **V2-2** Followup-B AC-1（fix loop 発火）が出れば、Followup-B の検証フローへ移行（`Deliverables updated by review fix` ログ確認）
+- [ ] **V2-1** Followup-A AC-3（storage=notion+github 2 連続）達成のため、別トピックで 1 回追加投入（**進捗 1/2**: 14:48 で 1 件達成）
+- [ ] **V2-2** Followup-B AC-1（fix loop 発火）が出れば、Followup-B の検証フローへ移行（受動観測継続中）
 
 ## 完了条件
 

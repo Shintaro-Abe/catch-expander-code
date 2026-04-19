@@ -568,6 +568,8 @@ Properties:
 #### 実装上の制約・仕様
 
 - **100ブロック上限**: Notion APIの `append_block_children` は1リクエストあたり100ブロックが上限。`create_page()` は `content_blocks` を100ブロック単位に分割してチャンク投稿する。
+- **`rich_text` 2000文字上限**: Notion API は単一の `rich_text` 要素が 2000 文字を超えると 400 エラーを返す。`create_page()` 投入前に各 `rich_text` を 2000 文字以内に分割し、同一ブロック内の複数 `text` 要素として送信する。
+- **Cloudflare ブロック検知**: `_request_with_retry` は 403 レスポンスのボディに Cloudflare 特有のシグネチャを検出した場合、リトライせず `NotionCloudflareBlockError` を送出する。`cf_ray` / `cf_mitigated` / `user_agent_sent` 等を warning ログの `extra` に記録する（詳細は `architecture.md` 8.5 参照）。
 - **`create_page()` 戻り値**: `tuple[str, str]`（`page_url, page_id`）を返す。`page_id` はステータス更新（`update_page_status()`）に使用する。
 - **出典の `source_id` は呼び出し元で一意化済み**: オーケストレーターが `{step_id}:src-NNN` 形式に名前空間化して `put_sources()` に渡す（M1）。`put_sources()` は UUID 付与は行わず、同じ `source_id` / URL のエントリはスキップしてから DynamoDB `batch_writer()` で一括登録する。
 
@@ -912,7 +914,10 @@ src/agent/feedback/
 | Maxプラン利用上限到達 | Claude Code CLI | エラー通知＋次回利用可能時間を案内 |
 | Web検索失敗 | リサーチャー（WebSearch/WebFetch） | 該当ステップをスキップし、他のステップの結果で継続 |
 | Notion API失敗 | 格納処理 | 最大3回リトライ。全失敗時はSlackにエラー通知＋成果物テキストをSlackに直接投稿 |
+| Notion Cloudflareブロック（403 + Cloudflare HTML） | 格納処理 | `NotionCloudflareBlockError` として識別。リトライせず、Slackスレッドに「数分〜数十分空けて再投入」案内を投稿。`cf_ray` 等の診断情報をwarningログに記録 |
+| Notion `rich_text` 2000文字制限 | 格納処理 | `create_page()` 投入前に各 `rich_text` を 2000 文字以内のチャンクに分割（同一ブロック内の複数 `text` 要素として送信） |
 | GitHub API失敗 | 格納処理 | 最大3回リトライ。全失敗時はコードをNotionのコードブロックに格納（フォールバック） |
+| Claude OAuth 失効 | エージェント起動時 | ECSタスクが例外終了し `_notify_task_failure` が Slackスレッドに「`claude` コマンドで再ログイン」案内を投稿。Token Monitor Lambda も独立に検知して通知 |
 | コンテナ異常終了 | ECS | 状態をDynamoDBに保存しており、コンテナ再起動後に再開 |
 
 ### 部分成果物の出力

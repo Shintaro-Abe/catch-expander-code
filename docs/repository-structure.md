@@ -134,7 +134,7 @@ Slackイベントを受信し、署名検証・ACK応答・ECSタスク起動を
 
 ### `src/token_monitor/` — トークンモニター Lambda
 
-EventBridge の定期スケジュールで発火し、Secrets Manager に保管された Claude OAuth トークンの失効・残期限を監視する。しきい値を割り込んだ場合は Slack 通知で再ログインを促す。
+EventBridge の定期スケジュールで発火し、Secrets Manager に保管された Claude OAuth トークンの `expiresAt` を確認する。`now > expiresAt + STALE_THRESHOLD_HOURS`（既定 24 時間）となった時点で失効と判定し、Slack 通知で再ログインを促す。
 
 ### `src/agent/` — ECS エージェントアプリケーション
 

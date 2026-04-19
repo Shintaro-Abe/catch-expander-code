@@ -32,12 +32,12 @@
 
 ### フェーズ A 完了条件
 
-- [ ] **PA-1** ユニットテスト全件パス
-- [ ] **PA-2** A1〜A4 を Phase A 単一 commit に集約
-- [ ] **PA-3** `git push origin main` で GitHub Actions build-agent.yml 経由デプロイ
-- [ ] **PA-4** 同一トピック「API GatewayとLambdaの組み合わせについて」を Slack から 1 回投入し新 execution を実行
-- [ ] **PA-5** CloudWatch Logs から `Code generation failed for type` 警告メッセージを取得し、root cause を R1〜R5 のいずれかに分類
-- [ ] **PA-6** R1〜R5 に該当しない場合は design.md に root cause 種別を追記して Phase B 着手前に再ドラフト
+- [x] **PA-1** ユニットテスト全件パス（A3-2 時点で 180 passed）
+- [x] **PA-2** A1〜A4 を Phase A 単一 commit に集約（`f0b121a`）
+- [x] **PA-3** `git push origin main` で GitHub Actions build-agent.yml 経由デプロイ済み
+- [x] **PA-4** Slack 投入で `exec-20260418073748-2c27bb2f` を取得
+- [x] **PA-5** root cause を **R2（スキーマ違い）** と分類（観測ログ参照）
+- [x] **PA-6** R2 に該当のため再ドラフト不要
 
 ## フェーズ B: root cause 別本対応
 
@@ -73,16 +73,16 @@ PA-5 の分類結果に応じて該当ブランチのみ実装（複数該当時
 
 ### フェーズ B 共通
 
-- [ ] **PB-1** 適用ブランチごとに独立 commit
-- [ ] **PB-2** ユニットテスト全件パス
-- [ ] **PB-3** `git push origin main` でデプロイ
+- [x] **PB-1** 適用ブランチごとに独立 commit（B-2: `5e77dd3`）
+- [x] **PB-2** ユニットテスト全件パス（B-2 push 時点）
+- [x] **PB-3** `git push origin main` でデプロイ済み
 
 ## フェーズ C: 実機検証
 
-- [ ] **V-1** Phase B push 後、同一トピック「API GatewayとLambdaの組み合わせについて」を Slack から **2 回** 投入（間欠失敗排除）
-- [ ] **V-2** 両 execution の DynamoDB `workflow-executions.storage` が `"notion+github"` であることを確認
-- [ ] **V-3** GitHub catch-expander-code リポジトリに新 execution 向けディレクトリが 2 件作成され、IaC / プログラムコードファイルが push されていることを確認
-- [ ] **V-4** CloudWatch Logs に `Code generation failed for type` warning が出ないこと（または部分失敗のみで他方が成功）を確認
+- [ ] **V-1** Phase B push 後、同一トピック「API GatewayとLambdaの組み合わせについて」を Slack から **2 回** 投入（間欠失敗排除）。**進捗 1/2**: 2026-04-18 14:48 UTC `exec-20260418144822-33a2a5ab` で `storage=notion+github` を達成。次回コード生成トピック投入で 2 連続達成見込み
+- [ ] **V-2** 両 execution の DynamoDB `workflow-executions.storage` が `"notion+github"` であることを確認（1/2 達成）
+- [ ] **V-3** GitHub catch-expander-code リポジトリに新 execution 向けディレクトリが 2 件作成され、IaC / プログラムコードファイルが push されていることを確認（1/2 達成）
+- [ ] **V-4** CloudWatch Logs に `Code generation failed for type` warning が出ないこと（または部分失敗のみで他方が成功）を確認（1/2 達成）
 - [ ] **V-5** quality-fix の AC-2 を「達成」に更新するため `.steering/20260418-quality-fix/tasklist.md` の AC-2 行を ✓ に書き換え、本 steering 完了を理由として記録
 
 ## 完了条件（全体）

@@ -222,9 +222,11 @@ ENTRYPOINT ["python3", "main.py"]
 ```
 入力: EventBridge 定期スケジュールイベント
 処理:
-  1. Secrets Manager から Claude OAuth トークン情報を取得
-  2. 残り有効期限を算出し、しきい値（既定: 3日）を下回ったか判定
-  3. 既に失効している場合 / しきい値を下回った場合は Slack に再ログイン依頼を通知
+  1. Secrets Manager から Claude OAuth トークン情報（JSON）を取得
+  2. `claudeAiOauth.expiresAt`（ミリ秒）と現在時刻を比較し、
+     `now > expiresAt + STALE_THRESHOLD_HOURS` のとき「失効」と判定
+  3. 失効と判定された場合のみ、Slack 通知チャンネルへ
+     「`claude` コマンドで再ログイン → 自動 Secrets Manager 同期」案内を投稿
 出力: なし（Slack通知のみ）
 ```
 
@@ -233,10 +235,12 @@ ENTRYPOINT ["python3", "main.py"]
 | ランタイム | Python 3.13 |
 | メモリ | 256 MB |
 | タイムアウト | 60秒 |
-| トリガー | EventBridge Scheduler（定期実行） |
+| トリガー | EventBridge Scheduler（既定 12 時間ごと） |
+| 失効判定しきい値 | `STALE_THRESHOLD_HOURS`（既定 24 時間、環境変数で変更可） |
 | 実行ロール | TokenMonitorRole（Secrets Manager 読み取り） |
+| 主要環境変数 | `CLAUDE_OAUTH_SECRET_ARN` / `SLACK_BOT_TOKEN_SECRET_ARN` / `SLACK_NOTIFICATION_CHANNEL_ID` / `STALE_THRESHOLD_HOURS` |
 
-実装は `src/token_monitor/handler.py`。
+実装は `src/token_monitor/handler.py`。再ログイン後のトークンは DevContainer 上の `watch_claude_token.sh` / `sync_claude_token.sh` が `~/.claude/.credentials.json` の変更を検知し、Secrets Manager `catch-expander/claude-oauth` を自動更新する（詳細は `credential-setup.md` 4.4 参照）。
 
 ## 5. DynamoDBテーブル設計
 
@@ -363,6 +367,26 @@ ENTRYPOINT ["python3", "main.py"]
 | Lambda実行エラー | エラー率 > 10%（5分間） | Slack通知 |
 | ECSタスク失敗 | 失敗タスク数 > 0（5分間） | Slack通知 |
 | Maxプラン利用上限接近 | カスタムメトリクスで検知 | Slack通知 |
+
+## 8.5 タスク失敗時の通知設計
+
+ECS タスク (`src/agent/main.py`) が例外で終了する場合、`_notify_task_failure(slack_token, exc)` が `SLACK_THREAD_TS` のスレッドへ案内文を投稿する。例外型に応じて文言を分岐する。
+
+| 例外型 | Slack 文言の方針 |
+|--------|-----------------|
+| `NotionCloudflareBlockError`（`src/agent/storage/notion_client.py`） | Notion 前段（Cloudflare）で拒否された旨と、数分〜数十分後の再投入を案内。`execution_id` を併記 |
+| その他の `Exception` | 汎用エラー文言。Claude OAuth 期限切れの可能性を案内し、DevContainer で `claude` コマンドの再実行を促す |
+
+通知自体が失敗した場合は warning ログのみ残し、元の例外を再 raise する（隠蔽しない）。`SLACK_CHANNEL` / `SLACK_THREAD_TS` が未設定の場合は通知をスキップする。
+
+Cloudflare ブロック検知時は `notion_client._request_with_retry` が以下を warning ログに記録し、`NotionCloudflareBlockError` を送出する。
+
+- `cf_ray` / `cf_mitigated` / `cf_cache_status` / `Server` ヘッダ
+- `user_agent_sent`（送出した User-Agent）
+- `body_snippet`（HTML ボディ先頭 200 文字）
+- `response_headers`（`Set-Cookie` / `Authorization` を除外した文字列、1000 文字 truncate）
+
+これにより次回再現時に CloudWatch Logs Insights で根本原因（User-Agent / JA3 / IP 評判 / WAF ルール等）の絞り込みが可能になる。
 
 ## 9. デプロイ設計
 
