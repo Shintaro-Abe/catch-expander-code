@@ -16,6 +16,11 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 MAX_REVIEW_LOOPS = 2
 MAX_CLAUDE_RETRIES = 3
 
+# generator は text 成果物のみを返す契約のため、レビュー修正レスポンスを
+# current_deliverables に代入すると iac_code/program_code 由来の code_files が失われる。
+# 修正適用後に明示的に引き継ぐ独立生成フィールドの一覧。
+_PRESERVED_DELIVERABLE_FIELDS = ("code_files",)
+
 
 def _load_prompt(name: str) -> str:
     """プロンプトファイルを読み込む"""
@@ -735,10 +740,20 @@ class Orchestrator:
                     extra={"loop": loop, "issues_count": len(errors)},
                 )
             else:
+                preserved = {
+                    k: current_deliverables[k]
+                    for k in _PRESERVED_DELIVERABLE_FIELDS
+                    if k in current_deliverables
+                }
                 current_deliverables = parsed
+                current_deliverables.update(preserved)
                 logger.info(
                     "Deliverables updated by review fix",
-                    extra={"loop": loop, "issues_count": len(errors)},
+                    extra={
+                        "loop": loop,
+                        "issues_count": len(errors),
+                        "preserved_fields": list(preserved.keys()),
+                    },
                 )
 
         return review_result, current_deliverables

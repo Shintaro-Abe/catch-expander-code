@@ -468,6 +468,109 @@ class TestReviewLoop:
         # parse_error のため original を保持
         assert final_deliverables == original
 
+    @patch("orchestrator.call_claude")
+    def test_review_loop_preserves_code_files_on_fix_success(self, mock_claude):
+        """レビュー修正成功時も code_files は保持される（generator は text のみ返す契約のため）"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+        responses = [
+            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
+            # 修正レスポンスは text 成果物のみ（code_files を含まない = 実運用の挙動）
+            json.dumps({"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})}),
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "passed": True,
+                            "issues": [],
+                            "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
+                        }
+                    )
+                }
+            ),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original_code_files = {
+            "files": {"main.tf": "resource \"aws_cloudfront_distribution\" \"x\" {}"},
+            "readme_content": "# CloudFront IaC",
+        }
+        original = {
+            "content_blocks": [{"t": "original"}],
+            "summary": "初版",
+            "code_files": original_code_files,
+        }
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
+        )
+        assert result["passed"] is True
+        assert final_deliverables["summary"] == "修正版"
+        assert final_deliverables["content_blocks"] == [{"t": "fixed"}]
+        assert final_deliverables["code_files"] == original_code_files
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_no_code_files_when_absent(self, mock_claude):
+        """元の成果物に code_files が無ければ、修正後にもキーが現れない"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+        responses = [
+            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
+            json.dumps({"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})}),
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "passed": True,
+                            "issues": [],
+                            "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
+                        }
+                    )
+                }
+            ),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
+        )
+        assert result["passed"] is True
+        assert "code_files" not in final_deliverables
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_preserves_code_files_across_multiple_fixes(self, mock_claude):
+        """複数回の修正を跨いでも code_files は保持される"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+        failing_review = {"passed": False, "issues": [issue], "quality_metadata": {}}
+
+        responses = [
+            json.dumps({"result": json.dumps(failing_review)}),
+            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-1"})}),
+            json.dumps({"result": json.dumps(failing_review)}),
+            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-2"})}),
+            json.dumps({"result": json.dumps(failing_review)}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original_code_files = {"files": {"main.tf": "resource \"x\" \"y\" {}"}, "readme_content": "readme"}
+        original = {"content_blocks": [], "summary": "初版", "code_files": original_code_files}
+        result, final_deliverables = orch._run_review_loop(
+            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
+        )
+        assert result["passed"] is False
+        assert final_deliverables["summary"] == "fix-2"
+        assert final_deliverables["code_files"] == original_code_files
+
 
 class TestCodeGeneration:
     """コード成果物のタイプ別独立生成テスト（M3）"""

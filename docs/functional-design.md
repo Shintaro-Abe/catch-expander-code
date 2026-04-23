@@ -491,6 +491,8 @@ finally:
 
 **修正成果物の永続化**: `_run_review_loop` は `(review_result, final_deliverables)` のタプルを返し、ループ内で適用された修正結果を Notion / GitHub 出力パスに確実に引き継ぐ。修正応答が JSON パースできなかった場合は直前の成果物を保持し、warning ログを出力する（M2）。
 
+**独立生成フィールドの保護**: ジェネレーターの修正プロンプトは契約上テキスト成果物（`content_blocks` / `summary`）のみを返すため、修正レスポンスを `current_deliverables` に単純代入すると 3.3b で生成された `code_files` が失われる。`_run_review_loop` は修正適用時に `_PRESERVED_DELIVERABLE_FIELDS`（現状 `code_files`）を明示的に引き継ぎ、レビューループを跨いでも独立生成パイプラインの成果物が保持されることを保証する。
+
 ## 4. 外部連携設計
 
 ### 4.1 Slack連携
