@@ -89,6 +89,8 @@ class TestCallRefreshEndpoint:
         assert payload["scope"] == SCOPES
         assert req.headers["Content-type"] == "application/json"
         assert req.method == "POST"
+        # User-Agent は必須: 既定の Python urllib UA は Cloudflare に Bot 判定される
+        assert "claude-cli" in req.headers["User-agent"].lower()
 
     def test_propagates_http_401(self):
         from handler import _call_refresh_endpoint

@@ -61,6 +61,9 @@ def _call_refresh_endpoint(refresh_token: str) -> dict[str, Any]:
 
     成功時は access_token / refresh_token / expires_in / scope を含む dict を返す。
     HTTP 4xx/5xx は HTTPError、ネットワーク到達不能は URLError を伝播する。
+
+    User-Agent ヘッダは必須: 既定の Python urllib UA は Cloudflare Bot Management に
+    Bot 判定されて 429 を返される（2026-04-25 確認）。Claude CLI 相当の UA を送る。
     """
     payload = json.dumps(
         {
@@ -73,7 +76,11 @@ def _call_refresh_endpoint(refresh_token: str) -> dict[str, Any]:
     req = Request(
         TOKEN_URL,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "claude-cli/2.1.118 (external, cli)",
+        },
         method="POST",
     )
     with urlopen(req, timeout=10) as resp:
@@ -183,7 +190,15 @@ def lambda_handler(event: dict, context: object) -> dict[str, Any]:
         result = _call_refresh_endpoint(refresh_token)
     except HTTPError as e:
         reason = f"http_{e.code}"
-        logger.error("Refresh HTTP error", extra={"http_code": e.code})
+        # レスポンスボディを 500 文字までログに残す（OAuth エンドポイントの拒否理由を診断するため）
+        try:
+            body_preview = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_preview = "<unreadable>"
+        logger.error(
+            "Refresh HTTP error",
+            extra={"http_code": e.code, "body_preview": body_preview},
+        )
         slack_token = _get_secret(slack_token_arn)
         _post_slack_failure(slack_token, channel_id, reason, expires_at_ms)
         return {"refreshed": False, "reason": reason}
