@@ -1,7 +1,9 @@
 import concurrent.futures
 import json
 import logging
+import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -159,8 +161,12 @@ _CODE_TYPE_LABELS = {
     "program_code": "プログラムコード（Python またはユーザープロファイルの技術スタック）",
 }
 
-_CODE_FAILURE_PREVIEW_LIMIT = 500
-_CODE_FAILURE_TOP_KEYS_LIMIT = 10
+# コード成果物の生成は Claude Code CLI の Write ツール経由（ファイルシステム書き込み方式）。
+# JSON 文字列値に大規模コードを詰めさせると LLM が確率的にエスケープを誤るため、
+# 旧 JSON 方式は廃止し sandbox ディレクトリに直接書かせる方針へ移行（2026-04-25）。
+# 詳細: .steering/20260425-code-gen-redesign-filesystem/
+_MAX_FILE_BYTES = 100 * 1024
+_WORKSPACE_STDOUT_PREVIEW_LIMIT = 500
 
 _FILE_EXTENSIONS = {
     ".tf", ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".txt", ".md",
@@ -168,9 +174,6 @@ _FILE_EXTENSIONS = {
     ".cfg", ".ini", ".html", ".css", ".rb", ".kt", ".swift",
 }
 _FILENAME_EXACT = {"Dockerfile", "Makefile", "Procfile", ".gitignore", ".env.example"}
-_RESERVED_META_KEYS = {"readme_content", "summary", "parse_error", "raw_text", "files"}
-_FILE_KEY_RATIO_THRESHOLD = 0.8
-_FILE_KEY_MIN_COUNT = 2
 
 
 def _looks_like_file_path(key: str) -> bool:
@@ -188,85 +191,142 @@ def _looks_like_file_path(key: str) -> bool:
     return suffix in _FILE_EXTENSIONS
 
 
-def _normalize_code_files_payload(parsed: object) -> object:
-    """コード生成応答が files キーをラップせず、ファイルパスを直接トップレベルに置いた場合に正規化する。
+def _collect_workspace_files(sandbox: Path) -> tuple[dict[str, str], list[dict]]:
+    """sandbox 内のファイルを収集し、ホワイトリスト + 安全性チェックでフィルタする。
 
-    Phase A 観測（exec-20260418073748-2c27bb2f）で iac_code / program_code 共に
-    `{"bin/app.ts": "...", "package.json": "..."}` 形式で返ったケースを救済する。
-    既に `{"files": {...}}` 形式 / dict でない / parse_error の場合は無変更。
+    symlink は早期拒否（コード成果物に symlink を含む正当な理由がない）。
+    実ファイルでも resolve 後に sandbox 配下に収まるかを二重チェック。
     """
-    if not isinstance(parsed, dict):
-        return parsed
-    if "files" in parsed:
-        return parsed
-    if parsed.get("parse_error"):
-        return parsed
+    files: dict[str, str] = {}
+    rejected: list[dict] = []
 
-    file_keys: list[str] = []
-    other_keys: list[str] = []
-    for key, value in parsed.items():
-        if key in _RESERVED_META_KEYS:
+    if not sandbox.exists():
+        return files, rejected
+
+    sandbox_resolved = sandbox.resolve(strict=True)
+
+    for entry in sandbox.rglob("*"):
+        rel_str = str(entry.relative_to(sandbox))
+
+        if entry.is_symlink():
+            rejected.append({"path": rel_str, "reason": "symlink_not_allowed"})
             continue
-        if _looks_like_file_path(key) and isinstance(value, str):
-            file_keys.append(key)
-        else:
-            other_keys.append(key)
 
-    total_non_meta = len(file_keys) + len(other_keys)
-    if len(file_keys) < _FILE_KEY_MIN_COUNT or total_non_meta == 0:
-        return parsed
-    if len(file_keys) / total_non_meta < _FILE_KEY_RATIO_THRESHOLD:
-        return parsed
+        if not entry.is_file():
+            continue
 
-    normalized: dict = {"files": {key: parsed[key] for key in file_keys}}
-    readme = parsed.get("readme_content")
-    if isinstance(readme, str):
-        normalized["readme_content"] = readme
-    return normalized
+        try:
+            resolved = entry.resolve(strict=True)
+            resolved.relative_to(sandbox_resolved)
+        except (OSError, ValueError):
+            rejected.append({"path": rel_str, "reason": "outside_sandbox"})
+            continue
+
+        if not _looks_like_file_path(rel_str):
+            rejected.append({"path": rel_str, "reason": "not_in_whitelist"})
+            continue
+
+        size = entry.stat().st_size
+        if size > _MAX_FILE_BYTES:
+            rejected.append({"path": rel_str, "reason": "too_large", "size_bytes": size})
+            continue
+
+        try:
+            content = entry.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            rejected.append({"path": rel_str, "reason": "not_utf8"})
+            continue
+
+        files[rel_str] = content
+
+    return files, rejected
 
 
-def _build_code_failure_diagnostics(raw: str, parsed: object) -> dict:
-    """コード生成失敗時の診断情報を組み立てる。
+def _classify_workspace_outcome(files: dict[str, str], rejected: list[dict]) -> dict:
+    """収集結果から workspace 実行の結末を判定する。
 
-    ロガーの formatter が extra を出力しないため、警告メッセージ本文に
-    埋め込む形で root cause 判定に必要な観測項目を返す。
+    判定優先順位:
+      files_count == 0 && rejected あり → no_recognized
+      files_count == 0                  → none
+      total_bytes == 0                  → all_empty
+      それ以外                           → valid
     """
-    raw_text = raw if isinstance(raw, str) else ""
-    response_chars = len(raw_text)
-    response_preview = raw_text[:_CODE_FAILURE_PREVIEW_LIMIT]
+    files_count = len(files)
+    total_bytes = sum(len(c.encode("utf-8")) for c in files.values())
 
-    if not isinstance(parsed, dict):
-        return {
-            "parse_error": True,
-            "files_kind": "<not-dict>",
-            "files_count": 0,
-            "top_level_keys": [],
-            "response_chars": response_chars,
-            "response_preview": response_preview,
-        }
-
-    parse_error = bool(parsed.get("parse_error", False))
-    top_level_keys = list(parsed.keys())[:_CODE_FAILURE_TOP_KEYS_LIMIT]
-
-    if "files" not in parsed:
-        files_kind = "missing"
-        files_count = 0
+    if files_count == 0:
+        kind = "no_recognized" if rejected else "none"
+    elif total_bytes == 0:
+        kind = "all_empty"
     else:
-        files_value = parsed["files"]
-        files_kind = type(files_value).__name__
-        if isinstance(files_value, (dict, list)):
-            files_count = len(files_value)
-        else:
-            files_count = 0
+        kind = "valid"
 
     return {
-        "parse_error": parse_error,
-        "files_kind": files_kind,
+        "files_kind": kind,
         "files_count": files_count,
-        "top_level_keys": top_level_keys,
-        "response_chars": response_chars,
-        "response_preview": response_preview,
+        "files_total_bytes": total_bytes,
+        "rejected": rejected,
     }
+
+
+def call_claude_with_workspace(
+    prompt: str,
+    code_type: str,
+    *,
+    model: str = "sonnet",
+) -> tuple[str, dict[str, str], dict]:
+    """Claude CLI に Write ツールを許可して sandbox にファイルを書かせ、収集結果を返す。
+
+    旧 JSON 文字列値方式（call_claude + _parse_claude_response）が大規模コードの
+    エスケープミスで失敗するため、コード成果物のみこの経路を使う。テキスト成果物の
+    パスは call_claude のままで変更しない。
+
+    Returns:
+        (raw_stdout, files, outcome)
+    """
+    sandbox = Path(tempfile.mkdtemp(prefix=f"agent-output-{code_type}-"))
+    try:
+        cmd = [
+            "claude", "-p", "-",
+            "--model", model,
+            "--allowedTools", "Write,Edit",
+            "--output-format", "json",
+        ]
+        last_error: subprocess.CalledProcessError | None = None
+        raw_stdout = ""
+        for attempt in range(MAX_CLAUDE_RETRIES):
+            try:
+                result = subprocess.run(  # noqa: S603
+                    cmd,
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    cwd=str(sandbox),
+                )
+                raw_stdout = result.stdout
+                break
+            except subprocess.CalledProcessError as e:
+                last_error = e
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "Claude CLI error (workspace mode), retrying | rc=%s | stderr=%s",
+                    e.returncode,
+                    (e.stderr or "")[:500],
+                    extra={"attempt": attempt + 1, "wait_seconds": wait, "code_type": code_type},
+                )
+                time.sleep(wait)
+        else:
+            if last_error:
+                raise last_error
+            msg = "Unexpected: no error and no response (workspace mode)"
+            raise RuntimeError(msg)
+
+        files, rejected = _collect_workspace_files(sandbox)
+        outcome = _classify_workspace_outcome(files, rejected)
+        return raw_stdout, files, outcome
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
 def _build_code_generation_prompt(
@@ -276,14 +336,14 @@ def _build_code_generation_prompt(
     profile_text: str,
     code_type: str,
 ) -> str:
-    """単一タイプのコード成果物生成専用プロンプトを構築する
+    """単一タイプのコード成果物生成専用プロンプト（ファイル書き込み方式）を構築する。
 
-    コード生成をテキスト成果物生成から、さらにタイプごとに分離することで、
-    応答サイズ超過によるJSON解析失敗を防ぐ。
+    Claude Code CLI の Write ツールに sandbox の cwd 配下へ直接書かせる方式。
+    旧 JSON 文字列値方式は HCL/Python の JSON エスケープが LLM 任せになり
+    確率的に壊れるため廃止（2026-04-25）。
     """
     requested_type = _CODE_TYPE_LABELS.get(code_type, code_type)
 
-    # 調査サマリーのみ抽出（ソース一覧は省略してプロンプトサイズを抑制）
     research_summary = "\n\n".join(
         f"### {r.get('step_id', 'unknown')}\n{r.get('summary', '')}"
         for r in research_results
@@ -293,10 +353,9 @@ def _build_code_generation_prompt(
         research_summary = "（調査結果なし）"
 
     return (
-        "# コード成果物生成\n\n"
+        "# コード成果物生成（ファイル書き込み方式）\n\n"
         "## 依頼\n\n"
-        "以下のトピックに関するコード成果物のみを生成してください。\n"
-        "テキストコンテンツ（調査レポート等）は不要です。コードファイルのみを出力してください。\n\n"
+        "以下のトピックに関するコード成果物を **現在の作業ディレクトリに直接ファイルとして書き出してください**。\n"
         f"トピック: {topic}\n"
         f"カテゴリ: {category}\n"
         f"ユーザープロファイル:\n{profile_text}\n\n"
@@ -305,22 +364,20 @@ def _build_code_generation_prompt(
         "このプロンプトでは上記 **1種類のみ** を生成してください。\n\n"
         "## 調査結果サマリー\n\n"
         f"{research_summary}\n\n"
-        "## 出力形式\n\n"
-        "**重要**: 前置き文・説明文は不要です。以下のJSON形式のみを ` ```json ` ブロックで出力してください。\n\n"
-        "```json\n"
-        "{\n"
-        '  "files": {\n'
-        '    "ファイルパス": "ファイル内容（コメント付き）"\n'
-        "  },\n"
-        '  "readme_content": "README.md本文"\n'
-        "}\n"
-        "```\n\n"
-        "## 制約\n\n"
-        "- **PoC品質であることを各ファイルの冒頭コメントで明示**すること\n"
+        "## 出力指示（厳守）\n\n"
+        "- **Write ツールでファイルを書き出すこと**。テキストレスポンスとしてコードを返さない\n"
+        "- ファイルパスは **相対パスのみ**（例: `main.tf`、`modules/cloudfront/main.tf`）\n"
+        "  - 絶対パス（`/...`）や `..` を含むパスは禁止。書こうとしても破棄される\n"
+        "- ファイル数は最大 5 まで\n"
+        "- 1 ファイルあたり 100 KB 以下に抑える\n"
+        "- README.md を 1 ファイル含めてよい（リポジトリで紹介するための簡潔な説明）\n"
+        "- すべてのファイル冒頭にコメントで「PoC 品質」である旨を明示\n"
         "- ハードコードされたシークレット・認証情報を含めない\n"
-        "- プロファイルがない場合はAWS + Python（またはTerraform）を標準として生成\n"
-        "- コードは機能的なスケルトン（実装の骨格）として提供。詳細な業務ロジックは省略可\n"
-        "- ファイル数は最大5ファイルに抑える（main, variables, outputs, README等）\n"
+        "- プロファイルがない場合は AWS + Python（または Terraform）を標準とする\n"
+        "- コードは機能的なスケルトン（実装の骨格）として提供。詳細な業務ロジックは省略可\n\n"
+        "## 完了の合図\n\n"
+        "全ファイルを書き終えたら、レスポンステキストには **書き出したファイル一覧のみ** を返してください\n"
+        "（例: `Wrote: main.tf, variables.tf, README.md`）。コード本文は返さなくて構いません。\n"
     )
 
 
@@ -461,60 +518,70 @@ class Orchestrator:
         # ジェネレーターは text 成果物のみを返す。code_files は常に独立生成する
         deliverables.pop("code_files", None)
 
-        # 5b. コード成果物のタイプ別独立生成
-        # テキスト成果物と分離し、さらに iac_code / program_code ごとに個別の Claude 呼び出しに分割して
-        # 応答サイズ超過による JSON 解析失敗を防ぐ
+        # 5b. コード成果物のタイプ別独立生成（ファイル書き込み方式）
+        # 旧 JSON 文字列値方式は HCL/Python の JSON エスケープが LLM 任せで確率的に壊れたため、
+        # Claude Code CLI の Write ツールに sandbox cwd 配下へ直接書かせる方式へ移行。
         generate_step_types = [s.get("deliverable_type") for s in workflow.get("generate_steps", [])]
         code_types = [t for t in generate_step_types if t in ("iac_code", "program_code")]
         if code_types and "github" in storage_targets:
             self.slack.post_progress(slack_channel, slack_thread_ts, "⚙️ コード成果物を生成中...")
             code_files_merged: dict[str, str] = {}
             readme_parts: list[str] = []
+            failed_code_types: list[str] = []
             for code_type in code_types:
                 logger.info(
-                    "Generating code files for type",
+                    "Generating code files for type (workspace mode)",
                     extra={"execution_id": execution_id, "code_type": code_type},
                 )
-                code_raw = call_claude(
-                    _build_code_generation_prompt(topic, category, research_results, profile_text, code_type)
+                prompt = _build_code_generation_prompt(
+                    topic, category, research_results, profile_text, code_type
                 )
-                code_result = _parse_claude_response(code_raw)
-                code_result = _normalize_code_files_payload(code_result)
-                files = code_result.get("files") if isinstance(code_result, dict) else None
-                if isinstance(files, dict) and files:
-                    code_files_merged.update(files)
-                    readme = code_result.get("readme_content") if isinstance(code_result, dict) else None
-                    if isinstance(readme, str) and readme.strip():
+                raw_stdout, files, outcome = call_claude_with_workspace(prompt, code_type)
+
+                if outcome["files_kind"] == "valid":
+                    readme_text = files.pop("README.md", None)
+                    if readme_text and readme_text.strip():
                         label = _CODE_TYPE_LABELS.get(code_type, code_type)
-                        readme_parts.append(f"## {label}\n\n{readme}")
+                        readme_parts.append(f"## {label}\n\n{readme_text}")
+                    code_files_merged.update(files)
                     logger.info(
-                        "Code files generated",
-                        extra={
-                            "execution_id": execution_id,
-                            "code_type": code_type,
-                            "files_count": len(files),
-                        },
-                    )
-                else:
-                    diag = _build_code_failure_diagnostics(code_raw, code_result)
-                    logger.warning(
-                        "Code generation failed for type | execution_id=%s code_type=%s "
-                        "parse_error=%s files_kind=%s files_count=%s top_level_keys=%s "
-                        "response_chars=%d response_preview=%r",
+                        "Code files generated (workspace mode) | execution_id=%s code_type=%s "
+                        "files_count=%d files_total_bytes=%d rejected_count=%d",
                         execution_id,
                         code_type,
-                        diag["parse_error"],
-                        diag["files_kind"],
-                        diag["files_count"],
-                        diag["top_level_keys"],
-                        diag["response_chars"],
-                        diag["response_preview"],
+                        outcome["files_count"],
+                        outcome["files_total_bytes"],
+                        len(outcome["rejected"]),
                     )
+                else:
+                    stdout_preview = (raw_stdout or "")[:_WORKSPACE_STDOUT_PREVIEW_LIMIT]
+                    logger.warning(
+                        "Code generation failed (workspace mode) | execution_id=%s code_type=%s "
+                        "files_kind=%s files_count=%d rejected=%s stdout_preview=%r",
+                        execution_id,
+                        code_type,
+                        outcome["files_kind"],
+                        outcome["files_count"],
+                        outcome["rejected"][:5],
+                        stdout_preview,
+                    )
+                    failed_code_types.append(code_type)
+
             if code_files_merged:
                 deliverables["code_files"] = {
                     "files": code_files_merged,
                     "readme_content": "\n\n".join(readme_parts) if readme_parts else "",
                 }
+
+            if failed_code_types:
+                labels = [_CODE_TYPE_LABELS.get(t, t) for t in failed_code_types]
+                self.slack.post_progress(
+                    slack_channel,
+                    slack_thread_ts,
+                    "⚠️ 一部のコード成果物の生成に失敗しました（"
+                    + " / ".join(labels)
+                    + "）。GitHub への push は省略されました。再投入で改善する場合があります。",
+                )
 
         # 6. レビュアー起動 + レビューループ
         self.db.update_execution_status(execution_id, "reviewing")

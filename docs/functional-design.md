@@ -326,8 +326,11 @@ orchestrator.py（Pythonプロセス）
   ├── 全リサーチャーの結果を統合
   │
   ├── subprocess call_claude(ジェネレータープロンプト + 調査結果 + 計画)
-  │          ↓ code_filesがnullの場合
-  ├── subprocess call_claude(コード生成専用プロンプト)  ← 追加フォールバック
+  │          ↓ コード成果物が必要かつ github 格納対象の場合
+  ├── for code_type in (iac_code, program_code):
+  │      call_claude_with_workspace(コード生成プロンプト, code_type)
+  │      → Claude が Write ツールで sandbox にファイル書き出し
+  │      → os.walk で収集 + ホワイトリスト + 安全性チェック
   │
   ├── subprocess call_claude(レビュアープロンプト + 成果物, model="opus")
   │
@@ -421,29 +424,39 @@ orchestrator.py（Pythonプロセス）
 - オーケストレーターが `iac_code` / `program_code` ごとに独立した Claude 呼び出しで生成
 - 各呼び出しの `files` をマージし、README は成果物タイプ別のセクションに分けて結合
 
-### 3.3b コード成果物の独立生成
+### 3.3b コード成果物の独立生成（ファイル書き込み方式）
 
-ワークフロー計画の `deliverable_types` に `iac_code` / `program_code` が含まれ、かつ `storage_targets` に `github` が含まれる場合、オーケストレーターは成果物タイプごとに `_build_code_generation_prompt(code_type)` を呼び出してコード成果物を生成する。
+ワークフロー計画の `deliverable_types` に `iac_code` / `program_code` が含まれ、かつ `storage_targets` に `github` が含まれる場合、オーケストレーターは成果物タイプごとに `call_claude_with_workspace(prompt, code_type)` を呼び出してコード成果物を生成する。
 
-**背景**: 単一プロンプトでテキスト成果物＋コード成果物をまとめて生成すると応答サイズが肥大化し、JSON パース失敗によりコード成果物が欠落する事象が発生したため、タイプごとに独立呼び出しに分離した（M3）。
+**背景**: 旧方式では Claude CLI に「`{"files": {"waf.tf": "<HCL コード>"}}` の形で JSON を返せ」と指示し、Python 側で JSON パースしていた。しかし HCL/Python コードは `\"`、`${var}`、`\\n`、ヒアドキュメント等の JSON エスケープ衝突文字を密に含むため、出力が長くなるほど LLM が確率的にエスケープを誤り parse_error を頻発させた。過去 5 回の修正（パーサー頑健化、レスポンス分割、payload 正規化等）でも根本解決に至らず、2026-04-25 に **JSON エスケープ層を取り除く方針** へ移行した。詳細: `.steering/20260425-code-gen-redesign-filesystem/`
 
-**処理**:
+**処理**（ファイル書き込み方式）:
 ```
 for code_type in (iac_code, program_code):
-  1. [Sonnet] _build_code_generation_prompt(code_type) を実行
-  2. 応答を JSON パースし、files / readme_content を取得
-  3. 成功: files_merged に統合、readme_parts にタイプ別 README を追記
-  4. 失敗（parse_error）: warning ログを出力し、他タイプの生成は継続
+  1. tempfile.mkdtemp で sandbox を作成（/tmp/agent-output-<code_type>-<random>/）
+  2. [Sonnet] subprocess.run(["claude", "-p", "--allowedTools", "Write,Edit", ...], cwd=sandbox)
+     → Claude が Write ツールで sandbox 配下にファイルを書く
+  3. _collect_workspace_files(sandbox) で os.walk + ホワイトリスト + 安全性チェック
+     - symlink は早期拒否（is_symlink）
+     - sandbox 外への解決パスは破棄（resolve + relative_to）
+     - 拡張子ホワイトリスト、サイズ上限 100KB、UTF-8 デコード可能性
+  4. _classify_workspace_outcome で valid / all_empty / no_recognized / none を判定
+  5. valid: README.md を分離して readme_parts に、その他を files_merged に統合
+     失敗: warning ログ + Slack スレッドへ「コード生成失敗」通知
+  6. finally: shutil.rmtree(sandbox) で sandbox 削除
 finally:
   files_merged が非空なら deliverables["code_files"] にセット
+  failed_code_types が非空なら Slack に部分失敗通知
 ```
 
 **コード成果物ルール**（各プロンプト内で適用）
-- ファイル単位で生成（main.tf, variables.tf等）
-- 各ファイルにコメントで説明を付与
-- README.mdに使用手順を記載
-- GitHub APIでリポジトリにpushする形式で出力
-- ファイル数は最大5ファイル / タイプに抑制
+- Claude Code CLI の Write ツールで相対パスにファイルを書き出す（絶対パス禁止）
+- 各ファイルにコメントで説明を付与（PoC 品質明示）
+- README.md を 1 ファイル含めてよい（リポジトリ紹介用）
+- ファイル数は最大 5 / タイプに抑制
+- 1 ファイルあたり 100KB 以下
+
+**性質的差異の根拠**: テキスト成果物（ジェネレーター本体）・トピック解析・ワークフロー設計・リサーチャー要約・レビュアー合否は **数百〜数千文字の構造化データ**で JSON 適性が高い。一方コード成果物は **10,000+ 文字 + 特殊文字密集**で JSON 適性が低い。この差異を認め、コード成果物のみファイル書き込み方式とする例外設計を採用した。
 
 ### 3.4 レビュアーエージェント
 

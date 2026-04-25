@@ -608,25 +608,37 @@ class TestCodeGeneration:
         assert "コード成果物の構造化ルール" not in content
 
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
-    def test_code_generation_per_type_merges_files(self, mock_call_claude, _mock_load):
-        """iac_code と program_code が個別呼び出しでマージされる"""
+    def test_code_generation_per_type_merges_files(
+        self, mock_call_claude, mock_call_workspace, _mock_load
+    ):
+        """iac_code と program_code が個別 workspace 呼び出しでマージされる"""
         from orchestrator import Orchestrator
 
         analysis, workflow, research = self._make_analysis_and_workflow(["iac_code", "program_code"])
         text_deliverables = {"content_blocks": [], "summary": "完成"}
         review = {"passed": True, "issues": [], "quality_metadata": {}}
 
-        iac_result = {"files": {"main.tf": "# iac"}, "readme_content": "IaC README"}
-        prog_result = {"files": {"app.py": "# program"}, "readme_content": "Program README"}
-
+        # コード生成は call_claude_with_workspace 経由
+        mock_call_workspace.side_effect = [
+            (
+                "Wrote: main.tf, README.md",
+                {"main.tf": "# iac", "README.md": "IaC README"},
+                {"files_kind": "valid", "files_count": 2, "files_total_bytes": 30, "rejected": []},
+            ),
+            (
+                "Wrote: app.py, README.md",
+                {"app.py": "# program", "README.md": "Program README"},
+                {"files_kind": "valid", "files_count": 2, "files_total_bytes": 30, "rejected": []},
+            ),
+        ]
+        # text 系は call_claude 経由
         mock_call_claude.side_effect = [
             json.dumps({"result": json.dumps(analysis)}),
             json.dumps({"result": json.dumps(workflow)}),
             json.dumps({"result": json.dumps(research)}),
             json.dumps({"result": json.dumps(text_deliverables)}),
-            json.dumps({"result": json.dumps(iac_result)}),
-            json.dumps({"result": json.dumps(prog_result)}),
             json.dumps({"result": json.dumps(review)}),
         ]
 
@@ -647,28 +659,40 @@ class TestCodeGeneration:
         files_arg = orch.github.push_files.call_args.args[1]
         assert "main.tf" in files_arg
         assert "app.py" in files_arg
+        # README.md は files から分離されて readme_content にマージされる
+        assert "README.md" not in files_arg
 
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
-    def test_code_generation_partial_failure_keeps_successful_types(self, mock_call_claude, _mock_load):
-        """一方のタイプが parse_error でも、もう一方は push される"""
+    def test_code_generation_partial_failure_keeps_successful_types(
+        self, mock_call_claude, mock_call_workspace, _mock_load
+    ):
+        """一方のタイプが workspace 失敗でも、もう一方は push される + Slack 部分失敗通知"""
         from orchestrator import Orchestrator
 
         analysis, workflow, research = self._make_analysis_and_workflow(["iac_code", "program_code"])
         text_deliverables = {"content_blocks": [], "summary": "完成"}
         review = {"passed": True, "issues": [], "quality_metadata": {}}
 
-        iac_result = {"files": {"main.tf": "# iac"}, "readme_content": "IaC README"}
-        # program_code は壊れた JSON
-        prog_broken = "not a json"
-
+        mock_call_workspace.side_effect = [
+            (
+                "Wrote: main.tf",
+                {"main.tf": "# iac"},
+                {"files_kind": "valid", "files_count": 1, "files_total_bytes": 6, "rejected": []},
+            ),
+            # program_code は Write を呼ばずに失敗
+            (
+                "raw stdout no files",
+                {},
+                {"files_kind": "none", "files_count": 0, "files_total_bytes": 0, "rejected": []},
+            ),
+        ]
         mock_call_claude.side_effect = [
             json.dumps({"result": json.dumps(analysis)}),
             json.dumps({"result": json.dumps(workflow)}),
             json.dumps({"result": json.dumps(research)}),
             json.dumps({"result": json.dumps(text_deliverables)}),
-            json.dumps({"result": json.dumps(iac_result)}),
-            json.dumps({"result": prog_broken}),
             json.dumps({"result": json.dumps(review)}),
         ]
 
@@ -690,28 +714,43 @@ class TestCodeGeneration:
         assert "main.tf" in files_arg
         assert "app.py" not in files_arg
 
+        # 部分失敗の Slack 通知が送られている
+        warning_calls = [
+            c for c in slack.post_progress.call_args_list
+            if "失敗" in c.args[2]
+        ]
+        assert len(warning_calls) == 1
+        assert "プログラムコード" in warning_calls[0].args[2]
+
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
-    def test_generator_code_files_always_discarded(self, mock_call_claude, _mock_load):
-        """ジェネレーターが誤って code_files を返しても、システム側で破棄される"""
+    def test_generator_code_files_always_discarded(
+        self, mock_call_claude, mock_call_workspace, _mock_load
+    ):
+        """ジェネレーターが誤って code_files を返しても、workspace 経由の値で上書きされる"""
         from orchestrator import Orchestrator
 
         analysis, workflow, research = self._make_analysis_and_workflow(["iac_code"])
-        # 旧仕様のような code_files 混入を模擬
         text_deliverables = {
             "content_blocks": [],
             "code_files": {"files": {"LEAK.tf": "# must not be used"}, "readme_content": ""},
             "summary": "完成",
         }
         review = {"passed": True, "issues": [], "quality_metadata": {}}
-        iac_result = {"files": {"main.tf": "# iac"}, "readme_content": "IaC README"}
 
+        mock_call_workspace.side_effect = [
+            (
+                "Wrote: main.tf",
+                {"main.tf": "# iac"},
+                {"files_kind": "valid", "files_count": 1, "files_total_bytes": 6, "rejected": []},
+            ),
+        ]
         mock_call_claude.side_effect = [
             json.dumps({"result": json.dumps(analysis)}),
             json.dumps({"result": json.dumps(workflow)}),
             json.dumps({"result": json.dumps(research)}),
             json.dumps({"result": json.dumps(text_deliverables)}),
-            json.dumps({"result": json.dumps(iac_result)}),
             json.dumps({"result": json.dumps(review)}),
         ]
 
@@ -969,185 +1008,10 @@ class TestBuildQualityMetadataBlock:
         assert "情報の鮮度: 最新 2026-04-02 / 最古 不明" in text
 
 
-class TestBuildCodeFailureDiagnostics:
-    """_build_code_failure_diagnostics の観測項目テスト（Followup-A Phase A）"""
+class TestLooksLikeFilePath:
+    """_looks_like_file_path のホワイトリスト判定テスト（_collect_workspace_files から再利用）"""
 
-    def test_parse_error_flag_true_when_parsed_marks_parse_error(self):
-        from orchestrator import _build_code_failure_diagnostics
-
-        diag = _build_code_failure_diagnostics(
-            "raw text", {"parse_error": True, "raw_text": "raw text"}
-        )
-        assert diag["parse_error"] is True
-        assert diag["files_kind"] == "missing"
-        assert diag["files_count"] == 0
-        assert diag["top_level_keys"] == ["parse_error", "raw_text"]
-        assert diag["response_chars"] == len("raw text")
-        assert diag["response_preview"] == "raw text"
-
-    def test_missing_files_key_marks_files_kind_missing(self):
-        from orchestrator import _build_code_failure_diagnostics
-
-        parsed = {"summary": "ok", "content_blocks": []}
-        diag = _build_code_failure_diagnostics("{}", parsed)
-        assert diag["parse_error"] is False
-        assert diag["files_kind"] == "missing"
-        assert diag["files_count"] == 0
-        assert "summary" in diag["top_level_keys"]
-        assert "content_blocks" in diag["top_level_keys"]
-
-    def test_empty_files_dict_reports_zero_count(self):
-        from orchestrator import _build_code_failure_diagnostics
-
-        diag = _build_code_failure_diagnostics(
-            '{"files": {}}', {"files": {}, "readme_content": ""}
-        )
-        assert diag["parse_error"] is False
-        assert diag["files_kind"] == "dict"
-        assert diag["files_count"] == 0
-
-    def test_files_as_list_reports_list_kind(self):
-        from orchestrator import _build_code_failure_diagnostics
-
-        diag = _build_code_failure_diagnostics(
-            '{"files": [1, 2, 3]}', {"files": [1, 2, 3]}
-        )
-        assert diag["files_kind"] == "list"
-        assert diag["files_count"] == 3
-
-    def test_response_preview_truncated_to_500_chars(self):
-        from orchestrator import _build_code_failure_diagnostics
-
-        long_raw = "x" * 1500
-        diag = _build_code_failure_diagnostics(long_raw, {"files": None})
-        assert diag["response_chars"] == 1500
-        assert len(diag["response_preview"]) == 500
-        assert diag["files_kind"] == "NoneType"
-        assert diag["files_count"] == 0
-
-    def test_non_dict_parsed_marks_parse_error_true(self):
-        from orchestrator import _build_code_failure_diagnostics
-
-        diag = _build_code_failure_diagnostics("[1,2,3]", [1, 2, 3])
-        assert diag["parse_error"] is True
-        assert diag["files_kind"] == "<not-dict>"
-        assert diag["files_count"] == 0
-        assert diag["top_level_keys"] == []
-
-    def test_top_level_keys_capped_at_ten(self):
-        from orchestrator import _build_code_failure_diagnostics
-
-        parsed = {f"k{i}": i for i in range(15)}
-        diag = _build_code_failure_diagnostics("{}", parsed)
-        assert len(diag["top_level_keys"]) == 10
-
-
-class TestNormalizeCodeFilesPayload:
-    """_normalize_code_files_payload のスキーマ正規化テスト（Followup-A B-2）"""
-
-    def test_passes_through_already_wrapped(self):
-        from orchestrator import _normalize_code_files_payload
-
-        original = {"files": {"main.tf": "..."}, "readme_content": "doc"}
-        result = _normalize_code_files_payload(original)
-        assert result is original
-
-    def test_wraps_observed_iac_pattern(self):
-        """exec-20260418073748-2c27bb2f の iac_code 観測例"""
-        from orchestrator import _normalize_code_files_payload
-
-        parsed = {
-            "bin/app.ts": "// app entry",
-            "lib/api-lambda-stack.ts": "// stack",
-            "lambda/handler.ts": "// handler",
-            "package.json": "{}",
-            "cdk.json": "{}",
-        }
-        result = _normalize_code_files_payload(parsed)
-        assert "files" in result
-        assert len(result["files"]) == 5
-        assert result["files"]["bin/app.ts"] == "// app entry"
-        assert result["files"]["package.json"] == "{}"
-        assert "readme_content" not in result
-
-    def test_wraps_observed_program_pattern(self):
-        """exec-20260418073748-2c27bb2f の program_code 観測例"""
-        from orchestrator import _normalize_code_files_payload
-
-        parsed = {
-            "app.py": "import x",
-            "stacks/api_gateway_lambda_stack.py": "class Stack: pass",
-            "lambda/handler.py": "def handler(): pass",
-            "lambda/authorizer.py": "def auth(): pass",
-            "requirements.txt": "boto3",
-        }
-        result = _normalize_code_files_payload(parsed)
-        assert len(result["files"]) == 5
-        assert result["files"]["app.py"] == "import x"
-        assert result["files"]["requirements.txt"] == "boto3"
-
-    def test_preserves_readme_content_when_present(self):
-        from orchestrator import _normalize_code_files_payload
-
-        parsed = {
-            "main.tf": "resource ...",
-            "variables.tf": "variable ...",
-            "readme_content": "## Setup\n...",
-        }
-        result = _normalize_code_files_payload(parsed)
-        assert result["files"] == {"main.tf": "resource ...", "variables.tf": "variable ..."}
-        assert result["readme_content"] == "## Setup\n..."
-
-    def test_passes_through_parse_error(self):
-        from orchestrator import _normalize_code_files_payload
-
-        parsed = {"parse_error": True, "raw_text": "..."}
-        result = _normalize_code_files_payload(parsed)
-        assert result is parsed
-
-    def test_passes_through_non_dict(self):
-        from orchestrator import _normalize_code_files_payload
-
-        for value in [None, "raw text", [1, 2, 3], 42]:
-            assert _normalize_code_files_payload(value) is value
-
-    def test_does_not_wrap_when_majority_non_file_keys(self):
-        """ファイル風キーが少数派の場合は誤検知を避ける"""
-        from orchestrator import _normalize_code_files_payload
-
-        parsed = {
-            "main.tf": "resource ...",
-            "title": "x",
-            "description": "y",
-            "category": "z",
-            "metadata": "w",
-        }
-        result = _normalize_code_files_payload(parsed)
-        assert result is parsed
-
-    def test_does_not_wrap_with_only_one_file_key(self):
-        """ファイル風キーが1つのみだと誤検知の可能性が高いため正規化しない"""
-        from orchestrator import _normalize_code_files_payload
-
-        parsed = {"main.tf": "resource ..."}
-        result = _normalize_code_files_payload(parsed)
-        assert result is parsed
-
-    def test_wraps_when_value_is_string_only(self):
-        """値が string のものだけ files に含める（dict や list は除外）"""
-        from orchestrator import _normalize_code_files_payload
-
-        parsed = {
-            "main.tf": "resource ...",
-            "variables.tf": "variable ...",
-            "config.json": {"nested": "object"},
-        }
-        result = _normalize_code_files_payload(parsed)
-        # config.json は値が dict なので files から除外、結果として 2 ファイル のみ
-        # ただし非ファイルキー扱いになるため比率 2/3 = 0.67 で閾値 0.8 未満 → 正規化しない
-        assert result is parsed
-
-    def test_looks_like_file_path_recognizes_extensions(self):
+    def test_recognizes_extensions(self):
         from orchestrator import _looks_like_file_path
 
         assert _looks_like_file_path("main.tf")
@@ -1155,7 +1019,7 @@ class TestNormalizeCodeFilesPayload:
         assert _looks_like_file_path("README.md")
         assert _looks_like_file_path("config.yaml")
 
-    def test_looks_like_file_path_recognizes_paths(self):
+    def test_recognizes_paths_and_special_filenames(self):
         from orchestrator import _looks_like_file_path
 
         assert _looks_like_file_path("lib/stack.ts")
@@ -1164,3 +1028,300 @@ class TestNormalizeCodeFilesPayload:
         assert not _looks_like_file_path("")
         assert not _looks_like_file_path("plain_text")
         assert not _looks_like_file_path("title.x")  # unknown extension
+
+
+# ---------------------------------------------------------------------------
+# Workspace mode: _collect_workspace_files
+# ---------------------------------------------------------------------------
+
+
+class TestCollectWorkspaceFiles:
+    """sandbox からのファイル収集 + ホワイトリスト + 安全性チェック"""
+
+    def test_collects_whitelisted_files(self, tmp_path):
+        from orchestrator import _collect_workspace_files
+
+        (tmp_path / "main.tf").write_text("resource ...")
+        (tmp_path / "app.py").write_text("import os")
+        (tmp_path / "Dockerfile").write_text("FROM python")
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert files == {
+            "main.tf": "resource ...",
+            "app.py": "import os",
+            "Dockerfile": "FROM python",
+        }
+        assert rejected == []
+
+    def test_rejects_unknown_extension(self, tmp_path):
+        from orchestrator import _collect_workspace_files
+
+        (tmp_path / "binary.exe").write_text("nope")
+        (tmp_path / "main.tf").write_text("resource ...")
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert "binary.exe" not in files
+        assert "main.tf" in files
+        assert any(r["path"] == "binary.exe" and r["reason"] == "not_in_whitelist" for r in rejected)
+
+    def test_rejects_oversized_file(self, tmp_path):
+        from orchestrator import _MAX_FILE_BYTES, _collect_workspace_files
+
+        big = "x" * (_MAX_FILE_BYTES + 100)
+        (tmp_path / "big.tf").write_text(big)
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert files == {}
+        assert any(r["path"] == "big.tf" and r["reason"] == "too_large" for r in rejected)
+
+    def test_rejects_non_utf8(self, tmp_path):
+        from orchestrator import _collect_workspace_files
+
+        (tmp_path / "binary.tf").write_bytes(b"\xff\xfe\x00\x00invalid utf-8")
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert files == {}
+        assert any(r["path"] == "binary.tf" and r["reason"] == "not_utf8" for r in rejected)
+
+    def test_rejects_symlink_to_outside(self, tmp_path):
+        import os
+
+        from orchestrator import _collect_workspace_files
+
+        target = tmp_path.parent / "outside.txt"
+        target.write_text("secret")
+        link = tmp_path / "leak.tf"
+        os.symlink(target, link)
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert files == {}
+        assert any(r["path"] == "leak.tf" and r["reason"] == "symlink_not_allowed" for r in rejected)
+        target.unlink()
+
+    def test_rejects_symlink_to_inside(self, tmp_path):
+        import os
+
+        from orchestrator import _collect_workspace_files
+
+        real = tmp_path / "main.tf"
+        real.write_text("resource ...")
+        link = tmp_path / "alias.tf"
+        os.symlink(real, link)
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert files == {"main.tf": "resource ..."}
+        assert any(r["path"] == "alias.tf" and r["reason"] == "symlink_not_allowed" for r in rejected)
+
+    def test_returns_empty_when_sandbox_empty(self, tmp_path):
+        from orchestrator import _collect_workspace_files
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert files == {}
+        assert rejected == []
+
+    def test_handles_subdirectory(self, tmp_path):
+        from orchestrator import _collect_workspace_files
+
+        sub = tmp_path / "modules" / "cloudfront"
+        sub.mkdir(parents=True)
+        (sub / "main.tf").write_text("resource ...")
+
+        files, rejected = _collect_workspace_files(tmp_path)
+
+        assert files == {"modules/cloudfront/main.tf": "resource ..."}
+        assert rejected == []
+
+
+# ---------------------------------------------------------------------------
+# Workspace mode: _classify_workspace_outcome
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyWorkspaceOutcome:
+    """workspace 実行の結末判定（valid / all_empty / no_recognized / none）"""
+
+    def test_valid_when_files_have_content(self):
+        from orchestrator import _classify_workspace_outcome
+
+        outcome = _classify_workspace_outcome({"main.tf": "resource ..."}, [])
+
+        assert outcome["files_kind"] == "valid"
+        assert outcome["files_count"] == 1
+        assert outcome["files_total_bytes"] > 0
+
+    def test_all_empty_when_files_have_zero_bytes(self):
+        from orchestrator import _classify_workspace_outcome
+
+        outcome = _classify_workspace_outcome({"main.tf": "", "variables.tf": ""}, [])
+
+        assert outcome["files_kind"] == "all_empty"
+        assert outcome["files_count"] == 2
+        assert outcome["files_total_bytes"] == 0
+
+    def test_no_recognized_when_only_rejected(self):
+        from orchestrator import _classify_workspace_outcome
+
+        rejected = [{"path": "x.exe", "reason": "not_in_whitelist"}]
+        outcome = _classify_workspace_outcome({}, rejected)
+
+        assert outcome["files_kind"] == "no_recognized"
+        assert outcome["files_count"] == 0
+        assert outcome["rejected"] == rejected
+
+    def test_none_when_nothing_written(self):
+        from orchestrator import _classify_workspace_outcome
+
+        outcome = _classify_workspace_outcome({}, [])
+
+        assert outcome["files_kind"] == "none"
+        assert outcome["files_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Workspace mode: call_claude_with_workspace
+# ---------------------------------------------------------------------------
+
+
+class TestCallClaudeWithWorkspace:
+    """Claude CLI の Write ツール経由呼び出しの sandbox 管理 + リトライ"""
+
+    def _fake_subprocess_run(self, files_to_write: dict[str, str] | None = None, stdout: str = "ok"):
+        """Claude CLI の subprocess.run を差し替える fake。cwd を見て指定ファイルを書く。"""
+        from pathlib import Path
+
+        def runner(cmd, **kwargs):
+            sandbox = Path(kwargs["cwd"])
+            for rel, content in (files_to_write or {}).items():
+                target = sandbox / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+            result = MagicMock()
+            result.stdout = stdout
+            result.returncode = 0
+            return result
+
+        return runner
+
+    def test_creates_and_cleans_sandbox(self, tmp_path):
+        from orchestrator import call_claude_with_workspace
+
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            result = MagicMock()
+            result.stdout = ""
+            return result
+
+        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+            call_claude_with_workspace("p", "iac_code")
+
+        assert captured["cwd"].startswith("/tmp/agent-output-iac_code-")
+        # finally で削除済み
+        from pathlib import Path
+
+        assert not Path(captured["cwd"]).exists()
+
+    def test_passes_cwd_to_subprocess(self):
+        from orchestrator import call_claude_with_workspace
+
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cwd"] = kwargs.get("cwd")
+            captured["cmd"] = cmd
+            result = MagicMock()
+            result.stdout = ""
+            return result
+
+        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+            call_claude_with_workspace("p", "iac_code")
+
+        assert captured["cwd"] is not None
+        assert captured["cwd"].startswith("/tmp/agent-output-iac_code-")
+
+    def test_includes_write_in_allowed_tools(self):
+        from orchestrator import call_claude_with_workspace
+
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            result = MagicMock()
+            result.stdout = ""
+            return result
+
+        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+            call_claude_with_workspace("p", "iac_code")
+
+        assert "--allowedTools" in captured["cmd"]
+        idx = captured["cmd"].index("--allowedTools")
+        assert "Write" in captured["cmd"][idx + 1]
+        assert "Edit" in captured["cmd"][idx + 1]
+
+    def test_returns_collected_files(self):
+        from orchestrator import call_claude_with_workspace
+
+        runner = self._fake_subprocess_run(
+            files_to_write={"main.tf": "resource ...", "README.md": "# doc"},
+            stdout="Wrote: main.tf, README.md",
+        )
+
+        with patch("orchestrator.subprocess.run", side_effect=runner):
+            raw, files, outcome = call_claude_with_workspace("p", "iac_code")
+
+        assert raw == "Wrote: main.tf, README.md"
+        assert files == {"main.tf": "resource ...", "README.md": "# doc"}
+        assert outcome["files_kind"] == "valid"
+
+    def test_retries_on_subprocess_error(self):
+        import subprocess
+
+        from orchestrator import call_claude_with_workspace
+
+        call_count = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="err")
+            result = MagicMock()
+            result.stdout = ""
+            return result
+
+        with (
+            patch("orchestrator.subprocess.run", side_effect=fake_run),
+            patch("orchestrator.time.sleep"),
+        ):
+            call_claude_with_workspace("p", "iac_code")
+
+        assert call_count["n"] == 2
+
+    def test_cleans_sandbox_on_exception(self):
+        import subprocess
+
+        from orchestrator import call_claude_with_workspace
+
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="")
+
+        with (
+            patch("orchestrator.subprocess.run", side_effect=fake_run),
+            patch("orchestrator.time.sleep"),
+            pytest.raises(subprocess.CalledProcessError),
+        ):
+            call_claude_with_workspace("p", "iac_code")
+
+        from pathlib import Path
+
+        assert not Path(captured["cwd"]).exists()
