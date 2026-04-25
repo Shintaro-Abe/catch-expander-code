@@ -227,29 +227,32 @@ aws secretsmanager create-secret \
 
 実際の認証ファイルパスは `~/.claude/.credentials.json`（先頭ドット）。
 
-### 4.4 OAuth トークンの自動同期と失効監視
+### 4.4 OAuth トークンの自動延命と失敗時通知
 
-#### 自動同期（DevContainer）
+#### 自動延命（Token Refresher Lambda）
 
-`.devcontainer/sync_claude_token.sh` と `.devcontainer/watch_claude_token.sh` により、
-DevContainer 内で `claude` コマンドにより `~/.claude/.credentials.json` が更新されると、
-変更を検知して Secrets Manager `catch-expander/claude-oauth` を自動的に
-`put-secret-value` で更新する。
+Token Refresher Lambda（`src/token_monitor/handler.py`、EventBridge Scheduler が 12 時間ごとに起動）が、
+Secrets Manager 上の `claudeAiOauth.refreshToken` を使って Anthropic OAuth エンドポイント
+（`https://platform.claude.com/v1/oauth/token`）に直接リクエストし、新 access_token を取得して
+Secrets Manager を上書きする。
 
-セキュリティ上の注意:
+判定基準: 残り < 1 時間または失効済みのとき refresh をトリガー。残り十分なら no-op。
 
-- `--secret-string` に直接値を渡すとプロセス一覧（`ps aux` / `/proc/PID/cmdline`）に
-  OAuth トークンが露出するため、0600 権限の一時ファイル経由で `--cli-input-json file://...`
-  として渡している（`sync_claude_token.sh` 参照）。
+#### 失敗時通知
 
-#### 失効監視（Token Monitor Lambda）
+refresh が HTTP 4xx/5xx で失敗、または `refreshToken` が credentials に存在しない場合のみ、
+Slack 通知チャンネルへ「再認証が必要」案内を投稿する。通知文には失敗理由（`http_401` /
+`no_refresh_token` 等）と最終 expiresAt を含む。
 
-Secrets Manager に格納された Claude OAuth トークンは、Token Monitor Lambda
-（`src/token_monitor/handler.py`、EventBridge Scheduler 起動）により定期的に
-`expiresAt` を確認される。`now > expiresAt + STALE_THRESHOLD_HOURS`（既定 24 時間）の
-ときに失効と判定し、Slack 通知チャンネルへ「DevContainer で `claude` コマンドを実行 →
-自動で Secrets Manager に同期」案内を投稿する。詳細は `architecture.md` 4 「Lambda 設計」
-の「トークンモニター関数」を参照。
+通知を受信したら、ローカル PC で 1 回 `claude` 認証して `~/.claude/.credentials.json` を
+Secrets Manager に再投入する。詳細は `.steering/20260425-auth-redesign-aipapers/initial-setup.md`
+を参照。
+
+#### ECS タスク内での書き戻し
+
+ECS Fargate タスクは起動時に Secrets Manager から credentials を取得して `~/.claude/.credentials.json`
+に展開し、タスク終了時に内容に変化があれば Secrets Manager に書き戻す（ベストエフォート）。
+これは `claude` CLI がタスク実行中に内部的に refresh した場合の救済。
 
 #### 不採用とした方式
 

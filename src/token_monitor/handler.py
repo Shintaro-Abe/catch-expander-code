@@ -3,6 +3,9 @@ import logging
 import os
 import time
 from datetime import UTC, datetime
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import boto3
 from slack_sdk import WebClient
@@ -13,98 +16,190 @@ logger.setLevel(logging.INFO)
 
 secrets_client = boto3.client("secretsmanager")
 
-STALE_THRESHOLD_HOURS_DEFAULT = 24
+# AS OF 2026-04-25: Anthropic OAuth エンドポイント / Claude Code CLI の公開クライアント ID
+# 仕様変更で動かなくなった場合はここを更新する単一の差し替え点
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+
+# 残り 1 時間以下なら refresh をトリガー（12h 実行間隔と整合）
+REFRESH_BUFFER_MS = 60 * 60 * 1000
+
+# refresh API レスポンスに expires_in が無い場合のフォールバック（Anthropic OAuth の典型値 8h）
+DEFAULT_EXPIRES_IN_SEC = 8 * 60 * 60
 
 
 def _get_secret(arn: str) -> str:
-    """Secrets Manager からシークレットを取得する。"""
     response = secrets_client.get_secret_value(SecretId=arn)
     return response["SecretString"]
 
 
-def _is_token_stale(claude_oauth_json: str, stale_threshold_ms: int) -> tuple[bool, int | None]:
-    """Claude OAuth トークンが失効かつ閾値時間以上経過しているか判定する。
+def _put_secret(arn: str, value: str) -> None:
+    secrets_client.put_secret_value(SecretId=arn, SecretString=value)
 
-    Secrets Manager に格納された JSON の `claudeAiOauth.expiresAt`（ミリ秒）を参照し、
-    `now_ms > expiresAt + stale_threshold_ms` のときに失効と見なす。
 
-    Returns:
-        (is_stale, expires_at_ms): 失効フラグと有効期限（ミリ秒）のタプル。
-        expiresAt が取得できない場合は (False, None) を返す。
-    """
+def _parse_credentials(raw: str) -> dict[str, Any]:
+    """Secrets Manager から取得した JSON 文字列を dict にパース。失敗時は空 dict。"""
     try:
-        creds = json.loads(claude_oauth_json)
-        expires_at_ms = creds.get("claudeAiOauth", {}).get("expiresAt")
-        if expires_at_ms is None:
-            logger.warning("expiresAt not found in Claude OAuth credentials")
-            return False, None
-        now_ms = int(time.time() * 1000)
-        is_stale = now_ms > expires_at_ms + stale_threshold_ms
-        return is_stale, int(expires_at_ms)
-    except (json.JSONDecodeError, AttributeError) as e:
-        logger.error("Failed to parse Claude OAuth credentials: %s", e)
-        return False, None
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            logger.error("Credentials JSON is not an object")
+            return {}
+        return parsed
+    except json.JSONDecodeError as e:
+        logger.error("Failed to parse credentials JSON: %s", e)
+        return {}
 
 
-def _post_slack_notification(slack_token: str, channel_id: str, expires_at_ms: int | None) -> None:
-    """Slack チャンネルへトークン失効通知を投稿する。
+def _needs_refresh(expires_at_ms: int, buffer_ms: int, now_ms: int) -> bool:
+    """残り時間が buffer 以下、または既に失効していれば True。"""
+    return now_ms + buffer_ms >= expires_at_ms
 
-    通知に失敗した場合は SlackApiError を再スローする。
+
+def _call_refresh_endpoint(refresh_token: str) -> dict[str, Any]:
+    """Anthropic OAuth エンドポイントへ refresh_token を投げて新トークンを取得。
+
+    成功時は access_token / refresh_token / expires_in / scope を含む dict を返す。
+    HTTP 4xx/5xx は HTTPError、ネットワーク到達不能は URLError を伝播する。
+    """
+    payload = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLIENT_ID,
+            "scope": SCOPES,
+        }
+    ).encode("utf-8")
+    req = Request(
+        TOKEN_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _build_updated_credentials(
+    old: dict[str, Any], result: dict[str, Any], now_ms: int
+) -> dict[str, Any]:
+    """既存 credentials 構造を保ったまま claudeAiOauth を新値で更新した dict を返す。
+
+    レスポンスに refresh_token があれば更新、無ければ既存値を維持。
+    expires_in（秒）から expiresAt（ミリ秒）を計算。
+    """
+    old_oauth = old.get("claudeAiOauth", {})
+    new_oauth = {
+        **old_oauth,
+        "accessToken": result["access_token"],
+        "refreshToken": result.get("refresh_token", old_oauth.get("refreshToken")),
+        "expiresAt": now_ms + result.get("expires_in", DEFAULT_EXPIRES_IN_SEC) * 1000,
+    }
+    if "scope" in result:
+        new_oauth["scopes"] = result["scope"].split(" ")
+    return {**old, "claudeAiOauth": new_oauth}
+
+
+def _post_slack_failure(
+    slack_token: str,
+    channel_id: str,
+    reason: str,
+    expires_at_ms: int | None,
+) -> None:
+    """自動延命に失敗したときのみ Slack へアラートを送る。
+
+    Slack 側のエラーは WARN ログに留め、Lambda 終了に影響させない（最終手段の通知のため
+    通知できなくても CloudWatch のメトリクスで検知できる）。
     """
     if expires_at_ms is not None:
         expires_at = datetime.fromtimestamp(expires_at_ms / 1000, tz=UTC)
-        now_ms = int(time.time() * 1000)
-        hours_overdue = (now_ms - expires_at_ms) // (60 * 60 * 1000)
-        expiry_str = f"{expires_at.strftime('%Y-%m-%d %H:%M UTC')} （{hours_overdue} 時間前に期限切れ）"
+        expiry_str = expires_at.strftime("%Y-%m-%d %H:%M UTC")
     else:
         expiry_str = "不明"
 
     message = (
-        "⚠️ Claude OAuth トークンの確認が必要です。\n"
+        "🚨 Claude OAuth トークンの自動延命に失敗しました。再認証が必要です。\n"
         "\n"
-        f"有効期限: {expiry_str}\n"
+        f"理由: {reason}\n"
+        f"最終 expiresAt: {expiry_str}\n"
         "\n"
-        "DevContainer を起動して `claude` コマンドを実行し、再ログインしてください。\n"
-        "再ログイン後、トークンは自動的に Secrets Manager へ同期されます。"
+        "対処:\n"
+        "1. ローカル PC で `claude` を起動し `/login` で再認証\n"
+        "2. ~/.claude/.credentials.json の中身を Secrets Manager に投入:\n"
+        "   `aws secretsmanager put-secret-value --secret-id catch-expander/claude-oauth"
+        " --secret-string file://~/.claude/.credentials.json`\n"
+        "\n"
+        "詳細手順: .steering/20260425-auth-redesign-aipapers/initial-setup.md"
     )
 
     client = WebClient(token=slack_token)
     try:
         client.chat_postMessage(channel=channel_id, text=message)
-        logger.info("Slack notification sent to channel %s", channel_id)
-    except SlackApiError as e:
-        logger.error("Failed to send Slack notification: %s", e)
-        raise
+        logger.info("Slack failure notification sent", extra={"reason": reason})
+    except SlackApiError:
+        logger.warning("Failed to send Slack failure notification", extra={"reason": reason})
 
 
-def lambda_handler(event: dict, context: object) -> None:
-    """Claude OAuth トークンの失効状態を定期チェックし、必要に応じて Slack 通知する。
+def lambda_handler(event: dict, context: object) -> dict[str, Any]:
+    """Claude OAuth トークンを自動延命する。
 
-    EventBridge Scheduler から 12 時間ごとに呼び出される。
-    `expiresAt` が現在時刻より STALE_THRESHOLD_HOURS 以上過去のとき失効と判定し、
-    Slack チャンネルへ通知を投稿する。
+    - 残り > 1h なら何もせず終了
+    - 残り <= 1h or 失効済み なら refresh_token で新トークンを取得し Secrets Manager 上書き
+    - refresh が失敗したら Slack へ通知
+
+    Returns:
+        {"refreshed": bool, "reason"?: str, "new_expires_at_ms"?: int}
     """
     claude_oauth_arn = os.environ["CLAUDE_OAUTH_SECRET_ARN"]
     slack_token_arn = os.environ["SLACK_BOT_TOKEN_SECRET_ARN"]
     channel_id = os.environ["SLACK_NOTIFICATION_CHANNEL_ID"]
-    stale_threshold_hours = int(os.environ.get("STALE_THRESHOLD_HOURS", str(STALE_THRESHOLD_HOURS_DEFAULT)))
-    stale_threshold_ms = stale_threshold_hours * 60 * 60 * 1000
 
-    claude_oauth_json = _get_secret(claude_oauth_arn)
-    is_stale, expires_at_ms = _is_token_stale(claude_oauth_json, stale_threshold_ms)
+    raw = _get_secret(claude_oauth_arn)
+    creds = _parse_credentials(raw)
+    oauth = creds.get("claudeAiOauth", {}) if isinstance(creds, dict) else {}
+    expires_at_ms = oauth.get("expiresAt")
+    refresh_token = oauth.get("refreshToken")
 
-    if not is_stale:
-        if expires_at_ms is not None:
-            expires_at = datetime.fromtimestamp(expires_at_ms / 1000, tz=UTC)
-            logger.info("Claude OAuth token is valid. Expires at: %s", expires_at.isoformat())
-        else:
-            logger.info("Claude OAuth token staleness check skipped (no expiresAt)")
-        return
+    now_ms = int(time.time() * 1000)
 
-    logger.warning(
-        "Claude OAuth token is stale. expires_at_ms=%d",
-        expires_at_ms if expires_at_ms is not None else -1,
+    if not isinstance(expires_at_ms, int):
+        logger.error("expiresAt missing or invalid in credentials")
+        slack_token = _get_secret(slack_token_arn)
+        _post_slack_failure(slack_token, channel_id, "no_expires_at", None)
+        return {"refreshed": False, "reason": "no_expires_at"}
+
+    if not _needs_refresh(expires_at_ms, REFRESH_BUFFER_MS, now_ms):
+        remaining_min = (expires_at_ms - now_ms) // 60_000
+        logger.info("Token still valid", extra={"remaining_min": remaining_min})
+        return {"refreshed": False, "reason": "still_valid"}
+
+    if not refresh_token:
+        logger.error("No refresh_token in credentials")
+        slack_token = _get_secret(slack_token_arn)
+        _post_slack_failure(slack_token, channel_id, "no_refresh_token", expires_at_ms)
+        return {"refreshed": False, "reason": "no_refresh_token"}
+
+    try:
+        result = _call_refresh_endpoint(refresh_token)
+    except HTTPError as e:
+        reason = f"http_{e.code}"
+        logger.error("Refresh HTTP error", extra={"http_code": e.code})
+        slack_token = _get_secret(slack_token_arn)
+        _post_slack_failure(slack_token, channel_id, reason, expires_at_ms)
+        return {"refreshed": False, "reason": reason}
+    except URLError as e:
+        logger.error("Refresh URL error", extra={"error_class": type(e).__name__})
+        slack_token = _get_secret(slack_token_arn)
+        _post_slack_failure(slack_token, channel_id, "url_error", expires_at_ms)
+        return {"refreshed": False, "reason": "url_error"}
+
+    new_creds = _build_updated_credentials(creds, result, now_ms)
+    _put_secret(claude_oauth_arn, json.dumps(new_creds))
+
+    new_expires_at_ms = new_creds["claudeAiOauth"]["expiresAt"]
+    new_expires_in_min = (new_expires_at_ms - now_ms) // 60_000
+    logger.info(
+        "Token refreshed successfully",
+        extra={"refreshed": True, "new_expires_in_min": new_expires_in_min},
     )
-
-    slack_token = _get_secret(slack_token_arn)
-    _post_slack_notification(slack_token, channel_id, expires_at_ms)
+    return {"refreshed": True, "new_expires_at_ms": new_expires_at_ms}

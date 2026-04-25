@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import sys
@@ -30,15 +31,45 @@ def _get_secret(arn: str) -> str:
     return response["SecretString"]
 
 
-def _setup_claude_credentials(secret_value: str) -> None:
-    """Claude Code OAuthクレデンシャルをホームディレクトリに配置する。
+def _hash_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _setup_claude_credentials(secret_value: str) -> str:
+    """Claude Code OAuthクレデンシャルをホームディレクトリに配置し、起動時の hash を返す。
 
     Claude Code CLIはタスク起動時に ~/.claude/.credentials.json を参照する。
     ECS Fargateのファイルシステムはエフェメラルなため、起動のたびにSecrets Managerから復元する。
+    戻り値の hash はタスク終了時に refresh が起きたかを判定するために _writeback_claude_credentials が使う。
     """
     claude_dir = Path.home() / ".claude"
     claude_dir.mkdir(exist_ok=True)
     (claude_dir / ".credentials.json").write_text(secret_value)
+    return _hash_text(secret_value)
+
+
+def _writeback_claude_credentials(secret_arn: str, initial_hash: str) -> None:
+    """タスク終了時、credentials が refresh されていれば Secrets Manager に書き戻す。
+
+    ベストエフォート: 書き戻し失敗はタスク本体の終了コードに影響させない。
+    Claude CLI が実行中に refresh した場合（auth status を内部的に走らせた等）の救済。
+    """
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        if not creds_path.exists():
+            logger.warning("Credentials file not found at task exit; skipping writeback")
+            return
+        current = creds_path.read_text()
+        if _hash_text(current) == initial_hash:
+            logger.info("Credentials unchanged at task exit")
+            return
+        boto3.client("secretsmanager").put_secret_value(
+            SecretId=secret_arn,
+            SecretString=current,
+        )
+        logger.info("Credentials writeback succeeded")
+    except Exception:
+        logger.exception("Credentials writeback failed (non-fatal)")
 
 
 def _run_feedback(slack_client: SlackClient, db_client: DynamoDbClient) -> None:
@@ -118,11 +149,13 @@ def main() -> None:
     _setup_logging()
 
     slack_token = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
+    claude_secret_arn = os.environ["CLAUDE_OAUTH_SECRET_ARN"]
+    initial_hash: str | None = None
     try:
         notion_token = _get_secret(os.environ["NOTION_TOKEN_SECRET_ARN"])
         github_token = _get_secret(os.environ["GITHUB_TOKEN_SECRET_ARN"])
-        claude_oauth = _get_secret(os.environ["CLAUDE_OAUTH_SECRET_ARN"])
-        _setup_claude_credentials(claude_oauth)
+        claude_oauth = _get_secret(claude_secret_arn)
+        initial_hash = _setup_claude_credentials(claude_oauth)
 
         table_prefix = os.environ["DYNAMODB_TABLE_PREFIX"]
         slack_client = SlackClient(slack_token)
@@ -138,6 +171,9 @@ def main() -> None:
         logger.exception("Task failed")
         _notify_task_failure(slack_token, exc)
         raise
+    finally:
+        if initial_hash is not None:
+            _writeback_claude_credentials(claude_secret_arn, initial_hash)
 
 
 if __name__ == "__main__":

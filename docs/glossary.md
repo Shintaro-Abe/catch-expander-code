@@ -100,8 +100,9 @@
 |--------------|------------|------|--------------|
 | Cloudflare ブロック | Cloudflare Block | Notion API 前段の Cloudflare WAF が ECS Fargate からのリクエストを 403 で拒否する事象。HTML ボディに「Attention Required! \| Cloudflare」または `cdn-cgi/styles/cf.errors.css` のシグネチャを含む | `cloudflare_block` |
 | Cloudflare ブロック例外 | Notion Cloudflare Block Error | Cloudflare ブロックを検知したときに `notion_client._request_with_retry` が送出する専用例外。`cf_ray` 属性を保持 | `NotionCloudflareBlockError` |
-| トークン失効 | Token Stale | Claude OAuth トークンの `expiresAt` を現在時刻が `STALE_THRESHOLD_HOURS`（既定 24 時間）以上超過した状態。Token Monitor が Slack 通知を投げる起点 | `is_stale` |
-| OAuth 自動同期 | OAuth Auto Sync | DevContainer 上で `claude login` 実行後に `~/.claude/.credentials.json` の変更を検出し、Secrets Manager `catch-expander/claude-oauth` を自動更新する仕組み（`watch_claude_token.sh` / `sync_claude_token.sh`） | `sync_claude_token` |
+| トークン要 refresh | Refresh Needed | Claude OAuth トークンの残り有効時間が 1 時間以下、または既に `expiresAt` を超過した状態。Token Refresher が refresh をトリガーする起点 | `_needs_refresh` |
+| OAuth 自動延命 | OAuth Auto Refresh | Token Refresher Lambda が `refreshToken` を Anthropic OAuth エンドポイントに直接送信し、新 access_token を Secrets Manager に書き戻す仕組み | `_call_refresh_endpoint` / `_build_updated_credentials` |
+| Credentials 書き戻し | Credentials Writeback | ECS タスク終了時に `~/.claude/.credentials.json` の内容変化を検知し、変更があれば Secrets Manager `catch-expander/claude-oauth` に書き戻すベストエフォート処理 | `_writeback_claude_credentials` |
 
 ## 6. 略語・略称
 

@@ -217,30 +217,36 @@ ENTRYPOINT ["python3", "main.py"]
 | タイムアウト | 10秒 |
 | 実行ロール | LambdaTriggerRole（ECS RunTask, DynamoDB, Secrets Manager） |
 
-### トークンモニター関数
+### トークンリフレッシャー関数
 
 ```
 入力: EventBridge 定期スケジュールイベント
 処理:
-  1. Secrets Manager から Claude OAuth トークン情報（JSON）を取得
-  2. `claudeAiOauth.expiresAt`（ミリ秒）と現在時刻を比較し、
-     `now > expiresAt + STALE_THRESHOLD_HOURS` のとき「失効」と判定
-  3. 失効と判定された場合のみ、Slack 通知チャンネルへ
-     「`claude` コマンドで再ログイン → 自動 Secrets Manager 同期」案内を投稿
-出力: なし（Slack通知のみ）
+  1. Secrets Manager から Claude OAuth credentials（JSON）を取得
+  2. `claudeAiOauth.expiresAt` を確認し、残り 1 時間以下または失効済みなら refresh をトリガー
+  3. Anthropic OAuth エンドポイント（`https://platform.claude.com/v1/oauth/token`）に
+     `refresh_token` で POST し、新 access_token / refresh_token / expires_in を取得
+  4. 新トークンを Secrets Manager に書き戻し（put_secret_value）
+  5. refresh が失敗した場合（HTTP 4xx/5xx、`refreshToken` 不在など）のみ、
+     Slack 通知チャンネルへ「再認証が必要」案内を投稿
+出力: {"refreshed": bool, "reason"?: str, "new_expires_at_ms"?: int}
 ```
 
 | 項目 | 値 |
 |------|-----|
 | ランタイム | Python 3.13 |
-| メモリ | 256 MB |
-| タイムアウト | 60秒 |
+| メモリ | 128 MB |
+| タイムアウト | 30秒 |
 | トリガー | EventBridge Scheduler（既定 12 時間ごと） |
-| 失効判定しきい値 | `STALE_THRESHOLD_HOURS`（既定 24 時間、環境変数で変更可） |
-| 実行ロール | TokenMonitorRole（Secrets Manager 読み取り） |
-| 主要環境変数 | `CLAUDE_OAUTH_SECRET_ARN` / `SLACK_BOT_TOKEN_SECRET_ARN` / `SLACK_NOTIFICATION_CHANNEL_ID` / `STALE_THRESHOLD_HOURS` |
+| refresh 判定しきい値 | 残り時間 ≤ 1 時間（`REFRESH_BUFFER_MS = 3600000` で固定） |
+| 実行ロール | TokenMonitorRole（Secrets Manager 読み取り＋ `claude-oauth` への書き込み） |
+| 主要環境変数 | `CLAUDE_OAUTH_SECRET_ARN` / `SLACK_BOT_TOKEN_SECRET_ARN` / `SLACK_NOTIFICATION_CHANNEL_ID` |
 
-実装は `src/token_monitor/handler.py`。再ログイン後のトークンは DevContainer 上の `watch_claude_token.sh` / `sync_claude_token.sh` が `~/.claude/.credentials.json` の変更を検知し、Secrets Manager `catch-expander/claude-oauth` を自動更新する（詳細は `credential-setup.md` 4.4 参照）。
+実装は `src/token_monitor/handler.py`。Anthropic OAuth クライアント ID は Claude Code CLI 公開のもの（`9d1c250a-...`）を AS OF 2026-04-25 でハードコード。仕様変更があれば handler.py 冒頭の定数のみ更新する。
+
+ECS Fargate タスクは起動時に Secrets Manager から credentials を取得して `~/.claude/.credentials.json` に展開し、タスク終了時（finally）に内容に変化があれば Secrets Manager に書き戻す（ベストエフォート、`src/agent/main.py:_writeback_claude_credentials`）。これは Claude CLI がタスク実行中に内部 refresh した場合の救済。
+
+初回 bootstrap 手順は `.steering/20260425-auth-redesign-aipapers/initial-setup.md` を参照（ローカル PC で 1 回認証 → Secrets Manager に投入）。
 
 ## 5. DynamoDBテーブル設計
 

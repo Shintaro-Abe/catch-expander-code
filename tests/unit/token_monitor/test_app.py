@@ -1,235 +1,393 @@
 import json
 import time
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError, URLError
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# _is_token_stale
+# _needs_refresh
 # ---------------------------------------------------------------------------
 
 
-class TestIsTokenStale:
-    _THRESHOLD_MS = 24 * 60 * 60 * 1000  # 24h
+class TestNeedsRefresh:
+    _BUFFER_MS = 60 * 60 * 1000  # 1h
 
-    def _make_oauth_json(self, expires_at_ms: int) -> str:
-        return json.dumps({"claudeAiOauth": {"expiresAt": expires_at_ms}})
+    def test_returns_false_when_more_than_buffer_remaining(self):
+        from handler import _needs_refresh
 
-    def test_returns_false_when_not_yet_expired(self):
-        from handler import _is_token_stale
+        now_ms = 1_000_000_000_000
+        # 残り 2h
+        expires_at_ms = now_ms + 2 * 60 * 60 * 1000
+        assert _needs_refresh(expires_at_ms, self._BUFFER_MS, now_ms) is False
 
-        future_ms = int(time.time() * 1000) + 10 * 60 * 60 * 1000  # 10h後
-        is_stale, expires_at = _is_token_stale(self._make_oauth_json(future_ms), self._THRESHOLD_MS)
+    def test_returns_true_when_within_buffer(self):
+        from handler import _needs_refresh
 
-        assert is_stale is False
-        assert expires_at == future_ms
+        now_ms = 1_000_000_000_000
+        # 残り 30min
+        expires_at_ms = now_ms + 30 * 60 * 1000
+        assert _needs_refresh(expires_at_ms, self._BUFFER_MS, now_ms) is True
 
-    def test_returns_false_when_expired_but_within_threshold(self):
-        from handler import _is_token_stale
+    def test_returns_true_when_already_expired(self):
+        from handler import _needs_refresh
 
-        # 12h前に期限切れ（閾値 24h 未満）
-        past_12h_ms = int(time.time() * 1000) - 12 * 60 * 60 * 1000
-        is_stale, expires_at = _is_token_stale(self._make_oauth_json(past_12h_ms), self._THRESHOLD_MS)
+        now_ms = 1_000_000_000_000
+        # 1h 前に失効
+        expires_at_ms = now_ms - 60 * 60 * 1000
+        assert _needs_refresh(expires_at_ms, self._BUFFER_MS, now_ms) is True
 
-        assert is_stale is False
-        assert expires_at == past_12h_ms
+    def test_boundary_at_exactly_buffer_returns_true(self):
+        from handler import _needs_refresh
 
-    def test_returns_true_when_expired_beyond_threshold(self):
-        from handler import _is_token_stale
-
-        # 25h前に期限切れ（閾値 24h 超過）
-        past_25h_ms = int(time.time() * 1000) - 25 * 60 * 60 * 1000
-        is_stale, expires_at = _is_token_stale(self._make_oauth_json(past_25h_ms), self._THRESHOLD_MS)
-
-        assert is_stale is True
-        assert expires_at == past_25h_ms
-
-    def test_returns_false_none_when_expires_at_missing(self):
-        from handler import _is_token_stale
-
-        oauth_json = json.dumps({"claudeAiOauth": {}})
-        is_stale, expires_at = _is_token_stale(oauth_json, self._THRESHOLD_MS)
-
-        assert is_stale is False
-        assert expires_at is None
-
-    def test_returns_false_none_when_claude_ai_oauth_missing(self):
-        from handler import _is_token_stale
-
-        oauth_json = json.dumps({"someOtherKey": "value"})
-        is_stale, expires_at = _is_token_stale(oauth_json, self._THRESHOLD_MS)
-
-        assert is_stale is False
-        assert expires_at is None
-
-    def test_returns_false_none_on_invalid_json(self):
-        from handler import _is_token_stale
-
-        is_stale, expires_at = _is_token_stale("not-valid-json", self._THRESHOLD_MS)
-
-        assert is_stale is False
-        assert expires_at is None
+        now_ms = 1_000_000_000_000
+        # ちょうど残り 1h
+        expires_at_ms = now_ms + self._BUFFER_MS
+        assert _needs_refresh(expires_at_ms, self._BUFFER_MS, now_ms) is True
 
 
 # ---------------------------------------------------------------------------
-# _post_slack_notification
+# _call_refresh_endpoint
 # ---------------------------------------------------------------------------
 
 
-class TestPostSlackNotification:
-    def test_posts_message_with_expiry_info(self, monkeypatch):
-        from handler import _post_slack_notification
+class TestCallRefreshEndpoint:
+    def _mock_response(self, body: dict) -> MagicMock:
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(body).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_resp.__exit__.return_value = None
+        return mock_resp
+
+    def test_returns_parsed_json_on_success(self):
+        from handler import _call_refresh_endpoint
+
+        body = {"access_token": "new", "refresh_token": "rt2", "expires_in": 7200, "scope": "a b"}
+        with patch("handler.urlopen", return_value=self._mock_response(body)):
+            result = _call_refresh_endpoint("rt1")
+
+        assert result == body
+
+    def test_payload_contains_required_fields(self):
+        from handler import CLIENT_ID, SCOPES, _call_refresh_endpoint
+
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout):
+            captured["req"] = req
+            return self._mock_response({"access_token": "x", "expires_in": 7200})
+
+        with patch("handler.urlopen", side_effect=fake_urlopen):
+            _call_refresh_endpoint("my-rt")
+
+        req = captured["req"]
+        payload = json.loads(req.data.decode("utf-8"))
+        assert payload["grant_type"] == "refresh_token"
+        assert payload["refresh_token"] == "my-rt"
+        assert payload["client_id"] == CLIENT_ID
+        assert payload["scope"] == SCOPES
+        assert req.headers["Content-type"] == "application/json"
+        assert req.method == "POST"
+
+    def test_propagates_http_401(self):
+        from handler import _call_refresh_endpoint
+
+        err = HTTPError(
+            url="https://platform.claude.com/v1/oauth/token",
+            code=401,
+            msg="Unauthorized",
+            hdrs=None,
+            fp=None,
+        )
+        with patch("handler.urlopen", side_effect=err):
+            with pytest.raises(HTTPError) as exc_info:
+                _call_refresh_endpoint("rt")
+        assert exc_info.value.code == 401
+
+    def test_propagates_http_500(self):
+        from handler import _call_refresh_endpoint
+
+        err = HTTPError(url="...", code=500, msg="ISE", hdrs=None, fp=None)
+        with patch("handler.urlopen", side_effect=err):
+            with pytest.raises(HTTPError) as exc_info:
+                _call_refresh_endpoint("rt")
+        assert exc_info.value.code == 500
+
+    def test_propagates_url_error(self):
+        from handler import _call_refresh_endpoint
+
+        with patch("handler.urlopen", side_effect=URLError("dns fail")):
+            with pytest.raises(URLError):
+                _call_refresh_endpoint("rt")
+
+
+# ---------------------------------------------------------------------------
+# _build_updated_credentials
+# ---------------------------------------------------------------------------
+
+
+class TestBuildUpdatedCredentials:
+    def test_calculates_expires_at_from_expires_in(self):
+        from handler import _build_updated_credentials
+
+        old = {"claudeAiOauth": {"accessToken": "old", "refreshToken": "rt-old"}}
+        result = {"access_token": "new", "expires_in": 7200}
+        now_ms = 1_700_000_000_000
+
+        new = _build_updated_credentials(old, result, now_ms)
+
+        assert new["claudeAiOauth"]["expiresAt"] == now_ms + 7200 * 1000
+        assert new["claudeAiOauth"]["accessToken"] == "new"
+
+    def test_preserves_old_refresh_token_when_response_omits_it(self):
+        from handler import _build_updated_credentials
+
+        old = {"claudeAiOauth": {"refreshToken": "rt-keep"}}
+        result = {"access_token": "new", "expires_in": 7200}
+
+        new = _build_updated_credentials(old, result, 0)
+
+        assert new["claudeAiOauth"]["refreshToken"] == "rt-keep"
+
+    def test_uses_new_refresh_token_when_response_includes_it(self):
+        from handler import _build_updated_credentials
+
+        old = {"claudeAiOauth": {"refreshToken": "rt-old"}}
+        result = {"access_token": "new", "refresh_token": "rt-new", "expires_in": 7200}
+
+        new = _build_updated_credentials(old, result, 0)
+
+        assert new["claudeAiOauth"]["refreshToken"] == "rt-new"
+
+    def test_splits_scope_into_array(self):
+        from handler import _build_updated_credentials
+
+        old = {"claudeAiOauth": {}}
+        result = {"access_token": "x", "scope": "user:profile user:inference"}
+
+        new = _build_updated_credentials(old, result, 0)
+
+        assert new["claudeAiOauth"]["scopes"] == ["user:profile", "user:inference"]
+
+    def test_preserves_other_top_level_keys(self):
+        from handler import _build_updated_credentials
+
+        old = {
+            "claudeAiOauth": {"accessToken": "old"},
+            "oauthAccount": {"emailAddress": "test@example.com"},
+        }
+        result = {"access_token": "new", "expires_in": 7200}
+
+        new = _build_updated_credentials(old, result, 0)
+
+        assert new["oauthAccount"] == {"emailAddress": "test@example.com"}
+
+    def test_uses_default_expires_in_when_missing(self):
+        from handler import DEFAULT_EXPIRES_IN_SEC, _build_updated_credentials
+
+        old = {"claudeAiOauth": {}}
+        result = {"access_token": "x"}
+        now_ms = 1_000_000
+
+        new = _build_updated_credentials(old, result, now_ms)
+
+        assert new["claudeAiOauth"]["expiresAt"] == now_ms + DEFAULT_EXPIRES_IN_SEC * 1000
+
+
+# ---------------------------------------------------------------------------
+# _post_slack_failure
+# ---------------------------------------------------------------------------
+
+
+class TestPostSlackFailure:
+    def test_posts_message_with_reason_and_expiry(self):
+        from handler import _post_slack_failure
 
         mock_client = MagicMock()
         with patch("handler.WebClient", return_value=mock_client):
-            # 10h前に期限切れ
-            expires_at_ms = int(time.time() * 1000) - 10 * 60 * 60 * 1000
-            _post_slack_notification("slack-token", "C12345", expires_at_ms)
+            past_ms = int(time.time() * 1000) - 60 * 60 * 1000
+            _post_slack_failure("slack-token", "C123", "http_401", past_ms)
 
         mock_client.chat_postMessage.assert_called_once()
-        call_kwargs = mock_client.chat_postMessage.call_args[1]
-        assert call_kwargs["channel"] == "C12345"
-        assert "⚠️" in call_kwargs["text"]
-        assert "10 時間前に期限切れ" in call_kwargs["text"]
-        assert "claude" in call_kwargs["text"]
+        text = mock_client.chat_postMessage.call_args.kwargs["text"]
+        assert "🚨" in text
+        assert "http_401" in text
+        assert "再認証" in text
 
-    def test_posts_message_with_unknown_expiry_when_none(self):
-        from handler import _post_slack_notification
+    def test_posts_unknown_when_expires_at_none(self):
+        from handler import _post_slack_failure
 
         mock_client = MagicMock()
         with patch("handler.WebClient", return_value=mock_client):
-            _post_slack_notification("slack-token", "C12345", None)
+            _post_slack_failure("slack-token", "C123", "no_refresh_token", None)
 
-        call_kwargs = mock_client.chat_postMessage.call_args[1]
-        assert "不明" in call_kwargs["text"]
+        text = mock_client.chat_postMessage.call_args.kwargs["text"]
+        assert "不明" in text
 
-    def test_raises_on_slack_api_error(self):
-        from handler import _post_slack_notification
+    def test_swallows_slack_error(self):
         from slack_sdk.errors import SlackApiError
+
+        from handler import _post_slack_failure
 
         mock_client = MagicMock()
         mock_client.chat_postMessage.side_effect = SlackApiError(
-            message="channel_not_found",
-            response={"error": "channel_not_found"},
+            message="channel_not_found", response={"error": "channel_not_found"}
         )
         with patch("handler.WebClient", return_value=mock_client):
-            with pytest.raises(SlackApiError):
-                _post_slack_notification("slack-token", "C_INVALID", None)
+            # 例外が伝播しないこと（最終手段の通知のため）
+            _post_slack_failure("slack-token", "C_INVALID", "http_500", None)
 
 
 # ---------------------------------------------------------------------------
-# lambda_handler
+# lambda_handler — 統合フロー
 # ---------------------------------------------------------------------------
 
 
-class TestLambdaHandler:
+class TestLambdaHandlerFlow:
     _COMMON_ENV = {
-        "CLAUDE_OAUTH_SECRET_ARN": "arn:aws:secretsmanager:ap-northeast-1:123:secret:claude",
-        "SLACK_BOT_TOKEN_SECRET_ARN": "arn:aws:secretsmanager:ap-northeast-1:123:secret:slack",
+        "CLAUDE_OAUTH_SECRET_ARN": "arn:claude",
+        "SLACK_BOT_TOKEN_SECRET_ARN": "arn:slack",
         "SLACK_NOTIFICATION_CHANNEL_ID": "C_MONITOR",
-        "STALE_THRESHOLD_HOURS": "24",
     }
 
     def _set_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for k, v in self._COMMON_ENV.items():
             monkeypatch.setenv(k, v)
 
-    def test_does_not_notify_when_token_is_valid(self, monkeypatch):
-        self._set_env(monkeypatch)
+    def _creds_json(self, expires_at_ms: int, refresh_token: str | None = "rt") -> str:
+        oauth = {"expiresAt": expires_at_ms}
+        if refresh_token is not None:
+            oauth["refreshToken"] = refresh_token
+        return json.dumps({"claudeAiOauth": oauth})
 
-        future_ms = int(time.time() * 1000) + 10 * 60 * 60 * 1000
-        oauth_json = json.dumps({"claudeAiOauth": {"expiresAt": future_ms}})
+    def test_still_valid_returns_no_op(self, monkeypatch):
+        self._set_env(monkeypatch)
+        future_ms = int(time.time() * 1000) + 2 * 60 * 60 * 1000  # 残り 2h
 
         with (
-            patch("handler._get_secret", return_value=oauth_json),
-            patch("handler._post_slack_notification") as mock_notify,
+            patch("handler._get_secret", return_value=self._creds_json(future_ms)),
+            patch("handler._put_secret") as mock_put,
+            patch("handler._call_refresh_endpoint") as mock_refresh,
+            patch("handler._post_slack_failure") as mock_notify,
         ):
             from handler import lambda_handler
 
-            lambda_handler({}, None)
+            result = lambda_handler({}, None)
 
+        assert result == {"refreshed": False, "reason": "still_valid"}
+        mock_put.assert_not_called()
+        mock_refresh.assert_not_called()
         mock_notify.assert_not_called()
 
-    def test_notifies_when_token_is_stale(self, monkeypatch):
+    def test_no_refresh_token_notifies_slack(self, monkeypatch):
         self._set_env(monkeypatch)
-
-        past_25h_ms = int(time.time() * 1000) - 25 * 60 * 60 * 1000
-        oauth_json = json.dumps({"claudeAiOauth": {"expiresAt": past_25h_ms}})
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
 
         with (
-            patch("handler._get_secret", side_effect=[oauth_json, "slack-bot-token"]),
-            patch("handler._post_slack_notification") as mock_notify,
+            patch(
+                "handler._get_secret",
+                side_effect=[self._creds_json(past_ms, refresh_token=None), "slack-token"],
+            ),
+            patch("handler._put_secret") as mock_put,
+            patch("handler._call_refresh_endpoint") as mock_refresh,
+            patch("handler._post_slack_failure") as mock_notify,
         ):
             from handler import lambda_handler
 
-            lambda_handler({}, None)
+            result = lambda_handler({}, None)
 
-        mock_notify.assert_called_once_with("slack-bot-token", "C_MONITOR", past_25h_ms)
+        assert result == {"refreshed": False, "reason": "no_refresh_token"}
+        mock_put.assert_not_called()
+        mock_refresh.assert_not_called()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.args[2] == "no_refresh_token"
 
-    def test_fetches_only_claude_secret_when_token_is_valid(self, monkeypatch):
+    def test_http_401_notifies_slack(self, monkeypatch):
         self._set_env(monkeypatch)
-
-        future_ms = int(time.time() * 1000) + 10 * 60 * 60 * 1000
-        oauth_json = json.dumps({"claudeAiOauth": {"expiresAt": future_ms}})
-
-        with patch("handler._get_secret", return_value=oauth_json) as mock_get:
-            from handler import lambda_handler
-
-            lambda_handler({}, None)
-
-        # 有効なトークンでは Slack トークン取得が不要
-        assert mock_get.call_count == 1
-        assert mock_get.call_args[0][0] == "arn:aws:secretsmanager:ap-northeast-1:123:secret:claude"
-
-    def test_fetches_slack_secret_only_when_stale(self, monkeypatch):
-        self._set_env(monkeypatch)
-
-        past_25h_ms = int(time.time() * 1000) - 25 * 60 * 60 * 1000
-        oauth_json = json.dumps({"claudeAiOauth": {"expiresAt": past_25h_ms}})
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
+        err = HTTPError(url="...", code=401, msg="Unauthorized", hdrs=None, fp=None)
 
         with (
-            patch("handler._get_secret", side_effect=[oauth_json, "slack-bot-token"]) as mock_get,
-            patch("handler._post_slack_notification"),
+            patch(
+                "handler._get_secret",
+                side_effect=[self._creds_json(past_ms), "slack-token"],
+            ),
+            patch("handler._put_secret") as mock_put,
+            patch("handler._call_refresh_endpoint", side_effect=err),
+            patch("handler._post_slack_failure") as mock_notify,
         ):
             from handler import lambda_handler
 
-            lambda_handler({}, None)
+            result = lambda_handler({}, None)
 
-        arns = [c.args[0] for c in mock_get.call_args_list]
-        assert "arn:aws:secretsmanager:ap-northeast-1:123:secret:claude" in arns
-        assert "arn:aws:secretsmanager:ap-northeast-1:123:secret:slack" in arns
+        assert result == {"refreshed": False, "reason": "http_401"}
+        mock_put.assert_not_called()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.args[2] == "http_401"
 
-    def test_does_not_notify_when_expires_at_missing(self, monkeypatch):
+    def test_url_error_notifies_slack(self, monkeypatch):
         self._set_env(monkeypatch)
-
-        oauth_json = json.dumps({"claudeAiOauth": {}})
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
 
         with (
-            patch("handler._get_secret", return_value=oauth_json),
-            patch("handler._post_slack_notification") as mock_notify,
+            patch(
+                "handler._get_secret",
+                side_effect=[self._creds_json(past_ms), "slack-token"],
+            ),
+            patch("handler._put_secret") as mock_put,
+            patch("handler._call_refresh_endpoint", side_effect=URLError("dns")),
+            patch("handler._post_slack_failure") as mock_notify,
         ):
             from handler import lambda_handler
 
-            lambda_handler({}, None)
+            result = lambda_handler({}, None)
 
+        assert result == {"refreshed": False, "reason": "url_error"}
+        mock_put.assert_not_called()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.args[2] == "url_error"
+
+    def test_success_updates_secret(self, monkeypatch):
+        self._set_env(monkeypatch)
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
+        refresh_response = {"access_token": "new", "refresh_token": "rt2", "expires_in": 7200}
+
+        with (
+            patch("handler._get_secret", return_value=self._creds_json(past_ms)),
+            patch("handler._put_secret") as mock_put,
+            patch("handler._call_refresh_endpoint", return_value=refresh_response),
+            patch("handler._post_slack_failure") as mock_notify,
+        ):
+            from handler import lambda_handler
+
+            result = lambda_handler({}, None)
+
+        assert result["refreshed"] is True
+        assert "new_expires_at_ms" in result
+        mock_put.assert_called_once()
+        # Secrets Manager に書かれた JSON を検証
+        put_value = json.loads(mock_put.call_args.args[1])
+        assert put_value["claudeAiOauth"]["accessToken"] == "new"
+        assert put_value["claudeAiOauth"]["refreshToken"] == "rt2"
         mock_notify.assert_not_called()
 
-    def test_uses_default_threshold_when_env_not_set(self, monkeypatch):
-        for k, v in self._COMMON_ENV.items():
-            monkeypatch.setenv(k, v)
-        monkeypatch.delenv("STALE_THRESHOLD_HOURS", raising=False)
-
-        # デフォルト閾値 24h: 25h 前に期限切れなら失効
-        past_25h_ms = int(time.time() * 1000) - 25 * 60 * 60 * 1000
-        oauth_json = json.dumps({"claudeAiOauth": {"expiresAt": past_25h_ms}})
+    def test_missing_expires_at_notifies_slack(self, monkeypatch):
+        self._set_env(monkeypatch)
+        # claudeAiOauth に expiresAt が無い
+        creds = json.dumps({"claudeAiOauth": {"refreshToken": "rt"}})
 
         with (
-            patch("handler._get_secret", side_effect=[oauth_json, "slack-token"]),
-            patch("handler._post_slack_notification") as mock_notify,
+            patch("handler._get_secret", side_effect=[creds, "slack-token"]),
+            patch("handler._put_secret") as mock_put,
+            patch("handler._call_refresh_endpoint") as mock_refresh,
+            patch("handler._post_slack_failure") as mock_notify,
         ):
             from handler import lambda_handler
 
-            lambda_handler({}, None)
+            result = lambda_handler({}, None)
 
+        assert result == {"refreshed": False, "reason": "no_expires_at"}
+        mock_put.assert_not_called()
+        mock_refresh.assert_not_called()
         mock_notify.assert_called_once()

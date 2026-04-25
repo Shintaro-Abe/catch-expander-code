@@ -37,6 +37,97 @@ class TestSetupClaudeCredentials:
 
         assert claude_dir.exists()
 
+    def test_returns_sha256_hash_of_secret_value(self, tmp_path):
+        import hashlib
+
+        from main import _setup_claude_credentials
+
+        secret = '{"token": "abc"}'
+        with patch("main.Path") as mock_path_cls:
+            mock_path_cls.home.return_value = tmp_path
+            mock_path_cls.side_effect = lambda *a, **kw: __import__("pathlib").Path(*a, **kw)
+
+            returned = _setup_claude_credentials(secret)
+
+        assert returned == hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# _writeback_claude_credentials
+# ---------------------------------------------------------------------------
+
+
+class TestWritebackClaudeCredentials:
+    def _patch_home(self, tmp_path):
+        return patch.object(
+            __import__("main").Path,
+            "home",
+            staticmethod(lambda: tmp_path),
+        )
+
+    def _setup_creds_file(self, tmp_path, content: str):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        (claude_dir / ".credentials.json").write_text(content)
+
+    def test_skips_when_credentials_unchanged(self, tmp_path):
+        from main import _hash_text, _writeback_claude_credentials
+
+        content = '{"token": "same"}'
+        self._setup_creds_file(tmp_path, content)
+        initial_hash = _hash_text(content)
+
+        with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
+            _writeback_claude_credentials("arn:claude", initial_hash)
+
+        mock_client_factory.assert_not_called()
+
+    def test_calls_put_when_credentials_changed(self, tmp_path):
+        from main import _hash_text, _writeback_claude_credentials
+
+        self._setup_creds_file(tmp_path, '{"token": "old"}')
+        initial_hash = _hash_text('{"token": "old"}')
+        # 起動後、claude CLI が refresh して中身が変わったことを再現
+        (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
+
+        mock_client = MagicMock()
+        with (
+            self._patch_home(tmp_path),
+            patch("main.boto3.client", return_value=mock_client),
+        ):
+            _writeback_claude_credentials("arn:claude", initial_hash)
+
+        mock_client.put_secret_value.assert_called_once_with(
+            SecretId="arn:claude",
+            SecretString='{"token": "new"}',
+        )
+
+    def test_handles_missing_credentials_file(self, tmp_path):
+        from main import _writeback_claude_credentials
+
+        # ファイルを作らない
+        with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
+            _writeback_claude_credentials("arn:claude", "any-hash")
+
+        mock_client_factory.assert_not_called()
+
+    def test_swallows_put_exception(self, tmp_path):
+        from main import _hash_text, _writeback_claude_credentials
+
+        self._setup_creds_file(tmp_path, '{"token": "old"}')
+        initial_hash = _hash_text('{"token": "old"}')
+        (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
+
+        mock_client = MagicMock()
+        mock_client.put_secret_value.side_effect = RuntimeError("AWS down")
+
+        with (
+            self._patch_home(tmp_path),
+            patch("main.boto3.client", return_value=mock_client),
+        ):
+            # 例外が外に伝播しないこと（ベストエフォート）
+            _writeback_claude_credentials("arn:claude", initial_hash)
+
 
 # ---------------------------------------------------------------------------
 # _run_feedback
@@ -244,6 +335,7 @@ class TestMain:
         with (
             patch("main._get_secret", return_value="secret"),
             patch("main._setup_claude_credentials"),
+            patch("main._writeback_claude_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_feedback") as mock_feedback,
@@ -263,6 +355,7 @@ class TestMain:
         with (
             patch("main._get_secret", return_value="secret"),
             patch("main._setup_claude_credentials"),
+            patch("main._writeback_claude_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_feedback") as mock_feedback,
@@ -284,6 +377,7 @@ class TestMain:
         with (
             patch("main._get_secret", return_value="secret"),
             patch("main._setup_claude_credentials"),
+            patch("main._writeback_claude_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_orchestrator", side_effect=RuntimeError("boom")),
@@ -306,6 +400,7 @@ class TestMain:
         with (
             patch("main._get_secret", return_value="secret") as mock_get,
             patch("main._setup_claude_credentials"),
+            patch("main._writeback_claude_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_orchestrator"),
@@ -316,3 +411,41 @@ class TestMain:
 
         called_arns = {c.args[0] for c in mock_get.call_args_list}
         assert called_arns == {"arn:slack", "arn:notion", "arn:github", "arn:claude"}
+
+    def test_writeback_called_in_finally_on_success(self, monkeypatch):
+        self._set_common_env(monkeypatch)
+        monkeypatch.delenv("TASK_TYPE", raising=False)
+
+        with (
+            patch("main._get_secret", return_value="secret"),
+            patch("main._setup_claude_credentials", return_value="initial-hash"),
+            patch("main._writeback_claude_credentials") as mock_writeback,
+            patch("main.SlackClient"),
+            patch("main.DynamoDbClient"),
+            patch("main._run_orchestrator"),
+        ):
+            from main import main
+
+            main()
+
+        mock_writeback.assert_called_once_with("arn:claude", "initial-hash")
+
+    def test_writeback_called_in_finally_on_failure(self, monkeypatch):
+        self._set_common_env(monkeypatch)
+        monkeypatch.delenv("TASK_TYPE", raising=False)
+
+        with (
+            patch("main._get_secret", return_value="secret"),
+            patch("main._setup_claude_credentials", return_value="initial-hash"),
+            patch("main._writeback_claude_credentials") as mock_writeback,
+            patch("main.SlackClient"),
+            patch("main.DynamoDbClient"),
+            patch("main._run_orchestrator", side_effect=RuntimeError("boom")),
+            patch("main._notify_task_failure"),
+        ):
+            from main import main
+
+            with pytest.raises(RuntimeError):
+                main()
+
+        mock_writeback.assert_called_once_with("arn:claude", "initial-hash")

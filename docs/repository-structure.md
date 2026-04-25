@@ -132,9 +132,9 @@ Catch-Expander/
 
 Slackイベントを受信し、署名検証・ACK応答・ECSタスク起動を行うLambda関数。SAMテンプレートから参照される。
 
-### `src/token_monitor/` — トークンモニター Lambda
+### `src/token_monitor/` — トークンリフレッシャー Lambda
 
-EventBridge の定期スケジュールで発火し、Secrets Manager に保管された Claude OAuth トークンの `expiresAt` を確認する。`now > expiresAt + STALE_THRESHOLD_HOURS`（既定 24 時間）となった時点で失効と判定し、Slack 通知で再ログインを促す。
+EventBridge の定期スケジュールで 12 時間ごとに発火し、Secrets Manager に保管された Claude OAuth credentials の `expiresAt` を確認する。残り 1 時間以下または失効済みの場合、`refreshToken` を Anthropic OAuth エンドポイントに直接送信して新 access_token を取得し、Secrets Manager を上書きする。refresh が失敗した場合のみ Slack 通知で再認証を促す。
 
 ### `src/agent/` — ECS エージェントアプリケーション
 

@@ -346,6 +346,11 @@ Resources:
                   - !Ref NotionTokenSecretArn
                   - !Ref GitHubTokenSecretArn
                   - !Ref ClaudeOAuthSecretArn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                Resource:
+                  - !Ref ClaudeOAuthSecretArn
         - PolicyName: CloudWatchLogsAccess
           PolicyDocument:
             Version: "2012-10-17"
@@ -508,6 +513,11 @@ Resources:
               Resource:
                 - !Ref ClaudeOAuthSecretArn
                 - !Ref SlackBotTokenSecretArn
+            - Effect: Allow
+              Action:
+                - secretsmanager:PutSecretValue
+              Resource:
+                - !Ref ClaudeOAuthSecretArn
 
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]

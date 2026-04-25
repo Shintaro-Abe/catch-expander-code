@@ -96,7 +96,7 @@ graph TB
 | Slack Bot App | ユーザーとのインターフェース（入力受付・通知） | Slack |
 | API Gateway | Slackイベントの受信・ルーティング | API Gateway |
 | トリガー関数 | Slack署名検証、ACK応答、ECSタスク起動、フィードバック検出 | Lambda |
-| トークンモニター関数 | Claude OAuth トークン失効の定期監視・Slack通知 | Lambda（EventBridge 定期トリガー） |
+| トークンリフレッシャー関数 | Claude OAuth トークンの自動延命（refresh_token で OAuth エンドポイントを直接叩いて Secrets Manager 上書き）。延命失敗時のみ Slack 通知 | Lambda（EventBridge 定期トリガー） |
 | オーケストレーターエージェント | トピック解析、ワークフロー設計、全体制御（learned_preferences 反映） | ECS Container（Claude Code CLI） |
 | リサーチャーエージェント（×N） | Web検索による情報収集・要約 | ECS Container（Claude Code Agentツール） |
 | ジェネレーターエージェント | 成果物の生成・推敲 | ECS Container（Claude Code Agentツール） |
@@ -919,7 +919,7 @@ src/agent/feedback/
 | Notion Cloudflareブロック（403 + Cloudflare HTML） | 格納処理 | `NotionCloudflareBlockError` として識別。リトライせず、Slackスレッドに「数分〜数十分空けて再投入」案内を投稿。`cf_ray` 等の診断情報をwarningログに記録 |
 | Notion `rich_text` 2000文字制限 | 格納処理 | `create_page()` 投入前に各 `rich_text` を 2000 文字以内のチャンクに分割（同一ブロック内の複数 `text` 要素として送信） |
 | GitHub API失敗 | 格納処理 | 最大3回リトライ。全失敗時はコードをNotionのコードブロックに格納（フォールバック） |
-| Claude OAuth 失効 | エージェント起動時 | ECSタスクが例外終了し `_notify_task_failure` が Slackスレッドに「`claude` コマンドで再ログイン」案内を投稿。Token Monitor Lambda も独立に検知して通知 |
+| Claude OAuth 失効 | エージェント起動時 | Token Refresher Lambda が 12 時間ごとに自動延命するため通常は失効しない。万一 ECS タスク内で失効した場合は例外終了し `_notify_task_failure` が Slack スレッドに案内を投稿。refresh が連続失敗した場合のみ Token Refresher が独立に Slack 通知 |
 | コンテナ異常終了 | ECS | 状態をDynamoDBに保存しており、コンテナ再起動後に再開 |
 
 ### 部分成果物の出力
