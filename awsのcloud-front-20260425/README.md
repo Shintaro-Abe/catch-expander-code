@@ -167,4 +167,4 @@ CloudFront Functions (JS 2.0 Runtime) を Viewer Response に紐づけ、`Strict
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/AWS-Cloud-Front-34d47b55202e81db84b7d0eb3134fca2)
