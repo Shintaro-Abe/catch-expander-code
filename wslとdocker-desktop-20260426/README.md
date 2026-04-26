@@ -105,4 +105,4 @@ cdk deploy --context account=<AWS_ACCOUNT_ID> --context region=ap-northeast-1
 
 ---
 
-📝 [Notionで詳細を見る]()
+📝 [Notionで詳細を見る](https://www.notion.so/WSL-Docker-Desktop-34e47b55202e81b1925cdb67afb158f8)
