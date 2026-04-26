@@ -1,0 +1,8 @@
+# PoC品質: バージョンは適宜最新の安定版に更新してください
+opentelemetry-api==1.30.0
+opentelemetry-sdk==1.30.0
+opentelemetry-exporter-otlp-proto-http==1.30.0
+opentelemetry-instrumentation-botocore==0.51b0
+opentelemetry-instrumentation-aws-lambda==0.51b0
+opentelemetry-semantic-conventions==0.51b0
+boto3>=1.34.0
