@@ -4,6 +4,15 @@
 対応 requirements: `.steering/20260425-auth-redesign-aipapers/requirements.md`
 対応 design: `.steering/20260425-auth-redesign-aipapers/design.md`
 
+> **ステータス: 完了 (2026-04-25 push 済み・2026-04-26 状態更新)**
+>
+> - 実装 push 完了: `947bc3b feat: adopt ai-papers-digest auth scheme with auto refresh` および `4ac050f fix: add User-Agent header to OAuth refresh request`
+> - `src/token_monitor/handler.py` を Token Refresher Lambda として全面書き換え済み（`call_claude_with_workspace` などとは無関係）
+> - `src/agent/main.py` の `_setup_claude_credentials` 改修済み・`entrypoint.sh` 経由で Secrets Manager 連携稼働中
+> - 実機 refresh 成功: メモリ参照 `project_auth_redesign_status.md`（2026-04-25）
+> - 個別タスクのチェックボックスは履歴保持のため未更新。**実装側のソースで完了状態を確認可能**
+> - 関連ナレッジ: `feedback_oauth_user_agent.md`（platform.claude.com への OAuth は User-Agent 必須）
+
 ## 完了条件
 
 - 全タスクが `[x]` になる

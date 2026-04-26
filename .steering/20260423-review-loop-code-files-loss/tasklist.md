@@ -1,5 +1,12 @@
 # タスクリスト: レビュー修正ループでの code_files 欠落バグの修正
 
+> **ステータス: 完了 (2026-04-23 push 済み・2026-04-26 状態更新)**
+>
+> - 実装 push 完了: `73658e3 fix: preserve code_files across review-fix loop`
+> - `src/agent/orchestrator.py:24` に `_PRESERVED_DELIVERABLE_FIELDS = ("code_files",)` 追加済み
+> - `src/agent/orchestrator.py:810-822` 付近で `_run_review_loop` の修正適用パスにて preserved 抽出 → update 反映を実施
+> - 個別タスクのチェックボックスは履歴保持のため未更新。**実装側のソースで完了状態を確認可能**
+
 ## 完了条件
 
 - 全タスクが `[x]` になる

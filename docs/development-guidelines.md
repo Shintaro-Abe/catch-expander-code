@@ -133,18 +133,17 @@ logger.info("Workflow started", extra={"execution_id": execution_id, "topic": to
 
 ### コード生成失敗ログの読み方
 
-ECS の標準 `logging` は formatter が `extra` を出力しないため、`Code generation failed for type` 警告は診断情報をメッセージ本文に直接埋め込む形式で出力する。CloudWatch でメッセージ本文だけで root cause を判別できるようにするためで、orchestrator の `_build_code_failure_diagnostics` が以下の項目を組み立てる。
+コード成果物はファイル書き込み方式（`call_claude_with_workspace`）で生成する。失敗時は `Code generation failed (workspace mode)` 警告がメッセージ本文に診断情報を埋め込む形式で出力される。ECS の標準 `logging` は formatter が `extra` を出力しないため、CloudWatch でメッセージ本文だけで root cause を判別できるようにする目的。`_classify_workspace_outcome` が分類した結果を元に、orchestrator がログを組み立てる。
 
 | フィールド | 意味 | root cause 判定の手がかり |
 |------------|------|--------------------------|
-| `parse_error` | `_parse_claude_response` の戦略 1〜4 が全失敗 | `True` なら CLI 応答が JSON 化できない（応答破損 / 大幅な形式違い）|
-| `files_kind` | パース後の `files` フィールドの型名 | `missing` ならスキーマ違い、`list` / `str` 等なら型違い、`dict` なら空 dict 確認へ |
-| `files_count` | `files` の要素数 | `dict` かつ `0` なら空応答 |
-| `top_level_keys` | パース結果のトップレベルキー（最大 10 件） | 期待外のキーがあれば応答スキーマがプロンプトと不整合 |
-| `response_chars` | 応答テキストの文字数 | 極端に大きければ応答サイズ超過の部分パースが疑わしい |
-| `response_preview` | 応答テキスト先頭 500 文字 | 上記からだけでは判別できないとき直接確認する |
+| `files_kind` | sandbox 収集結果の分類 | `none` ならファイルが書かれなかった（プロンプト誤読 / ツール許可の問題）、`no_recognized` はホワイトリスト外のみ書かれた、`all_empty` は空ファイルのみ、`valid` は成功（警告は出ない） |
+| `files_count` | 受理されたファイル数 | `0` なら sandbox に何も残っていない |
+| `rejected` | 破棄されたエントリの先頭 5 件（`{path, reason}` 形式） | `reason` で個別の破棄理由を確認（`symlink_not_allowed` / `outside_sandbox` / `not_in_whitelist` / `too_large` / `not_utf8`） |
+| `stdout_preview` | Claude CLI の stdout 先頭 500 文字 | 上記からだけでは判別できないとき LLM の最終応答テキストを直接確認する |
+| `code_type` | `iac_code` / `program_code` | どちらのコード種別の生成で失敗したかを特定 |
 
-新しい root cause が観測された場合は `.steering/` 配下の関連ステアリングに種別を追記してから対応に着手する。
+部分失敗時は Slack スレッドへ「⚠️ 一部のコード成果物の生成に失敗しました」案内を投稿し、GitHub への push は省略する（テキスト成果物の Notion 投稿は継続）。新しい root cause が観測された場合は `.steering/` 配下の関連ステアリングに種別を追記してから対応に着手する。
 
 ### ログへのシークレット漏洩防止
 

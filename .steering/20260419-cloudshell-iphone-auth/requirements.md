@@ -1,5 +1,17 @@
 # 要求内容: iPhone から AWS CloudShell 経由で Claude OAuth 再認証を行う
 
+> **⚠️ 注記 (2026-04-26 追加): この方針は 2026-04-25 に廃止**
+>
+> 本 steering の解決方針（CloudShell + iPhone での手動再認証）は `.steering/20260425-auth-redesign-aipapers/` の Token Refresher Lambda（自動リフレッシュ）方式により完全に置き換えられました。
+> 廃止理由は 3 つ:
+> 1. Claude Code 2.1.118 で CloudShell では `~/.claude/.credentials.json` が生成されない（既存 `sync-claude.sh` が動作不能）
+> 2. `sync-claude.sh` が「ファイル sync 成功」と「OAuth refresh 成功」を区別できない設計欠陥
+> 3. 上記により、ユーザーが手順を完走しても 401 エラーが継続する事故が 2026-04-23 に発生
+>
+> 現行の認証手順は `.steering/20260425-auth-redesign-aipapers/initial-setup.md` を参照してください。
+> 関連ナレッジ: `feedback_auth_procedure_design.md`（認証手順書は refresh 経路そのものを検証する必要あり）。
+> 本ファイルは履歴として保持されます。
+
 ## 概要
 
 PC の DevContainer にアクセスできない状況（外出先・iPhone のみ所持時）でも、Claude OAuth トークンの再認証と Secrets Manager への反映を実施できるようにする。

@@ -114,7 +114,7 @@
 ## フェーズ 4: 後続（保留判断）
 
 - [ ] **N1** （任意）`fix_prompt` の差分修正化を実装。次回 fix loop 発火時に効果測定したうえで判断（保留継続）
-- [x] **Followup-A** `.steering/20260418-code-generation-parse-error/` 起票済み。Phase B-2 まで実装完了、AC-3（storage=notion+github 2 連続）は受動観測待ち
+- [x] **Followup-A** `.steering/20260418-code-generation-parse-error/` 起票済み。Phase B-2 まで実装完了、AC-3（storage=notion+github 2 連続）は受動観測待ち。**2026-04-26 追記:** B-2 のスキーマ正規化は対症療法であったため `.steering/20260425-code-gen-redesign-filesystem/`（`call_claude_with_workspace` 方式）により全面置換。AC-2 の構造的解決はそちらで達成済み
 - [x] **Followup-B** `.steering/20260418-review-fix-reflection-verification/` 起票済み。fix loop 発火を受動観測中
 
 ## 完了条件（全体）

@@ -1,5 +1,11 @@
 # 設計: コード成果物生成の失敗修正
 
+> **⚠️ 注記 (2026-04-26 追加): 採用した方針は後に撤回**
+>
+> 本設計の Phase B-2（`_normalize_code_files_payload` でスキーマ正規化）は、`.steering/20260425-code-gen-redesign-filesystem/` により全面的に置き換えられました。
+> 新方式は JSON パース自体を放棄し、Claude に Write ツールでファイルを直接書き出させる `call_claude_with_workspace` 方式です。
+> 本ファイルは履歴として保持されます。
+
 ## 設計方針
 
 requirements.md AC-1 / AC-2 を 2 段階で実施する:

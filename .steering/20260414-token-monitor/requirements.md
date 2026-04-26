@@ -1,5 +1,13 @@
 # 要求内容: Claude OAuth トークン失効監視
 
+> **⚠️ 注記 (2026-04-26 追加): 設計方針が拡張・置換**
+>
+> 本 steering で実装した Token Monitor Lambda（失効を Slack に**通知のみ**・自動リフレッシュなし）は、その後 `.steering/20260425-auth-redesign-aipapers/` により **Token Refresher Lambda（自動リフレッシュ）** に再設計されました。
+> - `src/token_monitor/handler.py` の本体ロジックは ai-papers-digest 方式（`platform.claude.com/v1/oauth/token` を `refresh_token` で叩いて Secrets Manager に書き戻す）に全面書き換え（commit `947bc3b`）
+> - 「制約事項: トークンの自動リフレッシュは行わない（通知のみ）」「ECS タスクロールへの `PutSecretValue` 権限付与は行わない」は撤回されました
+> - EventBridge スケジュール（12 時間ごと）と Slack 失敗通知の枠組みは継続利用
+> 本ファイルは履歴として保持されます。
+
 ## 概要
 
 Claude OAuth トークンが Secrets Manager 上で失効状態になったとき、開発者へ Slack で通知する仕組みを実装する。

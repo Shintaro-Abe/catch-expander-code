@@ -1,5 +1,13 @@
 # 要求定義: コード成果物生成の失敗修正
 
+> **⚠️ 注記 (2026-04-26 追加): 採用した方針は後に撤回**
+>
+> このステアリングで採用した B-2（スキーマ正規化 `_normalize_code_files_payload`）は、その後 4 回の再発を経て対症療法であったと判断されました。
+> 2026-04-25 に `.steering/20260425-code-gen-redesign-filesystem/` にて、コード成果物生成は **JSON パースを完全に放棄** し、Claude に Write ツール経由でサンドボックスへファイルを直接書き出させる方式（`call_claude_with_workspace`）に再設計されました。
+> 本 steering で追加した `_normalize_code_files_payload` / `_build_code_failure_diagnostics` 等は撤去済みです（commit `1eba566`）。
+> 関連ナレッジ: `feedback_unified_interface_anti_pattern.md`（性質的差異の大きい成果物への統一 JSON 契約は構造的に壊れる）/ `feedback_repeated_fix_threshold.md`（同じ問題の 2 回再発でゼロベース見直し）。
+> 本ファイルは履歴として保持されます。
+
 ## 背景
 
 `.steering/20260418-quality-fix/` の Phase 3 検証（exec-20260418044855-00a18b82）で AC-2「storage = notion+github」が未達となった。

@@ -4,6 +4,15 @@
 対応 requirements: `.steering/20260425-code-gen-redesign-filesystem/requirements.md`
 対応 design: `.steering/20260425-code-gen-redesign-filesystem/design.md`
 
+> **ステータス: 完了 (2026-04-25 push 済み・2026-04-26 状態更新)**
+>
+> - 実装 push 完了: `1eba566 feat: switch code generation to filesystem write mode`
+> - `src/agent/orchestrator.py` に `call_claude_with_workspace`, `_collect_workspace_files`, `_classify_workspace_outcome` を実装済み（line 194-326 付近）
+> - 旧パスの `_normalize_code_files_payload` / `_build_code_failure_diagnostics` 等は撤去
+> - 実機検証完了: メモリ参照 `project_codegen_workspace_status.md`（2026-04-25 実機プッシュ成功）
+> - 個別タスクのチェックボックスは履歴保持のため未更新。**実装側のソースで完了状態を確認可能**
+> - 関連ナレッジ: `feedback_unified_interface_anti_pattern.md`（性質的差異の大きい成果物に統一 JSON 契約を強いると壊れる）/ `feedback_repeated_fix_threshold.md`（2 回再発で 3 回目前にゼロベース見直し）
+
 ## 完了条件
 
 - 全タスクが `[x]` になる

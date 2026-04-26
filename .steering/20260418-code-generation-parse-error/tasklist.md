@@ -1,5 +1,11 @@
 # タスクリスト: コード成果物生成の失敗修正
 
+> **⚠️ 注記 (2026-04-26 追加): 採用した方針は後に撤回**
+>
+> Phase B-2 を採用した実装（commit `5e77dd3`）はその後 4 回の再発を経て対症療法と判断され、`.steering/20260425-code-gen-redesign-filesystem/`（commit `1eba566`）により全面的に撤去・再設計されました。
+> Phase A の診断ヘルパー（`_build_code_failure_diagnostics` 等）も新方式では不要となり撤去済みです。
+> 本ファイルは履歴として保持されます。
+
 ## 方針
 
 - Phase A（観測強化）を独立した commit で先に push → 1 回の Slack 投入で root cause を確定
