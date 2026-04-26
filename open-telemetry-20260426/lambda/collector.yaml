@@ -1,0 +1,73 @@
+# PoC品質: 本番利用前にサンプリングレート・メモリ制限・認証設定を調整してください
+#
+# ADOT Lambda Extension 用 Collector 設定
+# Lambda 関数内の /var/task/collector.yaml に配置するか、
+# 環境変数 OPENTELEMETRY_COLLECTOR_CONFIG_URI で S3 URI を指定してください
+#
+# 参照: https://aws-otel.github.io/docs/components/otlp-exporter
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # メモリ使用量の上限を設定（Lambda のメモリサイズに合わせて調整）
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 100
+    spike_limit_mib: 20
+
+  # バッチ処理でエクスポートの効率化
+  batch:
+    timeout: 1s
+    send_batch_size: 50
+
+  # decouple: テレメトリ送信を Lambda 実行完了後に非同期化し課金時間を短縮
+  # Lambda Extension のシャットダウンフェーズで送信することで関数のレスポンスタイムに影響しない
+  decouple:
+
+exporters:
+  # X-Ray へ OTLP スパンを変換してエクスポート
+  awsxray:
+    region: ${AWS_REGION}
+    # indexed_attributes: スパン属性を X-Ray アノテーション（検索可能）として記録
+    indexed_attributes:
+      - "http.method"
+      - "http.status_code"
+      - "faas.invocation_id"
+      - "db.system"
+
+  # CloudWatch EMF 形式でカスタムメトリクスをエクスポート
+  awsemf:
+    region: ${AWS_REGION}
+    namespace: "OtelDemo/Lambda"
+    log_group_name: "/aws/lambda/otel-demo"
+    dimension_rollup_option: "NoDimensionRollup"
+    metric_declarations:
+      - dimensions: [["faas.name"]]
+        metric_name_selectors:
+          - ".*"
+
+  # デバッグ用（本番では削除してください）
+  # logging:
+  #   verbosity: detailed
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, decouple]
+      exporters: [awsxray]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [awsemf]
