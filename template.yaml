@@ -23,6 +23,7 @@ Parameters:
     Description: Notion database ID for deliverables
   GitHubRepo:
     Type: String
+    Default: Shintaro-Abe/catch-expander-deliverables
     Description: GitHub repository for code deliverables (owner/repo)
   DynamoDbTablePrefix:
     Type: String
