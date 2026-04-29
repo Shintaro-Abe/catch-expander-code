@@ -559,6 +559,339 @@ class TestReviewLoop:
         assert final_deliverables["summary"] == "fix-2"
         assert final_deliverables["code_files"] == original_code_files
 
+    @patch("orchestrator.call_claude")
+    def test_review_loop_code_issue_does_not_claim_fix_in_summary(self, mock_claude):
+        """コード関連指摘を受けても、generator は summary で「修正した」と主張しない
+
+        fix_prompt のスコープ制約セクションにより、generator は code_files を修正したと
+        宣言する代わりに quality_metadata.notes に未修正記録を残す挙動を期待する。
+        """
+        from orchestrator import Orchestrator
+
+        code_issue = {
+            "item": "コードの構文",
+            "severity": "error",
+            "description": "resolver.tf の filter ブロックは Route 53 Resolver では非対応",
+            "fix_instruction": "resolver.tf から filter ブロックを削除する",
+        }
+        responses = [
+            json.dumps({"result": json.dumps({"passed": False, "issues": [code_issue], "quality_metadata": {}})}),
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "content_blocks": [{"t": "unchanged"}],
+                            "summary": "Route 53 Resolver の概要レポート",
+                            "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
+                        }
+                    )
+                }
+            ),
+            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original_code_files = {
+            "files": {"resolver.tf": 'resource "aws_route53_resolver_firewall_rule" "x" {}'},
+            "readme_content": "# Route 53 Resolver IaC",
+        }
+        original = {
+            "content_blocks": [{"t": "original"}],
+            "summary": "初版",
+            "code_files": original_code_files,
+        }
+
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        # fix call (2 回目の call_claude 呼び出し) の prompt にスコープ制約セクションが含まれていること
+        fix_call_prompt = mock_claude.call_args_list[1].args[0]
+        assert "本ループでの修正可能範囲" in fix_call_prompt
+        assert "code_files" in fix_call_prompt
+        assert "quality_metadata.notes" in fix_call_prompt
+
+        # summary に修正主張が含まれない (mock 応答がスコープ制約を遵守したシナリオ)
+        assert "修正" not in final_deliverables["summary"]
+        assert "削除" not in final_deliverables["summary"]
+        # code_files は preserve されている (既存挙動の維持)
+        assert final_deliverables["code_files"] == original_code_files
+        # review が pass を返したこと
+        assert result["passed"] is True
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_text_issue_updates_text_normally(self, mock_claude):
+        """テキスト関連指摘では、従来通り summary / content_blocks が更新される (回帰なし)"""
+        from orchestrator import Orchestrator
+
+        text_issue = {
+            "item": "セクション 3 の表現",
+            "severity": "error",
+            "description": "数値 $100 億 が出典 [3] と矛盾 ($85 億)",
+            "fix_instruction": "セクション 3 の市場規模を $85 億 に修正",
+        }
+        responses = [
+            json.dumps({"result": json.dumps({"passed": False, "issues": [text_issue], "quality_metadata": {}})}),
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "content_blocks": [{"t": "fixed-section-3"}],
+                            "summary": "市場規模を $85 億 に更新済みの最新版",
+                        }
+                    )
+                }
+            ),
+            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+
+        original_code_files = {"files": {"main.tf": 'resource "x" "y" {}'}, "readme_content": "# README"}
+        original = {
+            "content_blocks": [{"t": "original"}],
+            "summary": "初版",
+            "code_files": original_code_files,
+        }
+
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert result["passed"] is True
+        assert final_deliverables["content_blocks"] == [{"t": "fixed-section-3"}]
+        assert "$85" in final_deliverables["summary"]
+        # code_files は preserve されている
+        assert final_deliverables["code_files"] == original_code_files
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_merges_fixer_notes_into_review_quality_metadata(self, mock_claude):
+        """fix loop で fixer が quality_metadata.notes に書いた未修正記録は、
+        後続の review pass 時にも review_result.quality_metadata.notes へマージされる
+        (Codex review P2 対応 — Notion / DynamoDB に流れる出力経路で notes が捨てられない)。
+        """
+        from orchestrator import Orchestrator
+
+        code_issue = {
+            "item": "コードの構文",
+            "severity": "error",
+            "description": "resolver.tf の filter ブロックは非対応",
+            "fix_instruction": "filter ブロック削除",
+        }
+        responses = [
+            json.dumps(
+                {"result": json.dumps({"passed": False, "issues": [code_issue], "quality_metadata": {"notes": []}})}
+            ),
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "content_blocks": [{"t": "unchanged"}],
+                            "summary": "Route 53 概要",
+                            "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
+                        }
+                    )
+                }
+            ),
+            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {"notes": []}})}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original_code_files = {"files": {"resolver.tf": "..."}, "readme_content": "# README"}
+        original = {
+            "content_blocks": [{"t": "original"}],
+            "summary": "初版",
+            "code_files": original_code_files,
+        }
+
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        # review pass 後でも fixer notes が review_result に伝搬していること
+        assert result["passed"] is True
+        notes = result.get("quality_metadata", {}).get("notes", [])
+        assert any("コード関連指摘" in n and "未修正" in n for n in notes), f"fixer notes not merged: {notes}"
+
+        # final_deliverables の code_files は preserve されていること (既存挙動維持)
+        assert final_deliverables["code_files"] == original_code_files
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_accumulates_fixer_notes_across_multiple_fixes(self, mock_claude):
+        """複数回の fix にまたがって fixer notes が累積される (Codex review 2 回目 P2 対応)。
+
+        1 回目の fixer が記録した「コード関連指摘 N 件は本ループ未修正」が、2 回目の fix で
+        current_deliverables が新応答に上書きされても失われず、最終 review_result.quality_metadata.notes
+        へ届くことを検証する。
+        """
+        from orchestrator import Orchestrator
+
+        code_issue = {
+            "item": "コードの構文",
+            "severity": "error",
+            "description": "filter ブロック非対応",
+            "fix_instruction": "削除",
+        }
+        text_issue = {
+            "item": "セクション 3 表現",
+            "severity": "error",
+            "description": "数値矛盾",
+            "fix_instruction": "$85 億 に修正",
+        }
+        responses = [
+            # 1 回目 review: コード関連 error
+            json.dumps(
+                {"result": json.dumps({"passed": False, "issues": [code_issue], "quality_metadata": {"notes": []}})}
+            ),
+            # 1 回目 fix: fixer がスコープ制約に従い notes に未修正を記録
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "content_blocks": [{"t": "after-fix-1"}],
+                            "summary": "Route 53 概要",
+                            "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
+                        }
+                    )
+                }
+            ),
+            # 2 回目 review: 別のテキスト error (code error は前回未修正のまま)
+            json.dumps(
+                {"result": json.dumps({"passed": False, "issues": [text_issue], "quality_metadata": {"notes": []}})}
+            ),
+            # 2 回目 fix: テキスト指摘に対応、notes は空 (1 回目の note を引き継がない応答)
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "content_blocks": [{"t": "after-fix-2"}],
+                            "summary": "市場規模 $85 億 に更新済み",
+                            "quality_metadata": {"notes": []},
+                        }
+                    )
+                }
+            ),
+            # 3 回目 review: pass を返す (reviewer は fixer notes を echo しない)
+            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {"notes": []}})}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original_code_files = {"files": {"resolver.tf": "..."}, "readme_content": "# README"}
+        original = {
+            "content_blocks": [{"t": "original"}],
+            "summary": "初版",
+            "code_files": original_code_files,
+        }
+
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        # 1 回目 fixer の notes が 2 回目 fix の上書きを越えて最終 review_result に届いていること
+        assert result["passed"] is True
+        notes = result.get("quality_metadata", {}).get("notes", [])
+        assert any(
+            "コード関連指摘" in n and "未修正" in n for n in notes
+        ), f"first fixer's note was lost across multiple fixes: {notes}"
+        # code_files は preserve されている
+        assert final_deliverables["code_files"] == original_code_files
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_safely_skips_null_quality_metadata_in_fixer_response(self, mock_claude):
+        """fixer 応答の quality_metadata が null でも _accumulate_fixer_notes は raise せず safely skip する
+        (Codex review 3 回目 P2 対応 — malformed LLM 応答でも review loop が abort しない)。
+        """
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        responses = [
+            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
+            # fixer が malformed: quality_metadata が null
+            json.dumps(
+                {"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "OK", "quality_metadata": None})}
+            ),
+            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+
+        # raise しないこと
+        result, _ = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert result["passed"] is True
+        # notes は空または存在しても corrupt していない (str のみで構成される)
+        notes = result.get("quality_metadata", {}).get("notes", [])
+        assert all(isinstance(n, str) for n in notes)
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_safely_skips_scalar_notes_in_fixer_response(self, mock_claude):
+        """fixer 応答の quality_metadata.notes が文字列 (scalar) でも、文字単位で
+        accumulated に追加されず safely skip する (Notion/DynamoDB の corrupt 防止)。
+        """
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        responses = [
+            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
+            # fixer が malformed: notes が文字列
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "content_blocks": [{"t": "fixed"}],
+                            "summary": "OK",
+                            "quality_metadata": {"notes": "コード関連指摘 1 件は本ループ未修正"},
+                        }
+                    )
+                }
+            ),
+            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+
+        result, _ = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert result["passed"] is True
+        notes = result.get("quality_metadata", {}).get("notes", [])
+        # 文字単位で追加されていない (1 文字の note が存在しない)
+        assert not any(isinstance(n, str) and len(n) == 1 for n in notes), f"notes corrupted by char iteration: {notes}"
+        # 文字列全体がそのまま 1 entry として入ってもいない (型が list ではないので skip された)
+        assert "コード関連指摘 1 件は本ループ未修正" not in notes
+
+    @patch("orchestrator.call_claude")
+    def test_review_loop_safely_skips_int_notes_in_fixer_response(self, mock_claude):
+        """fixer 応答の quality_metadata.notes が整数でも raise せず safely skip する。"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        responses = [
+            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
+            # fixer が malformed: notes が整数
+            json.dumps(
+                {
+                    "result": json.dumps(
+                        {
+                            "content_blocks": [{"t": "fixed"}],
+                            "summary": "OK",
+                            "quality_metadata": {"notes": 5},
+                        }
+                    )
+                }
+            ),
+            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
+        ]
+        mock_claude.side_effect = responses
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+
+        # raise しないこと
+        result, _ = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert result["passed"] is True
+
 
 class TestCodeGeneration:
     """コード成果物のタイプ別独立生成テスト（M3）"""

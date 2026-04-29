@@ -507,6 +507,10 @@ finally:
 
 **独立生成フィールドの保護**: ジェネレーターの修正プロンプトは契約上テキスト成果物（`content_blocks` / `summary`）のみを返すため、修正レスポンスを `current_deliverables` に単純代入すると 3.3b で生成された `code_files` が失われる。`_run_review_loop` は修正適用時に `_PRESERVED_DELIVERABLE_FIELDS`（現状 `code_files`）を明示的に引き継ぎ、レビューループを跨いでも独立生成パイプラインの成果物が保持されることを保証する。
 
+**修正可能範囲のスコープ宣言**: `_run_review_loop` の修正再生成プロンプト (`fix_prompt`) には「本ループで修正できるのは text 成果物 (`content_blocks` / `summary`) のみ。`code_files` は別パイプラインで独立生成されており本ループでは修正できない」とのスコープ制約を明示する。これにより、レビュアーが出すコード関連指摘（構文・API バージョン・README 整合性等）を受け取った場合に、ジェネレーターが summary に「コードを修正した」と主張する（実体は変わらない）乖離を緩和する。コード関連指摘は `quality_metadata.notes` に「本ループ未修正」として記録され、Notion 出力で利用者が認識できる状態を保つ。
+
+**Fixer notes の出力経路保護**: 修正再生成でジェネレーターが `quality_metadata.notes` に「コード関連指摘 N 件は本ループ未修正」と記録しても、後続のレビュアーが `passed: True` を返した場合、最終的に Notion / DynamoDB に出力されるのはレビュアーの `quality_metadata` であり、ジェネレーター側の note は捨てられる経路がある。さらに修正再生成は最大 2 回まで実行され、2 回目で `current_deliverables` が新応答に置換されると 1 回目の fixer notes も失われる。`_run_review_loop` は (1) 各 fix attempt 直後に `_accumulate_fixer_notes` で notes を accumulator に退避し、(2) 各 return 直前に `_apply_accumulated_fixer_notes` で `review_result.quality_metadata.notes` へ重複なくマージする。これにより全周回の fixer notes が決定論的に最終出力へ届くことを保証する。
+
 ## 4. 外部連携設計
 
 ### 4.1 Slack連携

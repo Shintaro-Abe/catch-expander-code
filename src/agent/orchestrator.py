@@ -29,6 +29,52 @@ def _load_prompt(name: str) -> str:
     return (PROMPTS_DIR / f"{name}.md").read_text()
 
 
+def _accumulate_fixer_notes(accumulated: list[str], source: dict) -> None:
+    """source.quality_metadata.notes の中身を accumulated リストへ重複なく追記する。
+
+    各 fix attempt 直後に呼ぶことで、後続の fix で current_deliverables が新応答に
+    上書きされても、過去の fixer が記録した notes (例: 「コード関連指摘 N 件は本ループ未修正」) が
+    決定論的に保持される。
+
+    LLM 応答の malformed パターン (quality_metadata が null / notes が scalar / int 等) でも
+    accumulator を corrupt させず、safely skip する。型チェックの責務はここに局所化する。
+    """
+    qmeta = source.get("quality_metadata")
+    if not isinstance(qmeta, dict):
+        return
+    notes = qmeta.get("notes")
+    if not isinstance(notes, list):
+        return
+    for note in notes:
+        if isinstance(note, str) and note not in accumulated:
+            accumulated.append(note)
+
+
+def _apply_accumulated_fixer_notes(review_result: dict, accumulated: list[str]) -> None:
+    """累積した fixer notes を review_result.quality_metadata.notes へ重複なくマージする。
+
+    Notion / DynamoDB に流れるのは review_result["quality_metadata"] であり、fixer 側の
+    quality_metadata は review pass 応答で echo されない限り捨てられる。本関数は
+    _run_review_loop の各 return 直前で呼び、fix loop 全周回の notes を最終出力経路へ届ける。
+
+    review_result.quality_metadata が null / notes が非 list の場合でも、accumulated を
+    届けるために型を補正する (既存の malformed 値は破棄して空 dict / list で再構築する)。
+    """
+    if not accumulated:
+        return
+    qmeta = review_result.get("quality_metadata")
+    if not isinstance(qmeta, dict):
+        qmeta = {}
+        review_result["quality_metadata"] = qmeta
+    review_notes = qmeta.get("notes")
+    if not isinstance(review_notes, list):
+        review_notes = []
+        qmeta["notes"] = review_notes
+    for note in accumulated:
+        if note not in review_notes:
+            review_notes.append(note)
+
+
 def _namespace_source_ids(result: dict, step_id: str) -> None:
     """リサーチャー結果の source_id を {step_id}:{source_id} 形式にリマップする（in-place）
 
@@ -786,6 +832,9 @@ class Orchestrator:
         """
         current_deliverables = deliverables
         sources_text = json.dumps(sources, ensure_ascii=False)
+        # fix loop 全周回にまたがって fixer (generator) が記録した notes を累積する。
+        # 各 fix attempt 直後に追記し、return 直前に review_result へマージする。
+        accumulated_fixer_notes: list[str] = []
 
         for loop in range(MAX_REVIEW_LOOPS + 1):
             review_prompt = (
@@ -799,6 +848,8 @@ class Orchestrator:
             review_result = _parse_claude_response(raw)
 
             if review_result.get("passed", False):
+                _accumulate_fixer_notes(accumulated_fixer_notes, current_deliverables)
+                _apply_accumulated_fixer_notes(review_result, accumulated_fixer_notes)
                 logger.info("Review passed", extra={"loop": loop})
                 return review_result, current_deliverables
 
@@ -809,6 +860,8 @@ class Orchestrator:
                     notes = review_result.get("quality_metadata", {}).get("notes", [])
                     notes.append(f"レビュー修正上限（{MAX_REVIEW_LOOPS}回）に到達。未修正の指摘: {len(errors)}件")
                     review_result.setdefault("quality_metadata", {})["notes"] = notes
+                _accumulate_fixer_notes(accumulated_fixer_notes, current_deliverables)
+                _apply_accumulated_fixer_notes(review_result, accumulated_fixer_notes)
                 logger.info("Review loop limit reached", extra={"loop": loop, "remaining_errors": len(errors)})
                 return review_result, current_deliverables
 
@@ -821,6 +874,16 @@ class Orchestrator:
                 f"{gen_prompt}\n\n"
                 f"## 修正指示\n\n"
                 f"以下のレビュー指摘に基づき、成果物を修正してください。\n\n"
+                f"### 本ループでの修正可能範囲\n"
+                f"- 修正できるのは text 成果物 (`content_blocks` / `summary`) のみ。"
+                f"`code_files` (`*.tf`, `*.py`, README 等) は別パイプラインで独立生成されており、"
+                f"本ループでは修正できません。\n"
+                f"- コード関連指摘 (構文・API バージョン・リソース定義・README 整合性等) を受け取った場合、"
+                f"`summary` および `content_blocks` に「コードを修正した」「filter ブロックを削除した」"
+                f"等の修正主張を**書かないでください**。"
+                f"代わりに `quality_metadata.notes` (list[str]) に "
+                f"「コード関連指摘 N 件は本ループ未修正」として正直に記録してください。\n"
+                f"- テキスト関連指摘 (本文表現・出典記述・構成変更) は従来通り反映してください。\n\n"
                 f"指摘事項:\n```json\n{fix_instructions}\n```\n\n"
                 f"現在の成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```"
             )
@@ -835,6 +898,8 @@ class Orchestrator:
                 preserved = {
                     k: current_deliverables[k] for k in _PRESERVED_DELIVERABLE_FIELDS if k in current_deliverables
                 }
+                # fixer notes は parsed の上書きで失われるため、置換前に accumulator へ退避する。
+                _accumulate_fixer_notes(accumulated_fixer_notes, parsed)
                 current_deliverables = parsed
                 current_deliverables.update(preserved)
                 logger.info(
@@ -846,6 +911,8 @@ class Orchestrator:
                     },
                 )
 
+        _accumulate_fixer_notes(accumulated_fixer_notes, current_deliverables)
+        _apply_accumulated_fixer_notes(review_result, accumulated_fixer_notes)
         return review_result, current_deliverables
 
     @staticmethod
