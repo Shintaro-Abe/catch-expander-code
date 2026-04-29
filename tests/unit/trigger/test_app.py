@@ -650,12 +650,13 @@ class TestQueryCompletedExecutions:
         assert call_kwargs["IndexName"] == "user-id-index"
 
 
-class TestGetDeliverableUrl:
-    """_get_deliverable_url のテスト"""
+class TestGetDeliverableUrls:
+    """_get_deliverable_urls のテスト"""
 
     @patch("app.dynamodb")
-    def test_returns_external_url_when_record_exists(self, mock_dynamodb):
-        from app import _get_deliverable_url
+    def test_returns_notion_url_only_when_legacy_record(self, mock_dynamodb):
+        """github_url フィールド未存在の旧フォーマットレコードでは notion_url のみセットされる"""
+        from app import _get_deliverable_urls
 
         mock_table = MagicMock()
         mock_dynamodb.Table.return_value = mock_table
@@ -663,19 +664,43 @@ class TestGetDeliverableUrl:
             "Items": [{"execution_id": "exec-001", "external_url": "https://notion.so/page-123"}]
         }
 
-        result = _get_deliverable_url("exec-001", "test-prefix")
+        result = _get_deliverable_urls("exec-001", "test-prefix")
 
-        assert result == "https://notion.so/page-123"
+        assert result == {"notion_url": "https://notion.so/page-123", "github_url": None}
+
+    @patch("app.dynamodb")
+    def test_returns_both_urls_when_github_url_present(self, mock_dynamodb):
+        """github_url フィールド有りの新フォーマットレコードでは両方セットされる"""
+        from app import _get_deliverable_urls
+
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_table.query.return_value = {
+            "Items": [
+                {
+                    "execution_id": "exec-001",
+                    "external_url": "https://notion.so/page-123",
+                    "github_url": "https://github.com/owner/repo/tree/main/topic-20260429",
+                }
+            ]
+        }
+
+        result = _get_deliverable_urls("exec-001", "test-prefix")
+
+        assert result == {
+            "notion_url": "https://notion.so/page-123",
+            "github_url": "https://github.com/owner/repo/tree/main/topic-20260429",
+        }
 
     @patch("app.dynamodb")
     def test_returns_none_when_no_record(self, mock_dynamodb):
-        from app import _get_deliverable_url
+        from app import _get_deliverable_urls
 
         mock_table = MagicMock()
         mock_dynamodb.Table.return_value = mock_table
         mock_table.query.return_value = {"Items": []}
 
-        result = _get_deliverable_url("exec-001", "test-prefix")
+        result = _get_deliverable_urls("exec-001", "test-prefix")
 
         assert result is None
 
@@ -684,16 +709,16 @@ class TestHandleHistoryCommand:
     """_handle_history_command の統合テスト（外部依存はモック）"""
 
     @patch("app._post_history_result")
-    @patch("app._get_deliverable_url")
+    @patch("app._get_deliverable_urls")
     @patch("app._query_completed_executions")
-    def test_no_keyword_passes_all_completed_up_to_5(self, mock_query, mock_get_url, mock_post):
+    def test_no_keyword_passes_all_completed_up_to_5(self, mock_query, mock_get_urls, mock_post):
         from app import _handle_history_command
 
         mock_query.return_value = [
             {"execution_id": f"e{i}", "topic": f"Topic {i}", "category": "tech", "created_at": "2026-01-01T00:00:00"}
             for i in range(3)
         ]
-        mock_get_url.return_value = "https://notion.so/page"
+        mock_get_urls.return_value = {"notion_url": "https://notion.so/page", "github_url": None}
 
         _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
 
@@ -702,9 +727,9 @@ class TestHandleHistoryCommand:
         assert len(items) == 3
 
     @patch("app._post_history_result")
-    @patch("app._get_deliverable_url")
+    @patch("app._get_deliverable_urls")
     @patch("app._query_completed_executions")
-    def test_keyword_filters_by_topic(self, mock_query, mock_get_url, mock_post):
+    def test_keyword_filters_by_topic(self, mock_query, mock_get_urls, mock_post):
         from app import _handle_history_command
 
         mock_query.return_value = [
@@ -712,7 +737,7 @@ class TestHandleHistoryCommand:
             {"execution_id": "e2", "topic": "Kubernetes概要", "category": "infra", "created_at": "2026-01-02T00:00:00"},
             {"execution_id": "e3", "topic": "terraform応用", "category": "infra", "created_at": "2026-01-03T00:00:00"},
         ]
-        mock_get_url.return_value = None
+        mock_get_urls.return_value = None
 
         _handle_history_command("U1", "C1", "111.000", "terraform", "prefix", "token")
 
@@ -721,16 +746,16 @@ class TestHandleHistoryCommand:
         assert all("terraform" in item["topic"].lower() for item in items)
 
     @patch("app._post_history_result")
-    @patch("app._get_deliverable_url")
+    @patch("app._get_deliverable_urls")
     @patch("app._query_completed_executions")
-    def test_truncates_to_5_items(self, mock_query, mock_get_url, mock_post):
+    def test_truncates_to_5_items(self, mock_query, mock_get_urls, mock_post):
         from app import _handle_history_command
 
         mock_query.return_value = [
             {"execution_id": f"e{i}", "topic": f"Topic {i}", "category": "tech", "created_at": "2026-01-01T00:00:00"}
             for i in range(8)
         ]
-        mock_get_url.return_value = "https://notion.so/page"
+        mock_get_urls.return_value = {"notion_url": "https://notion.so/page", "github_url": None}
 
         _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
 
@@ -738,25 +763,47 @@ class TestHandleHistoryCommand:
         assert len(items) == 5
 
     @patch("app._post_history_result")
-    @patch("app._get_deliverable_url")
+    @patch("app._get_deliverable_urls")
     @patch("app._query_completed_executions")
-    def test_url_none_is_passed_to_post(self, mock_query, mock_get_url, mock_post):
+    def test_url_none_is_passed_to_post(self, mock_query, mock_get_urls, mock_post):
         from app import _handle_history_command
 
         mock_query.return_value = [
             {"execution_id": "e1", "topic": "Topic", "category": "tech", "created_at": "2026-01-01T00:00:00"}
         ]
-        mock_get_url.return_value = None
+        mock_get_urls.return_value = None
 
         _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
 
         items = mock_post.call_args[0][2]
-        assert items[0]["url"] is None
+        assert items[0]["notion_url"] is None
+        assert items[0]["github_url"] is None
 
     @patch("app._post_history_result")
-    @patch("app._get_deliverable_url")
+    @patch("app._get_deliverable_urls")
     @patch("app._query_completed_executions")
-    def test_empty_executions_passes_empty_items(self, mock_query, mock_get_url, mock_post):
+    def test_github_url_is_passed_to_post(self, mock_query, mock_get_urls, mock_post):
+        """deliverables に github_url が含まれるとき、items に notion_url / github_url 両方が入る"""
+        from app import _handle_history_command
+
+        mock_query.return_value = [
+            {"execution_id": "e1", "topic": "Topic", "category": "tech", "created_at": "2026-01-01T00:00:00"}
+        ]
+        mock_get_urls.return_value = {
+            "notion_url": "https://notion.so/page",
+            "github_url": "https://github.com/owner/repo/tree/main/topic-20260429",
+        }
+
+        _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
+
+        items = mock_post.call_args[0][2]
+        assert items[0]["notion_url"] == "https://notion.so/page"
+        assert items[0]["github_url"] == "https://github.com/owner/repo/tree/main/topic-20260429"
+
+    @patch("app._post_history_result")
+    @patch("app._get_deliverable_urls")
+    @patch("app._query_completed_executions")
+    def test_empty_executions_passes_empty_items(self, mock_query, mock_get_urls, mock_post):
         from app import _handle_history_command
 
         mock_query.return_value = []
@@ -765,12 +812,12 @@ class TestHandleHistoryCommand:
 
         items = mock_post.call_args[0][2]
         assert items == []
-        mock_get_url.assert_not_called()
+        mock_get_urls.assert_not_called()
 
     @patch("app._post_history_result")
-    @patch("app._get_deliverable_url")
+    @patch("app._get_deliverable_urls")
     @patch("app._query_completed_executions")
-    def test_get_deliverable_url_exception_sets_url_none_and_continues(self, mock_query, mock_get_url, mock_post):
+    def test_get_deliverable_urls_exception_sets_urls_none_and_continues(self, mock_query, mock_get_urls, mock_post):
         from app import _handle_history_command
 
         mock_query.return_value = [
@@ -778,19 +825,21 @@ class TestHandleHistoryCommand:
             {"execution_id": "e2", "topic": "Topic B", "category": "tech", "created_at": "2026-01-02T00:00:00"},
         ]
 
-        def get_url_side_effect(execution_id, table_prefix):
+        def get_urls_side_effect(execution_id, table_prefix):
             if execution_id == "e1":
                 raise RuntimeError("DynamoDB error")
-            return "https://notion.so/page-e2"
+            return {"notion_url": "https://notion.so/page-e2", "github_url": None}
 
-        mock_get_url.side_effect = get_url_side_effect
+        mock_get_urls.side_effect = get_urls_side_effect
 
         _handle_history_command("U1", "C1", "111.000", None, "prefix", "token")
 
         items = mock_post.call_args[0][2]
         assert len(items) == 2
-        assert items[0]["url"] is None  # e1: exception → None
-        assert items[1]["url"] == "https://notion.so/page-e2"  # e2: unaffected
+        assert items[0]["notion_url"] is None  # e1: exception → None
+        assert items[0]["github_url"] is None
+        assert items[1]["notion_url"] == "https://notion.so/page-e2"  # e2: unaffected
+        assert items[1]["github_url"] is None
 
 
 class TestPostHistoryResult:
@@ -830,7 +879,15 @@ class TestPostHistoryResult:
         mock_slack = MagicMock()
         mock_webclient_cls.return_value = mock_slack
 
-        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "url": "https://notion.so/p1"}]
+        items = [
+            {
+                "topic": "T1",
+                "category": "cat",
+                "date": "2026-01-01",
+                "notion_url": "https://notion.so/p1",
+                "github_url": None,
+            }
+        ]
         _post_history_result("C1", "111.000", items, None, "token")
 
         text = mock_slack.chat_postMessage.call_args[1]["text"]
@@ -843,37 +900,97 @@ class TestPostHistoryResult:
         mock_slack = MagicMock()
         mock_webclient_cls.return_value = mock_slack
 
-        items = [{"topic": "Terraform入門", "category": "infra", "date": "2026-01-01", "url": None}]
+        items = [
+            {
+                "topic": "Terraform入門",
+                "category": "infra",
+                "date": "2026-01-01",
+                "notion_url": None,
+                "github_url": None,
+            }
+        ]
         _post_history_result("C1", "111.000", items, "Terraform", "token")
 
         text = mock_slack.chat_postMessage.call_args[1]["text"]
         assert "📚 成果物履歴「Terraform」（最新 1 件）" in text
 
     @patch("app.WebClient")
-    def test_item_with_url_includes_url_line(self, mock_webclient_cls):
+    def test_history_command_displays_github_url(self, mock_webclient_cls):
+        """github_url ありの item は notion_url と github_url の 2 行が表示される"""
         from app import _post_history_result
 
         mock_slack = MagicMock()
         mock_webclient_cls.return_value = mock_slack
 
-        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "url": "https://notion.so/p1"}]
+        items = [
+            {
+                "topic": "T1",
+                "category": "cat",
+                "date": "2026-01-01",
+                "notion_url": "https://notion.so/p1",
+                "github_url": "https://github.com/owner/repo/tree/main/t1-20260101",
+            }
+        ]
         _post_history_result("C1", "111.000", items, None, "token")
 
         text = mock_slack.chat_postMessage.call_args[1]["text"]
-        assert "   https://notion.so/p1" in text
+        assert "   📝 https://notion.so/p1" in text
+        assert "   💻 https://github.com/owner/repo/tree/main/t1-20260101" in text
 
     @patch("app.WebClient")
-    def test_item_without_url_includes_no_url_line(self, mock_webclient_cls):
+    def test_history_command_omits_github_url_when_absent(self, mock_webclient_cls):
+        """github_url が None の item は notion_url の 1 行のみ表示され、💻 行は出ない"""
         from app import _post_history_result
 
         mock_slack = MagicMock()
         mock_webclient_cls.return_value = mock_slack
 
-        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "url": None}]
+        items = [
+            {
+                "topic": "T1",
+                "category": "cat",
+                "date": "2026-01-01",
+                "notion_url": "https://notion.so/p1",
+                "github_url": None,
+            }
+        ]
+        _post_history_result("C1", "111.000", items, None, "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "   📝 https://notion.so/p1" in text
+        assert "💻" not in text
+
+    @patch("app.WebClient")
+    def test_history_command_handles_legacy_record(self, mock_webclient_cls):
+        """github_url キー自体が存在しない旧フォーマット item でも例外を出さず notion_url のみ表示"""
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        # 旧フォーマット: github_url キーが含まれていない（item.get("github_url") が None になる）
+        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "notion_url": "https://notion.so/p1"}]
+        _post_history_result("C1", "111.000", items, None, "token")
+
+        text = mock_slack.chat_postMessage.call_args[1]["text"]
+        assert "   📝 https://notion.so/p1" in text
+        assert "💻" not in text
+
+    @patch("app.WebClient")
+    def test_history_command_no_url(self, mock_webclient_cls):
+        """notion_url も github_url も None のとき「（URL なし）」表示が維持される"""
+        from app import _post_history_result
+
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+
+        items = [{"topic": "T1", "category": "cat", "date": "2026-01-01", "notion_url": None, "github_url": None}]
         _post_history_result("C1", "111.000", items, None, "token")
 
         text = mock_slack.chat_postMessage.call_args[1]["text"]
         assert "   （URL なし）" in text
+        assert "📝" not in text
+        assert "💻" not in text
 
     @patch("app.WebClient")
     def test_multiple_items_are_numbered(self, mock_webclient_cls):
@@ -883,8 +1000,8 @@ class TestPostHistoryResult:
         mock_webclient_cls.return_value = mock_slack
 
         items = [
-            {"topic": "Topic A", "category": "cat", "date": "2026-01-01", "url": None},
-            {"topic": "Topic B", "category": "cat", "date": "2026-01-02", "url": None},
+            {"topic": "Topic A", "category": "cat", "date": "2026-01-01", "notion_url": None, "github_url": None},
+            {"topic": "Topic B", "category": "cat", "date": "2026-01-02", "notion_url": None, "github_url": None},
         ]
         _post_history_result("C1", "111.000", items, None, "token")
 

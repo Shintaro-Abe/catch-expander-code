@@ -169,9 +169,30 @@ _MAX_FILE_BYTES = 100 * 1024
 _WORKSPACE_STDOUT_PREVIEW_LIMIT = 500
 
 _FILE_EXTENSIONS = {
-    ".tf", ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".txt", ".md",
-    ".yaml", ".yml", ".go", ".rs", ".java", ".toml", ".sh", ".env",
-    ".cfg", ".ini", ".html", ".css", ".rb", ".kt", ".swift",
+    ".tf",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".json",
+    ".txt",
+    ".md",
+    ".yaml",
+    ".yml",
+    ".go",
+    ".rs",
+    ".java",
+    ".toml",
+    ".sh",
+    ".env",
+    ".cfg",
+    ".ini",
+    ".html",
+    ".css",
+    ".rb",
+    ".kt",
+    ".swift",
 }
 _FILENAME_EXACT = {"Dockerfile", "Makefile", "Procfile", ".gitignore", ".env.example"}
 
@@ -287,10 +308,15 @@ def call_claude_with_workspace(
     sandbox = Path(tempfile.mkdtemp(prefix=f"agent-output-{code_type}-"))
     try:
         cmd = [
-            "claude", "-p", "-",
-            "--model", model,
-            "--allowedTools", "Write,Edit",
-            "--output-format", "json",
+            "claude",
+            "-p",
+            "-",
+            "--model",
+            model,
+            "--allowedTools",
+            "Write,Edit",
+            "--output-format",
+            "json",
         ]
         last_error: subprocess.CalledProcessError | None = None
         raw_stdout = ""
@@ -533,9 +559,7 @@ class Orchestrator:
                     "Generating code files for type (workspace mode)",
                     extra={"execution_id": execution_id, "code_type": code_type},
                 )
-                prompt = _build_code_generation_prompt(
-                    topic, category, research_results, profile_text, code_type
-                )
+                prompt = _build_code_generation_prompt(topic, category, research_results, profile_text, code_type)
                 raw_stdout, files, outcome = call_claude_with_workspace(prompt, code_type)
 
                 if outcome["files_kind"] == "valid":
@@ -646,16 +670,17 @@ class Orchestrator:
         self.notion.update_page_status(notion_page_id, "完了")
 
         # 成果物レコードをDynamoDBに保存
-        self.db.put_deliverable(
-            {
-                "execution_id": execution_id,
-                "deliverable_id": f"dlv-{execution_id}",
-                "type": "all",
-                "storage": "notion" if not github_url else "notion+github",
-                "external_url": notion_url,
-                "quality_metadata": quality_metadata,
-            }
-        )
+        deliverable_record = {
+            "execution_id": execution_id,
+            "deliverable_id": f"dlv-{execution_id}",
+            "type": "all",
+            "storage": "notion" if not github_url else "notion+github",
+            "external_url": notion_url,
+            "quality_metadata": quality_metadata,
+        }
+        if github_url:
+            deliverable_record["github_url"] = github_url
+        self.db.put_deliverable(deliverable_record)
 
         # 出典をDynamoDBに保存
         if all_sources:
@@ -808,9 +833,7 @@ class Orchestrator:
                 )
             else:
                 preserved = {
-                    k: current_deliverables[k]
-                    for k in _PRESERVED_DELIVERABLE_FIELDS
-                    if k in current_deliverables
+                    k: current_deliverables[k] for k in _PRESERVED_DELIVERABLE_FIELDS if k in current_deliverables
                 }
                 current_deliverables = parsed
                 current_deliverables.update(preserved)

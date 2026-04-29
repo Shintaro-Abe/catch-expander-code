@@ -158,9 +158,10 @@ erDiagram
         string deliverable_id PK
         string execution_id FK
         string type "成果物タイプ"
-        string storage "格納先（notion/github）"
+        string storage "格納先（notion/notion+github）"
         string external_id "Notion page ID / GitHub commit SHA"
-        string external_url "アクセスURL"
+        string external_url "Notion ページ URL"
+        string github_url "GitHub ディレクトリ URL（storage=notion+github の場合のみ）"
         json quality_metadata "品質メタデータ"
         datetime created_at
     }
@@ -855,7 +856,7 @@ src/agent/feedback/
       ↓
 [Lambda] キーワードフィルタ（指定時）→ 先頭 5 件に絞る
       ↓
-[Lambda] DynamoDB: deliverables テーブルで各 execution_id の external_url を解決
+[Lambda] DynamoDB: deliverables テーブルで各 execution_id の external_url（Notion）と github_url（任意）を解決
       ↓
 [Lambda] フォーマット済み一覧を Slack スレッドに投稿
       ↓
@@ -891,7 +892,7 @@ src/agent/feedback/
 | `_is_history_command(text)` | 履歴コマンドかどうかの判定 |
 | `_extract_history_keyword(text)` | コマンド文字列からキーワード部分を抽出 |
 | `_query_completed_executions(user_id, table_prefix)` | `user-id-index` GSI で完了済み実行を取得 |
-| `_get_deliverable_url(execution_id, table_prefix)` | `deliverables` テーブルから Notion URL を取得 |
+| `_get_deliverable_urls(execution_id, table_prefix)` | `deliverables` テーブルから Notion URL（`external_url`）と GitHub URL（`github_url`、任意）を取得し、`{"notion_url": ..., "github_url": ...}` で返す |
 | `_handle_history_command(user_id, channel, msg_ts, keyword, table_prefix, slack_token)` | 上記を組み合わせた履歴コマンド処理 |
 | `_post_history_result(channel, thread_ts, items, keyword, slack_token)` | 成果物一覧を Slack スレッドに投稿 |
 
@@ -904,11 +905,22 @@ src/agent/feedback/
 📚 成果物履歴（最新 N 件）
 
 1. {topic} — {category} — {YYYY-MM-DD}
-   {notion_url}
+   📝 {notion_url}
+   💻 {github_url}
 
 2. {topic} — {category} — {YYYY-MM-DD}
+   📝 {notion_url}
+
+3. {topic} — {category} — {YYYY-MM-DD}
    （URL なし）
 ```
+
+各項目の URL 表示ルール：
+
+- `📝` 行は `external_url`（Notion URL）が存在する場合のみ
+- `💻` 行は `github_url` が存在する場合のみ（コード成果物 = `storage="notion+github"` のレコード）
+- 両方とも未存在のとき「（URL なし）」を表示
+- 旧フォーマット（`github_url` フィールド未存在）レコードでも `📝` 行のみが表示され、エラーにならない
 
 **キーワード指定時のヘッダー：** `📚 成果物履歴「{keyword}」（最新 N 件）`
 

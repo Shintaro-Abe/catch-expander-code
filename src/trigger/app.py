@@ -80,9 +80,15 @@ def _query_completed_executions(user_id: str, table_prefix: str) -> list[dict]:
     return [item for item in items if item.get("status") == "completed"]
 
 
-def _get_deliverable_url(execution_id: str, table_prefix: str) -> str | None:
-    """deliverables テーブルから対象 execution_id の external_url を取得する。
-    レコードが存在しない場合は None を返す。
+def _get_deliverable_urls(execution_id: str, table_prefix: str) -> dict | None:
+    """deliverables テーブルから対象 execution_id の URL 群を取得する。
+
+    Returns:
+        - 該当レコードが存在する場合: {"notion_url": str | None, "github_url": str | None}
+        - 該当レコードが存在しない場合: None
+
+    `github_url` フィールドは storage="notion+github" のときのみ存在する。
+    旧フォーマットレコード (フィールド未存在) でも KeyError にならないよう .get で取得する。
     """
     table = dynamodb.Table(f"{table_prefix}-deliverables")
     response = table.query(
@@ -90,7 +96,13 @@ def _get_deliverable_url(execution_id: str, table_prefix: str) -> str | None:
         Limit=1,
     )
     items = response.get("Items", [])
-    return items[0].get("external_url") if items else None
+    if not items:
+        return None
+    item = items[0]
+    return {
+        "notion_url": item.get("external_url"),
+        "github_url": item.get("github_url"),
+    }
 
 
 def _handle_history_command(
@@ -112,19 +124,20 @@ def _handle_history_command(
     items = []
     for e in executions:
         try:
-            url = _get_deliverable_url(e["execution_id"], table_prefix)
+            urls = _get_deliverable_urls(e["execution_id"], table_prefix)
         except Exception:
             logger.exception(
-                "Failed to get deliverable URL",
+                "Failed to get deliverable URLs",
                 extra={"execution_id": e["execution_id"]},
             )
-            url = None
+            urls = None
         items.append(
             {
                 "topic": e.get("topic", ""),
                 "category": e.get("category", ""),
                 "date": e.get("created_at", "")[:10],
-                "url": url,
+                "notion_url": urls["notion_url"] if urls else None,
+                "github_url": urls["github_url"] if urls else None,
             }
         )
 
@@ -152,7 +165,12 @@ def _post_history_result(
         lines = [header, ""]
         for i, item in enumerate(items, 1):
             lines.append(f"{i}. {item['topic']} — {item['category']} — {item['date']}")
-            lines.append(f"   {item['url']}" if item["url"] else "   （URL なし）")
+            if item.get("notion_url"):
+                lines.append(f"   📝 {item['notion_url']}")
+            if item.get("github_url"):
+                lines.append(f"   💻 {item['github_url']}")
+            if not item.get("notion_url") and not item.get("github_url"):
+                lines.append("   （URL なし）")
         text = "\n".join(lines)
 
     slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)

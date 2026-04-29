@@ -402,9 +402,7 @@ class TestReviewLoop:
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
-        result, final_deliverables = orch._run_review_loop(
-            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
-        )
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
         assert result["passed"] is True
         assert final_deliverables["content_blocks"] == [{"t": "fixed"}]
         assert final_deliverables["summary"] == "修正版"
@@ -429,9 +427,7 @@ class TestReviewLoop:
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
         original = {"content_blocks": [], "summary": "初版"}
-        result, final_deliverables = orch._run_review_loop(
-            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
-        )
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
         assert result["passed"] is False
         assert final_deliverables["summary"] == "fix-2"
         notes = result["quality_metadata"]["notes"]
@@ -461,9 +457,7 @@ class TestReviewLoop:
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
-        result, final_deliverables = orch._run_review_loop(
-            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
-        )
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
         assert result["passed"] is True
         # parse_error のため original を保持
         assert final_deliverables == original
@@ -495,7 +489,7 @@ class TestReviewLoop:
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
         original_code_files = {
-            "files": {"main.tf": "resource \"aws_cloudfront_distribution\" \"x\" {}"},
+            "files": {"main.tf": 'resource "aws_cloudfront_distribution" "x" {}'},
             "readme_content": "# CloudFront IaC",
         }
         original = {
@@ -503,9 +497,7 @@ class TestReviewLoop:
             "summary": "初版",
             "code_files": original_code_files,
         }
-        result, final_deliverables = orch._run_review_loop(
-            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
-        )
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
         assert result["passed"] is True
         assert final_deliverables["summary"] == "修正版"
         assert final_deliverables["content_blocks"] == [{"t": "fixed"}]
@@ -537,9 +529,7 @@ class TestReviewLoop:
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
-        result, final_deliverables = orch._run_review_loop(
-            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
-        )
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
         assert result["passed"] is True
         assert "code_files" not in final_deliverables
 
@@ -562,11 +552,9 @@ class TestReviewLoop:
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
-        original_code_files = {"files": {"main.tf": "resource \"x\" \"y\" {}"}, "readme_content": "readme"}
+        original_code_files = {"files": {"main.tf": 'resource "x" "y" {}'}, "readme_content": "readme"}
         original = {"content_blocks": [], "summary": "初版", "code_files": original_code_files}
-        result, final_deliverables = orch._run_review_loop(
-            "prompt", original, [], "技術", "gen_prompt", "C1", "ts1"
-        )
+        result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
         assert result["passed"] is False
         assert final_deliverables["summary"] == "fix-2"
         assert final_deliverables["code_files"] == original_code_files
@@ -586,7 +574,9 @@ class TestCodeGeneration:
             "research_steps": [
                 {"step_id": "r-1", "step_name": "概要", "description": "test", "search_hints": []},
             ],
-            "generate_steps": [{"step_id": f"g-{i}", "step_name": t, "deliverable_type": t} for i, t in enumerate(deliverable_types)],
+            "generate_steps": [
+                {"step_id": f"g-{i}", "step_name": t, "deliverable_type": t} for i, t in enumerate(deliverable_types)
+            ],
             "storage_targets": ["github"],
         }
         research = {"step_id": "r-1", "summary": "調査結果", "sources": []}
@@ -610,9 +600,7 @@ class TestCodeGeneration:
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
     @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
-    def test_code_generation_per_type_merges_files(
-        self, mock_call_claude, mock_call_workspace, _mock_load
-    ):
+    def test_code_generation_per_type_merges_files(self, mock_call_claude, mock_call_workspace, _mock_load):
         """iac_code と program_code が個別 workspace 呼び出しでマージされる"""
         from orchestrator import Orchestrator
 
@@ -715,19 +703,14 @@ class TestCodeGeneration:
         assert "app.py" not in files_arg
 
         # 部分失敗の Slack 通知が送られている
-        warning_calls = [
-            c for c in slack.post_progress.call_args_list
-            if "失敗" in c.args[2]
-        ]
+        warning_calls = [c for c in slack.post_progress.call_args_list if "失敗" in c.args[2]]
         assert len(warning_calls) == 1
         assert "プログラムコード" in warning_calls[0].args[2]
 
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
     @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
-    def test_generator_code_files_always_discarded(
-        self, mock_call_claude, mock_call_workspace, _mock_load
-    ):
+    def test_generator_code_files_always_discarded(self, mock_call_claude, mock_call_workspace, _mock_load):
         """ジェネレーターが誤って code_files を返しても、workspace 経由の値で上書きされる"""
         from orchestrator import Orchestrator
 
@@ -852,6 +835,90 @@ class TestLearnedPreferencesInProfileText:
 
         first_prompt = mock_call_claude.call_args_list[0][0][0]
         assert "蓄積された好み" not in first_prompt
+
+
+class TestPutDeliverableGitHubUrl:
+    """put_deliverable に github_url が条件付きで含まれることのテスト"""
+
+    def _make_responses_with_storage(self, storage_targets):
+        """run() を最後まで通すための最小限の Claude 応答列（storage_targets を可変に）"""
+        analysis = {"category": "技術", "intent": "学習", "perspectives": [], "deliverable_types": ["research_report"]}
+        workflow = {
+            "research_steps": [{"step_id": "r-1", "step_name": "概要", "description": "概要調査", "search_hints": []}],
+            "generate_steps": [{"step_id": "g-1", "step_name": "レポート", "deliverable_type": "research_report"}],
+            "storage_targets": storage_targets,
+        }
+        research = {"step_id": "r-1", "summary": "概要", "sources": []}
+        deliverables = {"content_blocks": [], "code_files": None, "summary": "完成"}
+        review = {"passed": True, "issues": [], "quality_metadata": {}}
+        return [
+            json.dumps({"result": json.dumps(analysis)}),
+            json.dumps({"result": json.dumps(workflow)}),
+            json.dumps({"result": json.dumps(research)}),
+            json.dumps({"result": json.dumps(deliverables)}),
+            json.dumps({"result": json.dumps(review)}),
+        ]
+
+    def _make_orch(self, db, mock_review_loop_return):
+        """Orchestrator インスタンスを作成し、Notion / GitHub / レビューループをモック化"""
+        from orchestrator import Orchestrator
+
+        slack = MagicMock()
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+        orch.github.push_files.return_value = "https://github.com/owner/repo/tree/main/test-20260429"
+        orch._run_review_loop = MagicMock(return_value=mock_review_loop_return)
+        return orch
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_put_deliverable_with_github_url(self, mock_call_claude, _mock_load):
+        """code_files ありで storage_targets に github を含む場合、put_deliverable に github_url が含まれる"""
+        mock_call_claude.side_effect = self._make_responses_with_storage(["notion", "github"])
+
+        db = MagicMock()
+        db.get_user_profile.return_value = {"user_id": "U1"}
+        db._table.return_value = MagicMock()
+
+        # レビューループの戻り値で code_files を含む deliverables を返す
+        review_result = {"passed": True, "issues": [], "quality_metadata": {"sources_total": 5}}
+        deliverables_with_code = {
+            "content_blocks": [],
+            "code_files": {"files": {"main.py": "print('hi')"}, "readme_content": "# README"},
+            "summary": "完成",
+        }
+        orch = self._make_orch(db, (review_result, deliverables_with_code))
+
+        orch.run("exec-1", "U1", "Lambda入門", "C1", "ts1")
+
+        db.put_deliverable.assert_called_once()
+        payload = db.put_deliverable.call_args[0][0]
+        assert "github_url" in payload
+        assert payload["github_url"] == "https://github.com/owner/repo/tree/main/test-20260429"
+        assert payload["storage"] == "notion+github"
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_put_deliverable_without_github_url(self, mock_call_claude, _mock_load):
+        """code_files なしの場合、put_deliverable に github_url キー自体が含まれない"""
+        mock_call_claude.side_effect = self._make_responses_with_storage(["notion"])
+
+        db = MagicMock()
+        db.get_user_profile.return_value = {"user_id": "U1"}
+        db._table.return_value = MagicMock()
+
+        review_result = {"passed": True, "issues": [], "quality_metadata": {}}
+        deliverables_text_only = {"content_blocks": [], "code_files": None, "summary": "完成"}
+        orch = self._make_orch(db, (review_result, deliverables_text_only))
+
+        orch.run("exec-1", "U1", "DDDの基礎", "C1", "ts1")
+
+        db.put_deliverable.assert_called_once()
+        payload = db.put_deliverable.call_args[0][0]
+        assert "github_url" not in payload
+        assert payload["storage"] == "notion"
 
 
 class TestBuildQualityMetadataBlock:
@@ -980,7 +1047,7 @@ class TestBuildQualityMetadataBlock:
         assert "情報の鮮度: 取得日不明のソースが含まれます" in text
 
     def test_freshness_treats_unknown_marker_as_missing(self):
-        """"unknown" / "continuously-updated" は日付として扱わず注意書きに切り替わる"""
+        """ "unknown" / "continuously-updated" は日付として扱わず注意書きに切り替わる"""
         orch = self._make_orch()
         blocks = orch._build_quality_metadata_block(
             {
