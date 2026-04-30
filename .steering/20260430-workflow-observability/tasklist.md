@@ -22,7 +22,7 @@
 
 ### Phase 1: PR1 — バックエンド基盤 (events + API + 認証)
 
-- [ ] T1-1: 共通ヘルパー `src/observability/event_emitter.py` を実装
+- [x] T1-1: 共通ヘルパー `src/observability/event_emitter.py` を実装 (合成 ID対応、9 ユニットテスト含む、`__init__.py` 経由で `EventEmitter` を export)
 - [ ] T1-2: orchestrator (`src/agent/orchestrator.py`) に **基本 9 観測ポイント** の emit 呼び出しを追加
 - [ ] **T1-2b**: orchestrator + storage clients に **Tier 1/2 拡張イベント (4 種)** の emit 呼び出しを追加 (`api_call_completed` / `rate_limit_hit` / `feedback_received`)
 - [ ] T1-3: Lambda Trigger (`src/trigger/app.py`) に `topic_received` emit を追加
