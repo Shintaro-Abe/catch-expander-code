@@ -53,6 +53,23 @@
 | ソース優先順位 | Source Priority | カテゴリ別に定義された情報ソースの信頼度ランキング（1〜6） | `source_priority` |
 | 未検証 | Unverified | 信頼できるソースで裏付けが取れていない事実主張の状態 | `unverified` |
 | レビューループ | Review Loop | レビュアーが不合格→ジェネレーターが修正→再レビューの繰り返し（最大2回） | - |
+| フィクサー注記 | Fixer Notes | review fix loop で fixer (LLM) が `quality_metadata.notes` に記録する正直な実行ログ。「コード関連指摘 N 件は本ループ未修正」等が代表例 | `fixer_notes` |
+| 保護フィールドリスト | Preserved Deliverable Fields | fix loop で text 成果物を再生成しても上書きしないフィールド集合。現在は `("code_files",)` | `_PRESERVED_DELIVERABLE_FIELDS` |
+
+### コード生成
+
+| 用語（日本語） | 用語（英語） | 定義 | コード上の命名 |
+|--------------|------------|------|--------------|
+| ワークスペースモード | Workspace Mode | コード生成時に Claude が sandbox ディレクトリで `.tf` `.py` 等を Write ツール直書きする方式。JSON エスケープを回避 | `call_claude_with_workspace` |
+| サンドボックス | Sandbox | workspace モードで一時作成される独立ディレクトリ（`/tmp/agent-output-{type}-{uuid}`）。タスク完了後に `shutil.rmtree` で削除される | `sandbox` |
+
+### フィードバック学習
+
+| 用語（日本語） | 用語（英語） | 定義 | コード上の命名 |
+|--------------|------------|------|--------------|
+| フィードバックプロセッサー | Feedback Processor | F8 フィードバック（Slack 絵文字反応 + メンション返信）を解析し、`learned_preferences` を更新するモジュール（`src/agent/feedback/`） | `feedback_processor` |
+| 学習済み好み | Learned Preferences | ユーザーの過去フィードバックから抽出された嗜好情報。次回の deliverables 生成時に prompt 経由で反映される | `learned_preferences` |
+| 好み | Preference | ユーザーが特定のスタイル・形式・出典源等に対して持つ嗜好。F8 フィードバックを通じて学習対象になる | `preference` |
 
 ## 2. 成果物タイプ
 
@@ -79,6 +96,7 @@
 | ACK応答 | ACK Response | トピック受信時にSlackへ即座に返す受付確認メッセージ | `ack` |
 | 完了通知 | Completion Notification | ワークフロー完了時にSlackへ送信するサマリーとリンク | `completion_notification` |
 | 進捗通知 | Progress Notification | ワークフロー実行中にSlackへ送信するステップ完了報告 | `progress_notification` |
+| 履歴コマンド | History Command | Slack で `履歴` または `history [keyword]` 投稿で過去の完了成果物を一覧表示する F9 機能（`src/trigger/app.py`） | `_handle_history_command` |
 
 ## 4. ステータス
 
