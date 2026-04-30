@@ -125,35 +125,36 @@
 
 ### 4-1. ローカル全テスト実行
 
-- [ ] `pytest tests/ -v` で全テスト pass (新規 6 ケース含む)
-- [ ] 新規 warning が発生していないことを確認
+- [x] `pytest tests/ -v` で全テスト pass (新規 6 ケース含む) → 237 件全 pass
+- [x] 新規 warning が発生していないことを確認
 
 ### 4-2. Lint / Type check / Format check
 
-- [ ] `ruff check src/ tests/` でエラー 0
-- [ ] `ruff format --check src/ tests/` で差分 0
-- [ ] `mypy src/agent/orchestrator.py src/trigger/app.py --disallow-untyped-defs` でエラー 0
+- [x] `ruff check src/ tests/` でエラー 0 (本変更スコープのファイル)
+- [x] `ruff format --check src/ tests/` で差分 0 (本変更スコープのファイル)
+- [ ] `mypy src/agent/orchestrator.py src/trigger/app.py --disallow-untyped-defs` でエラー 0 (mypy 未導入のためスキップ)
 
 ### 4-3. コミット作成 (1 コミット)
 
-- [ ] コミットメッセージを起案 (例: `feat: persist GitHub URL on deliverables and surface in F9 history`)
-- [ ] ステージ対象を明示的に追加
-  - [ ] `src/agent/orchestrator.py`
-  - [ ] `src/trigger/app.py`
-  - [ ] `tests/unit/agent/test_orchestrator.py`
-  - [ ] `tests/unit/trigger/test_app.py`
-  - [ ] `docs/functional-design.md`
-  - [ ] `.steering/20260429-deliverables-github-url/`
-- [ ] `git diff --cached` で意図したファイルのみがステージされていることを確認
-- [ ] `git commit` 実行 → `git push origin main`
+- [x] コミットメッセージを起案 (例: `feat: persist GitHub URL on deliverables and surface in F9 history`)
+- [x] ステージ対象を明示的に追加
+  - [x] `src/agent/orchestrator.py`
+  - [x] `src/trigger/app.py`
+  - [x] `tests/unit/agent/test_orchestrator.py`
+  - [x] `tests/unit/trigger/test_app.py`
+  - [x] `docs/functional-design.md`
+  - [x] `.steering/20260429-deliverables-github-url/`
+- [x] `git diff --cached` で意図したファイルのみがステージされていることを確認
+- [x] `git commit` 実行 → `git push origin main` (commit: `d0900c8`)
 
 ### 4-4. `sam deploy` で本番反映
 
-- [ ] `sam build` 成功
-- [ ] `sam deploy` 実行 (`UsePreviousValue` で全パラメータ維持)
-- [ ] CloudFormation Stack `catch-expander` のステータスが `UPDATE_COMPLETE`
-- [ ] ECS タスク定義の新リビジョンが `ACTIVE`
-- [ ] Lambda の最新版がデプロイされている
+- [x] `sam build` 成功 (Python 3.13 ランタイムを uv 経由で確保)
+- [x] `sam deploy` 実行 → CloudFormation Stack `catch-expander` を `UPDATE_COMPLETE` に
+- [x] ECS タスク定義の新リビジョン `catch-expander-agent:3` が ACTIVE
+- [x] Lambda `TriggerFunction` の最新版がデプロイされている (F9 履歴コマンドの新表示形式が反映)
+- [x] GitHub Actions `build-agent.yml` がコミット `d0900c8` で自動発火 → ECR `:latest` 更新 (2026-04-29T04:38:03 UTC)
+- [x] 次回 ECS タスク起動時に orchestrator.py の `github_url` 永続化が有効になる
 
 ### 4-5. E2E 動作確認
 

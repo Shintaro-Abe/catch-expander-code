@@ -6,14 +6,19 @@
 
 ## 進捗サマリ
 
-- [ ] T1: ベースライン確認 (現状のテスト pass 状況を記録)
-- [ ] T2: `src/agent/orchestrator.py` の `fix_prompt` にスコープ制約セクションを追記
-- [ ] T3: `tests/unit/agent/test_orchestrator.py` に新規テスト 2 ケースを追加
-- [ ] T4: TestReviewLoop の単体テストを実行 (新規ケース pass + 既存回帰なし)
-- [ ] T5: 全体テストを実行 (orchestrator / trigger / token_monitor の全件 pass)
-- [ ] T6: ruff lint / format チェック
-- [ ] T7: `docs/functional-design.md` のレビューループ節を更新
-- [ ] T8: ステアリング 3 ファイル間の最終整合確認
+- [x] T1: ベースライン確認 (現状のテスト pass 状況を記録)
+- [x] T2: `src/agent/orchestrator.py` の `fix_prompt` にスコープ制約セクションを追記
+- [x] T3: `tests/unit/agent/test_orchestrator.py` に新規テスト 2 ケースを追加 (Codex 連続レビューで 7 ケースに拡張)
+- [x] T4: TestReviewLoop の単体テストを実行 (新規ケース pass + 既存回帰なし)
+- [x] T5: 全体テストを実行 (orchestrator / trigger / token_monitor 全件 pass、計 241 件)
+- [x] T6: ruff lint / format チェック
+- [x] T7: `docs/functional-design.md` のレビューループ節を更新
+- [x] T8: ステアリング 3 ファイル間の最終整合確認
+
+**完了** 2026-04-29 (commit `8c5b220`) → 2026-04-30 02:28 JST 実機検証で 4 観測点全発火確認。Codex 独立レビュー 3 回で当初案より厚い実装に進化:
+- T3: 2 ケース予定 → **7 ケース** (Codex 1〜3 回目対応で `_merge` → `_accumulate` 再設計、`isinstance` ガード、accumulator multi-fix 検証ケース追加)
+- 補助ヘルパー新設: `_accumulate_fixer_notes` / `_apply_accumulated_fixer_notes` (`src/agent/orchestrator.py:32-75`)
+- 詳細: `obsidian/2026-04-29_codex-iterative-review-finds-multilayer-misses.md`、`memory/project_review_loop_recurring_patch_site.md` (5 件目)
 
 ---
 
@@ -274,8 +279,8 @@ ruff format --check src/agent/orchestrator.py tests/unit/agent/test_orchestrator
 
 実装に着手する前に、design.md 7 のオープン論点 3 件の方針を確定させる:
 
-- [ ] **論点 1**: fix_prompt 追記文言は約 6〜8 行 (requirements.md AC1 の「約 5 行」より長い) で進める方針を確定
-- [ ] **論点 2**: ケース 1 の summary 検証は `assert "修正" not in summary` 等のゆるい部分一致で進める / より厳密にする — どちらの方針か確定
-- [ ] **論点 3**: docs/functional-design.md 更新 (T7) を本タスクに含めるか / 別タスクに切るかを確定
+- [x] **論点 1**: fix_prompt 追記文言は 6〜8 行で進める方針を確定 (実装は最終的に約 12 行 — Codex レビュー反映で長くなった)
+- [x] **論点 2**: ケース 1 の summary 検証は `assert "修正" not in summary` 等のゆるい部分一致で進める方針を確定 (実装も該当)
+- [x] **論点 3**: docs/functional-design.md 更新 (T7) を本タスクに含める方針を確定 (T7 で実施)
 
 論点が確定したら T1 から順に着手する。
