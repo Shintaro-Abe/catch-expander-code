@@ -829,6 +829,19 @@ class Orchestrator:
 
         Returns:
             (review_result, final_deliverables) — 修正が適用された場合は最終版成果物を返す
+
+        Notes:
+            **再発パッチ密集地点**: 過去 5 件の steering で連続的にパッチされてきた高リスク領域。
+            修正前に以下を必読:
+
+            - ``obsidian/2026-04-29_codex-iterative-review-finds-multilayer-misses.md``
+              5 件パッチ履歴 + Codex 連続レビューによる多層検出パターン (4 観測点全発火を実機実証)
+            - ``obsidian/2026-04-30_case-A-pipeline-steering-draft.md``
+              6 件目候補の起票準備ドラフト (3 層代替案分析 + A-Pipe 採用根拠)
+            - ``obsidian/2026-04-26_symptomatic-fix-anti-pattern.md``
+              対症療法アンチパターン回避のチェックリスト (3 件目以降の修正で発動)
+
+            関連メモリ: ``memory/project_review_loop_recurring_patch_site.md``
         """
         current_deliverables = deliverables
         sources_text = json.dumps(sources, ensure_ascii=False)
