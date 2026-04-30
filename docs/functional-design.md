@@ -49,7 +49,7 @@ graph TB
 
 本システムは**マルチAIエージェント構成**を採用する。Claude Code CLI（Maxプラン）をエージェント実行基盤とし、`claude -p` のサブプロセス呼び出し（ThreadPoolExecutorで並列制御）で4種類の専門エージェントが協調して動作する。
 
-選定の詳細は `knowledge/agent-runtime-selection.md` を参照。
+選定の詳細は `obsidian/2026-04-04_agent-runtime-selection-claude-code-cli-on-ecs.md` を参照。
 
 ```
 マルチAIエージェント（ECS Container）
