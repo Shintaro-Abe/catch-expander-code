@@ -261,7 +261,13 @@ slack_sdk==3.33.0
 aws-lambda-powertools==3.4.0
 ```
 
-Lambda（`src/trigger/`）には `requirements.txt` を配置する。ECSエージェント（`src/agent/`）用の依存パッケージはデプロイ時に別途管理する（リポジトリ外）。
+各コンポーネントは自身のディレクトリ配下に `requirements.txt` を配置し、デプロイ時に SAM ビルドまたは Dockerfile が `COPY` する。リポジトリ内で管理されている `requirements.txt` は以下の通り。
+
+| ファイル | 用途 | 管理方針 |
+|---------|------|---------|
+| `src/trigger/requirements.txt` | Slack イベント受信 Lambda の依存 | SAM ビルド時に `CodeUri` 経由でインストール |
+| `src/token_monitor/requirements.txt` | Claude OAuth トークン失効監視 Lambda の依存 | SAM ビルド時に `CodeUri` 経由でインストール |
+| `src/agent/requirements.txt` | ECS エージェント（Fargate コンテナ）の依存 | `src/agent/Dockerfile` の `COPY` + `pip install` でイメージに焼き込む |
 
 ### 開発用依存
 
