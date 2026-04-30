@@ -244,6 +244,49 @@ events テーブルと既存テーブルの役割分離:
 
 execution_id は 3 テーブル間で共通キーとして機能する。
 
+### 2.5 execution_id の発番フロー (T0-7 確定)
+
+events 書き込み時の `execution_id` は **新規発番せず**、既存フローを再利用する。発番フロー (T0-7 で `src/trigger/app.py:324` を起点として確認済み):
+
+```
+Lambda Trigger (`src/trigger/app.py:324`)
+    execution_id = f"exec-{datetime}-{uuid.uuid4().hex[:8]}"
+        ↓ workflows テーブルに PK として put_item
+        ↓ ECS RunTask の env var "EXECUTION_ID" に渡す
+ECS Agent (`src/agent/main.py:96`)
+    execution_id = os.environ["EXECUTION_ID"]
+        ↓
+Orchestrator.run(execution_id, ...)
+    各サブステージで同じ ID を使用 (update_execution_status / put_sources / 全 emit)
+```
+
+→ events 書き込み時は **orchestrator / Lambda Trigger / FeedbackProcessor で受け取っている `execution_id` をそのまま `EventEmitter(execution_id)` に渡すだけで OK**。変換ロジック不要。
+
+#### 例外: token_monitor は合成 ID を使う
+
+token_monitor (`src/token_monitor/handler.py`) は EventBridge 12h スケジュールで起動する system-level Lambda であり、特定の Slack トピックや実行に紐づかないため `execution_id` を持たない。`oauth_refresh_completed` / `oauth_refresh_failed` イベント emit 時は **合成 ID** を使う:
+
+```python
+# src/token_monitor/handler.py
+import time
+from src.observability.event_emitter import EventEmitter
+
+emitter = EventEmitter(f"system-token-refresh-{int(time.time())}")
+emitter.emit("oauth_refresh_completed", {...})
+```
+
+#### events テーブル PK の prefix 規約
+
+execution_id は string として扱うため、prefix で発生源を区別できる:
+
+| Prefix | 発生源 | 用途 |
+|---|---|---|
+| `exec-{datetime}-{uuid}` | Slack トピック起源の通常実行 | UI 実行一覧の主役 |
+| `system-token-refresh-{epoch}` | token_monitor の OAuth refresh (Tier 1.4) | UI のエラー & 健全性画面 token_monitor タブで表示 |
+| (将来追加候補) `system-health-check-{epoch}` | 能動的 API ヘルスチェック (Tier 1.2 拡張案、未実装) | — |
+
+UI 側 (Backend Lambda の `list_executions`) は **デフォルトで `exec-` prefix のみを返す** ようフィルタし、`system-*` は別エンドポイント (`/api/v1/system-events`) または `?include_system=true` クエリパラメータで取得する設計を採用する (実装詳細は T1-11b で確定)。
+
 ---
 
 ## 3. バックエンド API 設計

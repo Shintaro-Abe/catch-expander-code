@@ -18,7 +18,7 @@
 - [x] T0-4: PR1/PR2 分割方針の合意 → **A (2 PR 構成、PR1 = Backend / PR2 = Frontend)** 採用
 - [x] T0-5: コスト試算前提の再検証 → **実態 月 20 件 (α レンジ)**、試算 $3〜5/月 (NFR-2 上限 $30 に対し十分余裕)
 - [x] T0-6: events テーブル GSI 3 種の必要性最終判断 → **A (3 GSI 保持)** 採用 (規模拡大時の耐性確保、コスト差は誤差レベル)
-- [ ] T0-7: 既存 `workflows.execution_id` と新規 events `execution_id` の整合性確認
+- [x] T0-7: 既存 `workflows.execution_id` と新規 events `execution_id` の整合性確認 → **完全一致** (`src/trigger/app.py:324` で発番、env var 経由で orchestrator まで同一 ID が流れる)。**追加対応**: token_monitor は execution_id を持たないため合成 ID `system-token-refresh-{epoch}` を使う規約を design.md に追記
 
 ### Phase 1: PR1 — バックエンド基盤 (events + API + 認証)
 
