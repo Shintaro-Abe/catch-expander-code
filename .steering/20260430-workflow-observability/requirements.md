@@ -91,11 +91,20 @@
 
 #### 機能面
 
-- **専用 Web UI** (5 画面: ダッシュボードトップ / 実行一覧 / 実行詳細 / レビュー品質 / エラー一覧)
+- **専用 Web UI** (6 画面: ダッシュボードトップ / 実行一覧 / 実行詳細 / レビュー品質 / エラー & 健全性 / フィードバック分析)
 - **Slack OAuth 認証** によるアクセス制御
-- **構造化イベント書き込み** (orchestrator / Lambda Trigger / sub-agents / fix loop / 格納処理)
+- **構造化イベント書き込み** (orchestrator / Lambda Trigger / sub-agents / fix loop / 格納処理 / token_monitor / feedback_processor)
 - **events ストア** (新規 DynamoDB テーブル、TTL 90 日)
-- **API エンドポイント群** (実行一覧 / 詳細 / メトリクス / イベント取得)
+- **API エンドポイント群** (実行一覧 / 詳細 / メトリクス / イベント取得 / コスト集計 / API 健全性 / フィードバック集計)
+- **拡張観測機能** (Tier 1 + Tier 2):
+  - Tier 1.1: コスト追跡 (Anthropic API トークンコスト + AWS インフラコスト + サブエージェント別内訳)
+  - Tier 1.2: API 連携健全性 (Notion / GitHub / Slack / Anthropic API の成功率・レイテンシ・rate limit ヒット)
+  - Tier 1.3: 段階別レイテンシ分解 (research / generator / reviewer / storage の処理時間内訳)
+  - Tier 1.4: token_monitor 健全性 (OAuth refresh 成否、トークン残存時間)
+  - Tier 2.1: ソース品質指標 (domain authority 分布 / freshness / diversity)
+  - Tier 2.2: レビュー指摘の再発パターン検出 (issue カテゴリ別集計、同種指摘の繰り返し)
+  - Tier 2.3: エラー再発パターン検出 (時系列クラスター、stage 別失敗頻度)
+  - Tier 2.4: F8 フィードバック集計 (絵文字反応、メンション返信、learned_preferences 更新頻度)
 
 #### インフラ面
 
@@ -147,6 +156,36 @@
 **I want** エラー一覧画面で直近 7 日のエラーを stack trace 付きでブラウズしたい、
 **So that** 原因調査の初動を 5 分以内に完了させ、利用者への影響範囲を判断できる。
 
+### US-6: コスト把握 (Tier 1.1)
+
+**As a** Catch-Expander の運用者として、
+**I want** Anthropic API トークン使用量と AWS インフラコストを 1 実行単位 / 月次集計で把握したい、
+**So that** Anthropic 月額コストの予算内収まりを確認し、コスト効率の悪い実行 (失敗続きで無駄遣い) を特定できる。
+
+### US-7: 連携 API の健全性監視 (Tier 1.2)
+
+**As a** Catch-Expander の運用者として、
+**I want** Notion / GitHub / Slack / Anthropic 各 API の呼び出し成功率・レスポンスタイム・rate limit ヒットを可視化したい、
+**So that** 過去観測した Cloudflare 429 等の事象 (`obsidian/2026-04-25_python-urllib-cloudflare-429-user-agent.md`) の再発を早期検知し、外部依存に起因する不具合を切り分けられる。
+
+### US-8: ボトルネックとソース品質の特定 (Tier 1.3 + 2.1)
+
+**As a** Catch-Expander の運用者として、
+**I want** 1 実行内の段階別レイテンシ分解 (research / generator / reviewer / storage の比率) と、収集された research source の品質指標 (domain authority / freshness / diversity) を確認したい、
+**So that** どの段階に時間がかかっているか、収集された情報源が信頼に足るかを質的に評価できる。
+
+### US-9: レビュー / エラーの再発パターン検出 (Tier 2.2 + 2.3)
+
+**As a** Catch-Expander の運用者として、
+**I want** 同種のレビュー指摘 / エラーが時系列で集中・反復していないかを検出したい、
+**So that** 構造的な問題 (プロンプト不備 / 外部依存の劣化等) を対症療法アンチパターンに陥る前に発見できる (`obsidian/2026-04-26_symptomatic-fix-anti-pattern.md` 連動)。
+
+### US-10: F8 フィードバック傾向の把握 (Tier 2.4)
+
+**As a** Catch-Expander の運用者として、
+**I want** F8 フィードバック (絵文字反応 / メンション返信) の集計と `learned_preferences` 更新頻度を観測したい、
+**So that** 利用者満足度の定量指標を把握し、F8 学習機構の効果を測定できる。
+
 ---
 
 ## 受け入れ条件 (AC)
@@ -164,6 +203,9 @@
 - [ ] 「成功率」「平均処理時間」「レビュー pass 率」「エラー率」がスコアカード形式で 1 ページ目に並ぶ
 - [ ] 期間切替 (24h / 7d / 30d) のセレクタがある
 - [ ] ページ初回表示は 1 秒以内 (cold start を除く、warm 状態)
+- [ ] **Tier 1.1 拡張**: 「期間内の総トークン使用量 / 総コスト概算 ($)」スコアカード + 月次推移折れ線グラフ
+- [ ] **Tier 1.1 拡張**: サブエージェント別 (researcher / generator / reviewer) のトークン使用量内訳 (積み上げ棒グラフ or ドーナツチャート)
+- [ ] **Tier 1.3 拡張**: 全実行平均の段階別レイテンシ分解 (積み上げ棒グラフで research / generator / reviewer / storage の比率)
 
 ### AC-3: 実行一覧画面
 
@@ -183,6 +225,10 @@
 - [ ] 「コンテキスト」セクションには research_results の sources (URL / title / excerpt) を Markdown 整形で表示
 - [ ] 「レビュー結果」セクションには各 fix loop iteration の issues / fixer notes / pass/fail を順次表示
 - [ ] 「成果物」セクションには Notion URL / GitHub URL / code_files の有無を表示
+- [ ] **Tier 1.1 拡張**: 上部メタ情報に「本実行のトークン使用量 / コスト概算」を表示
+- [ ] **Tier 1.3 拡張**: 「段階別レイテンシ分解」セクション — research / generator / reviewer / storage の処理時間 (絶対値 + 比率) を可視化 (横棒グラフ)
+- [ ] **Tier 2.1 拡張**: 「コンテキスト」セクションの sources 一覧に、各 source の `domain_authority` ラベル (公式 docs / 公式 blog / 第三者 blog / forum / unknown) と `published_at` (取得可能な場合) を追加
+- [ ] **Tier 2.1 拡張**: sources 一覧の上に「ソース品質サマリ」(domain authority 分布の小型ドーナツ + 平均 freshness + 重複ドメイン率) を表示
 
 ### AC-5: レビュー品質画面
 
@@ -190,26 +236,60 @@
 - [ ] fix loop 発火回数 (0 回 / 1 回 / 2 回) の分布が棒グラフで表示される
 - [ ] **`code_related_unfixed_count > 0` の実行を抽出した一覧** がテーブルで見える (案 A 起票判断のデータソース、`memory/project_review_loop_recurring_patch_site.md` 連動)
 - [ ] 各行から実行詳細画面へ遷移可能
+- [ ] **Tier 2.2 拡張**: コード関連 issue のカテゴリ別集計 (terraform_schema / iam_action / syntax / api_version / その他) が円グラフ or 横棒グラフで表示される
+- [ ] **Tier 2.2 拡張**: 「同種 issue の繰り返し検出」テーブル — 同一 fix loop 内で類似 issue が解消されないまま MAX_REVIEW_LOOPS に到達したケースをハイライト
+- [ ] **Tier 2.2 拡張**: トピックカテゴリ別 (技術 / 時事 等) のレビュー pass 率比較 (棒グラフ)
 
-### AC-6: エラー一覧画面
+### AC-6: エラー & 健全性画面 (Tier 1.2 + 1.4 + 2.3 統合)
+
+#### エラー一覧 (基本)
 
 - [ ] 直近 7 日のエラー (status=failed の実行 + ECS タスク異常終了等) が時系列で表示される
 - [ ] 各エラーは展開可能で、stack trace / error_message / 関連 execution_id が見える
 - [ ] エラータイプ別の集計 (例: ParseError / NotionAPIError / Cloudflare429 等) が円グラフで見える
 
+#### Tier 2.3 拡張: 再発パターン検出
+
+- [ ] 同種 `error_type` の集中発生検出 — 1 時間に 3 回以上発生したエラータイプをハイライト表示
+- [ ] stage 別 (notion_storage / generator / reviewer / etc.) の失敗頻度ランキング
+- [ ] エラー復旧成功率 (`is_recoverable=True` のうち実際にリトライ成功した割合)
+
+#### Tier 1.2 拡張: 連携 API 健全性タブ
+
+- [ ] Notion / GitHub / Slack / Anthropic 各 API の直近 7 日の呼び出し成功率がタブ別に表示される
+- [ ] 各 API のレスポンスタイム p50 / p95 / p99 が時系列折れ線グラフで表示される
+- [ ] **rate limit ヒット件数** (Cloudflare 429 / Slack rate limit / Anthropic 429 等) が時系列で表示される
+- [ ] 異常な失敗率 (>10%) の API はバナーで警告表示
+
+#### Tier 1.4 拡張: token_monitor 健全性タブ
+
+- [ ] 直近 30 日の OAuth refresh 成功 / 失敗の時系列が表示される
+- [ ] refresh 直前のトークン残存時間ヒストグラム (refresh タイミングの妥当性検証用)
+- [ ] refresh 失敗時の Slack 通知到達率 (フォールバック観測)
+- [ ] 直近の refresh 失敗があった場合、バナーで「ECS タスク認証エラーリスクあり」を警告
+
 ### AC-7: イベント観測ポイント (データソース要件)
 
 UI で表示する内容を支えるため、以下のイベントが events テーブルに永続化される必要がある (詳細スキーマは design.md):
 
+#### 基本イベント (元の 9 種)
+
 - [ ] `topic_received`: Slack トピック受領 (execution_id / topic / user_id (匿名化) / channel_id)
 - [ ] `workflow_planned`: ワークフロー自動生成完了 (execution_id / planned_subagents / topic_category / expected_deliverable_type)
-- [ ] `research_completed`: コンテキスト構築完了 (execution_id / sources_summary / total_tokens_used)
+- [ ] `research_completed`: コンテキスト構築完了 (execution_id / sources_summary / total_tokens_used) **+ Tier 2.1: 各 source に `domain_authority` / `published_at` を含める**
 - [ ] `subagent_started` / `subagent_completed` / `subagent_failed`: 各サブエージェントの開始/終了/失敗 (duration_ms / output_summary / tokens_used を含む)
-- [ ] `review_completed`: レビュー終了 (iteration / passed / issues_count / fixer_notes_count / **`code_related_unfixed_count`**)
+- [ ] `review_completed`: レビュー終了 (iteration / passed / issues_count / fixer_notes_count / **`code_related_unfixed_count`**) **+ Tier 2.2: 各 issue に `issue_category` (terraform_schema / iam_action / syntax / api_version / other) を含める**
 - [ ] `notion_stored` / `github_stored`: 格納完了 (URL / code_files の有無)
 - [ ] `slack_notified`: 完了通知送信
-- [ ] `execution_completed`: 実行全体終了 (status / total_duration_ms / total_tokens_used / final_deliverable_url)
+- [ ] `execution_completed`: 実行全体終了 (status / total_duration_ms / total_tokens_used / final_deliverable_url) **+ Tier 1.1: `total_cost_usd` (推計) を含める**
 - [ ] `error`: 例外発生 (error_type / error_message / stack_trace / 関連 execution_id)
+
+#### Tier 1/2 で追加するイベント (4 種)
+
+- [ ] **`api_call_completed`** (Tier 1.2): 外部 API 呼び出しの成否と所要時間 (subtype: `notion` / `github` / `slack` / `anthropic`、success / duration_ms / response_status_code / endpoint_path)
+- [ ] **`rate_limit_hit`** (Tier 1.2): rate limit 検出 (subtype + retry_after など)、Cloudflare 429 / Slack rate limit / Anthropic 429 を区別
+- [ ] **`oauth_refresh_completed`** / **`oauth_refresh_failed`** (Tier 1.4): token_monitor からの emit (status / token_remaining_seconds_before / error_message)
+- [ ] **`feedback_received`** (Tier 2.4): F8 フィードバック受信 (subtype: `emoji_reaction` / `mention_reply`、emoji 種別 / reply_text_summary / 関連 execution_id / `learned_preferences_updated` (bool))
 
 ### AC-8: パフォーマンス
 
@@ -234,6 +314,14 @@ UI で表示する内容を支えるため、以下のイベントが events テ
 - [ ] `docs/repository-structure.md` のツリーに `frontend/` (or 同等の) ディレクトリを追加
 - [ ] README に「ダッシュボード URL」と「アクセス方法」を記載
 
+### AC-11: フィードバック分析画面 (Tier 2.4)
+
+- [ ] 直近 30 日の F8 絵文字反応の分布 (👍 / 👎 / その他) が円グラフで表示される
+- [ ] 直近 30 日のメンション返信の件数推移が折れ線グラフで表示される
+- [ ] `learned_preferences` の更新頻度が時系列で表示される
+- [ ] フィードバックを受けた成果物の execution_id 一覧 (実行詳細へリンク) がテーブルで見える
+- [ ] フィードバックに紐づくトピックカテゴリ別の満足度 (例: 技術 vs 時事 で 👍 比率) を比較できる
+
 ---
 
 ## 非機能要件 (NFR)
@@ -254,14 +342,69 @@ UI で表示する内容を支えるため、以下のイベントが events テ
   - データ転送: <$5
 - 1 ヶ月運用後にコスト実測で見直し
 
-### NFR-3: セキュリティ
+### NFR-3: セキュリティ (個人利用ベースライン)
 
-- 構造化イベントには **以下を含めない**:
+#### 前提とする脅威モデル
+
+- **利用者は単独 (本人のみ)**
+- **Slack workspace は個人開発用** (機密業務情報は含まない前提)
+- **コンプライアンス要件なし** (監査ログ・SOC2 等不要)
+- **運用期間 1 年以上**
+- 守るべき脅威: 「外部攻撃者による不正アクセス」「自身の credentials 漏洩 (PC 紛失等)」「AWS 課金爆発」「長期運用での鍵陳腐化」に絞る
+
+#### 実装するセキュリティ対策 (S1〜S4 + 既存)
+
+**[既存維持] 基本的な機密性管理**
+
+- 構造化イベントには以下を含めない:
   - Slack Bot Token / Notion Token / GitHub PAT (Secrets Manager 経由のみで扱う)
-  - 利用者の Slack user ID は **匿名化** (ハッシュ化、events table には hash のみ保存)
-- raw `topic` は events に含むが、PII を含む可能性があるため、機密プロジェクトで使う場合の注意点として `docs/development-guidelines.md` に追記
-- API Gateway は Slack OAuth トークン検証必須、未認証リクエストは 401
-- CloudFront はカスタムヘッダー (Origin Verify) で API Gateway のみが応答するよう制限
+  - 利用者の Slack user ID は SHA-256 ハッシュ化、events には hash のみ保存
+- API Gateway は Slack OAuth トークン検証必須、未認証は 401
+- CloudFront はカスタムヘッダ (`X-Origin-Verify`、**静的値で許容**) で API Gateway 直叩きを制限
+
+**[S1] CSP / セキュリティヘッダー設定 (CloudFront Response Headers Policy)**
+
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'`
+- `X-Frame-Options: DENY`
+- `X-Content-Type-Options: nosniff`
+- `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+- `Referrer-Policy: no-referrer`
+
+**[S2] IAM 最小権限ポリシー**
+
+- 各 Lambda は必要最小限のアクション + リソース ARN に限定
+- `dynamodb:*` / `secretsmanager:*` / `s3:*` 等の **`*` ワイルドカード禁止**
+- Read 系 Lambda: `dynamodb:Query` / `GetItem` のみ、特定テーブル ARN
+- Auth 系 Lambda: 該当 Secrets Manager の特定 ARN のみ
+- ECS Task Role: events テーブルへの `PutItem` のみ (既存の workflows / deliverables への権限は変更しない)
+
+**[S3] OAuth state の単一回限り化 + フィンガープリントバインド**
+
+- `auth_login` で生成した state を DDB に保存する際、IP アドレス + User-Agent のハッシュも一緒に記録
+- `auth_callback` で受け取った state を照合する際、IP / UA も一致確認
+- 一致したら state を **照合直後に DDB から削除** (一回限り)
+- 不一致または既に削除済みの state は 400 応答
+
+**[S4] AWS 課金 Budget アラート + 年 1 回の手動鍵ローテーション**
+
+- AWS Budgets で **月額 $30 の警告アラート** を設定 (Slack 個人 channel に通知)
+- 運用手順 (`docs/development-guidelines.md` に追加) に以下を明記:
+  - **JWT 署名鍵** を年 1 回 (毎年 1 月) 手動ローテーション
+  - **Slack OAuth client_secret** を年 1 回手動ローテーション
+  - **Slack workspace の MFA を有効化** (アクセス防御の最大要素)
+  - **PC 紛失時** は Slack 設定画面からセッションを revoke
+  - ダッシュボード URL を **公開リポジトリのソースコードに書かない** (難読化のため)
+
+#### スキップする対策 (個人利用では過剰)
+
+- **API Gateway / Lambda Authorizer のレート制限**: 自分しか使わない / AWS Budget で課金爆発は別経路防御
+- **JWT blacklist (ログアウト時の token 即時失効)**: 自分のみ利用、24h セッション expire で受容
+- **CloudFront Origin Verify の自動ローテーション**: 静的値で十分
+- **PII フィルタリング**: topic は自分の入力なので不要
+- **events 書き込み失敗時のエラーログ payload マスキング**: 自分の Slack 内容なので受容
+- **監査ログ / Dependabot / SRI 等の運用機能**: 個人開発で過剰投資
+
+これらは将来チーム利用化や業務利用に切り替える際に **追加要件として再評価** する (本要求書「将来追加候補」セクション参照)。
 
 ### NFR-4: 可用性
 
@@ -310,6 +453,31 @@ UI で表示する内容を支えるため、以下のイベントが events テ
 8. **デザインシステム選定**: shadcn/ui / Material UI / Chakra UI / カスタム — UI ライブラリの最終選定
 9. **トピック/コンテキスト中の PII 取り扱い**: Slack 投稿に含まれる可能性のある個人情報のフィルタリング方針 (events 書き込み時にマスクするか、UI 表示時に警告のみか)
 10. **コスト見積もり検証**: 月額 $30 以内の試算根拠を SAM deploy 直前に再検証
+11. **Anthropic API 単価設定** (Tier 1.1): モデル別単価をどこで管理するか (環境変数 / Secrets Manager / コード固定)。料金体系変更時の追従コスト評価
+12. **issue カテゴリ簡易分類のヒューリスティック** (Tier 2.2): キーワードマッチで `terraform_schema` / `iam_action` / `syntax` / `api_version` 等に分類する精度許容ライン
+13. **domain authority 分類リスト** (Tier 2.1): 公式 docs / 公式 blog / 第三者 blog の判定ルール (URL ホワイトリスト / 動的判定)
+
+---
+
+## 将来追加候補の監視観点 (Tier 3-4)
+
+本 MVP には含まないが、運用が固まった後に独立タスクで検討する候補:
+
+### Tier 3: 検討余地あり (要件次第)
+
+- **利用パターン分析**: DAU (distinct user_id_hash 数) / 時間帯ヒートマップ / トピックカテゴリ分布 / F9 履歴コマンド使用回数
+- **認証・セキュリティ監視**: Slack OAuth callback 失敗回数 / JWT 検証失敗回数 / workspace 境界違反 / API rate limit 自身ヒット
+- **同時実行数 / 並列度モニタ**: 月間実行数が 100 件超に増えた段階で必要
+
+### Tier 4: 規模拡大時の候補
+
+- **異常検知 (sudden spike detection)**: ML ベースの異常検知 / アラート
+- **A/B テスト基盤**: モデル / プロンプトバージョン比較
+- **容量計画 / 予測メトリクス**: AWS 制限到達予測
+
+採用判断のトリガー:
+- Tier 3 → チーム利用化、月次実行数 50+ への成長、セキュリティ監査要件
+- Tier 4 → 月次実行数 500+、複数プロンプトバージョン並行運用、本番事故を契機
 
 ---
 

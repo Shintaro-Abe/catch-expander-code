@@ -433,6 +433,209 @@ def lambda_handler(event, context):
 - レスポンスは 5 分キャッシュ (cookie ヘッダの hash でキー化)
 - 各 Lambda の `event.requestContext.authorizer.lambda` で認証情報を受け取る
 
+### 4.6 軽量セキュリティ対策の実装詳細 (S1〜S4)
+
+requirements.md NFR-3 で確定した「個人利用ベースライン」の実装詳細。
+
+#### 4.6.1 [S1] CSP / セキュリティヘッダー (CloudFront Response Headers Policy)
+
+CloudFront Distribution に **Response Headers Policy** をアタッチ。SAM template 例:
+
+```yaml
+DashboardResponseHeadersPolicy:
+  Type: AWS::CloudFront::ResponseHeadersPolicy
+  Properties:
+    ResponseHeadersPolicyConfig:
+      Name: catch-expander-dashboard-security-headers
+      SecurityHeadersConfig:
+        ContentSecurityPolicy:
+          ContentSecurityPolicy: "default-src 'self'; script-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+          Override: true
+        FrameOptions:
+          FrameOption: DENY
+          Override: true
+        ContentTypeOptions:
+          Override: true
+        StrictTransportSecurity:
+          AccessControlMaxAgeSec: 31536000
+          IncludeSubdomains: true
+          Override: true
+        ReferrerPolicy:
+          ReferrerPolicy: no-referrer
+          Override: true
+```
+
+- `style-src 'self' 'unsafe-inline'` は Tailwind / shadcn/ui の inline style 対応 (CSS-in-JS は使わない方針なら今後 `'unsafe-inline'` を外せる)
+- `connect-src 'self'` で外部 API への通信を制限 (XSS が成立しても外部ドメインへの cookie 送信を防ぐ)
+
+#### 4.6.2 [S2] IAM 最小権限ポリシーの具体例
+
+各 Lambda の IAM ポリシーを具体化:
+
+```yaml
+# Read 系 Lambda (例: list_executions)
+Policies:
+  - DynamoDBReadPolicy:
+      TableName: !Ref DashboardEventsTable
+  - DynamoDBReadPolicy:
+      TableName: !Ref WorkflowsTable  # 既存
+  - DynamoDBReadPolicy:
+      TableName: !Ref DeliverablesTable  # 既存
+  # `dynamodb:Scan` は不要のため明示的に許可しない
+
+# Auth 系 Lambda (例: auth_callback)
+Policies:
+  - Statement:
+      - Effect: Allow
+        Action: secretsmanager:GetSecretValue
+        Resource:
+          - !Ref DashboardSlackOAuthSecret
+          - !Ref DashboardJwtKeySecret
+  - DynamoDBCrudPolicy:
+      TableName: !Ref DashboardOAuthStateTable
+
+# ECS Task Role 拡張 (events 書き込み)
+- Statement:
+    - Effect: Allow
+      Action: dynamodb:PutItem  # PutItem のみ、UpdateItem/DeleteItem は不要
+      Resource: !GetAtt DashboardEventsTable.Arn
+```
+
+- `*` ワイルドカードはアクションでもリソースでも使用しない
+- SAM `Policies` 簡易テンプレ (`DynamoDBReadPolicy` 等) を使うことで宣言的に最小権限を確保
+- IAM Access Analyzer を有効化して未使用権限を継続監視 (運用フェーズで実施)
+
+#### 4.6.3 [S3] OAuth state の単一回限り化 + フィンガープリントバインド
+
+`auth_login` での state 生成と保存:
+
+```python
+# auth_login
+import secrets
+import hashlib
+
+def lambda_handler(event, context):
+    state = secrets.token_urlsafe(32)
+    # フィンガープリント = IP + User-Agent のハッシュ
+    ip = event["requestContext"]["http"]["sourceIp"]
+    ua = event["headers"].get("user-agent", "")
+    fingerprint = hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()
+
+    # DDB に保存 (TTL 10 分)
+    oauth_state_table.put_item(Item={
+        "state": state,
+        "fingerprint": fingerprint,
+        "ttl": int(time.time()) + 600,
+    })
+
+    return redirect_to_slack_oauth(state)
+```
+
+`auth_callback` での照合と即時削除:
+
+```python
+# auth_callback
+def lambda_handler(event, context):
+    state = event["queryStringParameters"]["state"]
+    ip = event["requestContext"]["http"]["sourceIp"]
+    ua = event["headers"].get("user-agent", "")
+    fingerprint = hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()
+
+    # DDB から取得
+    record = oauth_state_table.get_item(Key={"state": state}).get("Item")
+    if not record:
+        return error_response(400, "Invalid or expired state")
+
+    # フィンガープリント照合
+    if record["fingerprint"] != fingerprint:
+        return error_response(400, "Fingerprint mismatch")
+
+    # 単一回限り: 照合直後に DDB から削除
+    oauth_state_table.delete_item(Key={"state": state})
+
+    # 以下、Slack OAuth 続行 ...
+```
+
+- state 一致 + fingerprint 一致 + 単一回限りの 3 段階で OAuth callback CSRF / replay を防御
+- IP が変わるモバイル利用では誤検知の可能性あり (公衆 Wi-Fi → 4G の切り替え等)。個人利用前提では受容
+
+#### 4.6.4 [S4] AWS Budget アラート + 年 1 回の手動鍵ローテーション
+
+**AWS Budget アラート** (SAM template に追加):
+
+```yaml
+DashboardBudgetAlert:
+  Type: AWS::Budgets::Budget
+  Properties:
+    Budget:
+      BudgetName: catch-expander-dashboard-monthly
+      BudgetLimit:
+        Amount: 30
+        Unit: USD
+      TimeUnit: MONTHLY
+      BudgetType: COST
+      CostFilters:
+        TagKeyValue:
+          - "user:Project$catch-expander-dashboard"
+    NotificationsWithSubscribers:
+      - Notification:
+          ComparisonOperator: GREATER_THAN
+          NotificationType: ACTUAL
+          Threshold: 80
+          ThresholdType: PERCENTAGE
+        Subscribers:
+          - SubscriptionType: SNS
+            Address: !Ref DashboardBudgetAlertTopic
+```
+
+- $30 の 80% (= $24) で警告通知。実害が出る前に検知
+- SNS Topic から Slack 個人 channel に Lambda 経由で通知 (既存 Slack 通知パスを再利用)
+- Budget アラートは無料 (AWS Budgets の最初の 2 つは無料枠)
+
+**年 1 回の手動ローテーション運用手順** (`docs/development-guidelines.md` に追加):
+
+```markdown
+## ダッシュボード運用手順
+
+### 年次セキュリティメンテナンス (毎年 1 月実施)
+
+1. **JWT 署名鍵のローテーション**
+   - AWS CLI: `aws secretsmanager rotate-secret --secret-id catch-expander/dashboard-jwt-key`
+     (or 手動で `update-secret` で新ランダム値を投入)
+   - 既存セッションは旧鍵で発行されているため、24h 以内にすべて自然 expire
+   - ローテーション後にダッシュボードへ再ログイン (再認証フロー実行)
+
+2. **Slack OAuth client_secret のローテーション**
+   - Slack App 管理画面 (`https://api.slack.com/apps/<app_id>`) で client_secret を再生成
+   - AWS Secrets Manager の `catch-expander/dashboard-slack-oauth` の `client_secret` を更新
+
+3. **Slack workspace の MFA 確認**
+   - Slack の設定で MFA が ON になっていることを確認 (Slack OAuth 経由のアクセス強度の最大要素)
+
+4. **AWS Budget アラート閾値の見直し**
+   - 過去 1 年の実績を踏まえて月額上限 ($30) を調整するか判断
+
+### PC 紛失時の対処
+
+1. Slack 設定画面 (`Slack Workspace Settings → Account → Sessions`) からすべてのセッションを revoke
+2. JWT 署名鍵を即時ローテーション (上記手順 1)
+3. AWS CloudFront のアクセスログを確認し、紛失後の不正アクセスがないかチェック
+```
+
+- ダッシュボード URL を **公開 GitHub リポジトリの README やソースコード** に書かない (難読化のため `.env` で管理)
+
+#### 4.6.5 スキップする対策の明示 (将来再評価候補)
+
+requirements.md NFR-3 で挙げたスキップ対策は本設計書でも実装しない。将来チーム利用化や業務利用時の再評価候補として記録:
+
+| 将来追加候補 | 再評価トリガー |
+|---|---|
+| API Gateway / Lambda Authorizer のレート制限 | 利用者数増 (>2 人) |
+| JWT blacklist (ログアウト時即時失効) | チーム利用 / 共有 PC での利用 |
+| CloudFront Origin Verify ローテーション | 業務利用 / コンプライアンス要件発生 |
+| PII フィルタリング | 業務 Slack workspace での利用 |
+| 監査ログ / Dependabot / SRI | コンプライアンス要件発生 |
+
 ---
 
 ## 5. フロントエンド設計

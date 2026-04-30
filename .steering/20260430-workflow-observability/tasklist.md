@@ -12,28 +12,32 @@
 
 ### Phase 0: 前提条件確認
 
-- [ ] T0-1: Slack OAuth クライアント作成方針の決定
-- [ ] T0-2: CloudFront カスタムドメインの要否決定
-- [ ] T0-3: Claude Design アクセス確認
-- [ ] T0-4: PR1/PR2 分割方針の合意
-- [ ] T0-5: コスト試算前提の再検証
-- [ ] T0-6: events テーブル GSI 3 種の必要性最終判断
+- [x] T0-1: Slack OAuth クライアント作成方針の決定 → **案 A (新規 Slack App)** 採用 (T1-14 デプロイ前に作成)
+- [x] T0-2: CloudFront カスタムドメインの要否決定 → **A (CloudFront デフォルトドメイン)** 採用、将来カスタムドメイン化は alternate domain で後付け可
+- [x] T0-3: Claude Design アクセス確認 → **Claude Max プラン保有 + アクセス可能** 確認済 (動作確認は T2-2 / T2-3 で実機検証)
+- [x] T0-4: PR1/PR2 分割方針の合意 → **A (2 PR 構成、PR1 = Backend / PR2 = Frontend)** 採用
+- [x] T0-5: コスト試算前提の再検証 → **実態 月 20 件 (α レンジ)**、試算 $3〜5/月 (NFR-2 上限 $30 に対し十分余裕)
+- [x] T0-6: events テーブル GSI 3 種の必要性最終判断 → **A (3 GSI 保持)** 採用 (規模拡大時の耐性確保、コスト差は誤差レベル)
 - [ ] T0-7: 既存 `workflows.execution_id` と新規 events `execution_id` の整合性確認
 
 ### Phase 1: PR1 — バックエンド基盤 (events + API + 認証)
 
 - [ ] T1-1: 共通ヘルパー `src/observability/event_emitter.py` を実装
-- [ ] T1-2: orchestrator (`src/agent/orchestrator.py`) に 9 観測ポイントの emit 呼び出しを追加
+- [ ] T1-2: orchestrator (`src/agent/orchestrator.py`) に **基本 9 観測ポイント** の emit 呼び出しを追加
+- [ ] **T1-2b**: orchestrator + storage clients に **Tier 1/2 拡張イベント (4 種)** の emit 呼び出しを追加 (`api_call_completed` / `rate_limit_hit` / `feedback_received`)
 - [ ] T1-3: Lambda Trigger (`src/trigger/app.py`) に `topic_received` emit を追加
-- [ ] T1-4: SAM template に events テーブル + GSI + TTL を定義
-- [ ] T1-5: SAM template に OAuth state 一時保存テーブルを定義
+- [ ] **T1-3b**: token_monitor (`src/token_monitor/handler.py`) に `oauth_refresh_completed` / `oauth_refresh_failed` emit を追加 (Tier 1.4)
+- [ ] T1-4: SAM template に events テーブル + GSI 3 種 + TTL を定義
+- [ ] T1-5: SAM template に OAuth state 一時保存テーブルを定義 (PK = state、`fingerprint` 属性も保存、TTL 10 分)
 - [ ] T1-6: SAM template に Secrets Manager (JWT key + Slack OAuth) を定義
 - [ ] T1-7: SAM template に API Gateway HTTP API を定義
 - [ ] T1-8: Lambda Authorizer の実装 + SAM 定義
 - [ ] T1-9: Auth 系 Lambda (login / callback / logout / me) の実装 + SAM 定義
+- [ ] **T1-9b**: OAuth state の **単一回限り化** + **IP/UA フィンガープリントバインド** を auth_login / auth_callback に組み込み (S3 対応)
 - [ ] T1-10: 実行データ系 Lambda (list_executions / get_execution / get_execution_events) の実装 + SAM 定義
 - [ ] T1-11: メトリクス系 Lambda (get_metrics_summary / get_review_quality / get_errors) の実装 + SAM 定義
-- [ ] T1-12: 既存 IAM ロールに events テーブル PutItem 権限追加
+- [ ] **T1-11b**: Tier 1/2 拡張メトリクス系 Lambda (get_cost_summary / get_api_health / get_token_monitor_health / get_feedback_aggregation) の実装 + SAM 定義
+- [ ] T1-12: 既存 IAM ロールに events テーブル PutItem 権限追加 + **各 Lambda の IAM ポリシーで `*` ワイルドカード使用禁止 / リソース ARN 限定を明示** (S2 対応)
 - [ ] T1-13: バックエンドユニットテスト追加
 - [ ] T1-14: dev 環境への `sam deploy` + 手動 E2E (Slack OAuth ログインまで)
 - [ ] T1-15: Codex 連続レビュー (2〜3 回、収束まで)
@@ -43,20 +47,22 @@
 
 - [ ] T2-1: `frontend/` プロジェクト初期化 (Vite + React + TS + Tailwind + shadcn/ui)
 - [ ] T2-2: Claude Design でデザインシステム確立 (色 / タイポ / コンポーネント)
-- [ ] T2-3: 画面 1 (ダッシュボードトップ) — Claude Design モック → handoff → Claude Code 実装
+- [ ] T2-3: 画面 1 (ダッシュボードトップ) — Claude Design モック → handoff → Claude Code 実装 / **Tier 1.1/1.3 ウィジェット (コスト / サブエージェント別内訳 / 平均レイテンシ分解) 含む**
 - [ ] T2-4: 画面 2 (実行一覧) — Claude Design モック → handoff → Claude Code 実装
-- [ ] T2-5: 画面 3 (実行詳細) — Claude Design モック → handoff → Claude Code 実装
-- [ ] T2-6: 画面 4 (レビュー品質) — Claude Design モック → handoff → Claude Code 実装
-- [ ] T2-7: 画面 5 (エラー一覧) — Claude Design モック → handoff → Claude Code 実装
+- [ ] T2-5: 画面 3 (実行詳細) — Claude Design モック → handoff → Claude Code 実装 / **Tier 1.1/1.3/2.1 拡張 (本実行コスト + 段階別レイテンシ + ソース品質指標) 含む**
+- [ ] T2-6: 画面 4 (レビュー品質) — Claude Design モック → handoff → Claude Code 実装 / **Tier 2.2 拡張 (issue カテゴリ別集計 + 同種 issue 繰り返し検出 + トピック別 pass 率) 含む**
+- [ ] T2-7: 画面 5 (エラー & 健全性) — Claude Design モック → handoff → Claude Code 実装 / **Tier 1.2/1.4/2.3 統合 (API 健全性タブ + token_monitor タブ + 再発検出) 含む**
+- [ ] **T2-7b**: 画面 6 (フィードバック分析) — Claude Design モック → handoff → Claude Code 実装 (Tier 2.4、AC-11)
 - [ ] T2-8: 認証フローの SPA 統合 (auth/me ポーリング、401 ハンドリング、ログイン/ログアウト)
-- [ ] T2-9: API client + TanStack Query + Zustand 統合
+- [ ] T2-9: API client + TanStack Query + Zustand 統合 (画面別ポーリング戦略を実装: 集計画面 60s stale / 一覧 30s polling / 進行中詳細 5s polling)
 - [ ] T2-10: ルーティング統合 (React Router 6)
 - [ ] T2-11: アクセシビリティ補強 (ARIA、キーボードナビ、コントラスト) とレスポンシブ調整
 - [ ] T2-12: フロントエンドユニットテスト (Vitest + React Testing Library)
 - [ ] T2-13: GitHub Actions ワークフロー `build-frontend.yml` 作成
-- [ ] T2-14: SAM template に S3 / CloudFront / OAC を追加
-- [ ] T2-15: ドキュメント更新 (architecture / functional-design / glossary / repository-structure / credential-setup / README)
-- [ ] T2-16: dev 環境デプロイ + 手動 E2E (5 画面ブラウズ)
+- [ ] T2-14: SAM template に S3 / CloudFront / OAC を追加 + **CloudFront Response Headers Policy (CSP / X-Frame-Options / HSTS / etc.) を追加** (S1 対応)
+- [ ] **T2-14b**: SAM template に **AWS Budget アラート ($30/月、80% 警告)** + SNS → Slack 通知統合を追加 (S4 対応)
+- [ ] T2-15: ドキュメント更新 (architecture / functional-design / glossary / repository-structure / credential-setup / README) + **`docs/development-guidelines.md` に「ダッシュボード運用手順」(年次ローテーション / PC 紛失対処 / Slack workspace MFA 推奨) を追加** (S4 対応)
+- [ ] T2-16: dev 環境デプロイ + 手動 E2E (6 画面ブラウズ)
 - [ ] T2-17: Codex 連続レビュー (2〜3 回、収束まで)
 - [ ] T2-18: PR2 commit + push
 
@@ -774,18 +780,28 @@ PR2 の差分に対し独立 LLM レビューを連続で回す。
 
 | requirements.md AC | 対応する tasklist タスク |
 |---|---|
-| AC-1: 認証 / アクセス制御 | T1-8, T1-9, T2-8, T2-10 |
-| AC-2: ダッシュボードトップ画面 | T1-11 (metrics_summary), T2-3 |
+| AC-1: 認証 / アクセス制御 | T1-8, T1-9, T1-9b (S3), T2-8, T2-10 |
+| AC-2: ダッシュボードトップ画面 (Tier 1.1/1.3 拡張含む) | T1-11 (metrics_summary), T1-11b (cost), T2-3 |
 | AC-3: 実行一覧画面 | T1-10 (list_executions), T2-4 |
-| AC-4: 実行詳細画面 | T1-10 (get_execution_events), T2-5 |
-| AC-5: レビュー品質画面 | T1-11 (review_quality), T2-6 |
-| AC-6: エラー一覧画面 | T1-11 (get_errors), T2-7 |
-| AC-7: イベント観測ポイント | T1-1, T1-2, T1-3 |
+| AC-4: 実行詳細画面 (Tier 1.1/1.3/2.1 拡張含む) | T1-10 (get_execution_events), T1-11b, T2-5 |
+| AC-5: レビュー品質画面 (Tier 2.2 拡張含む) | T1-11 (review_quality), T2-6 |
+| AC-6: エラー & 健全性画面 (Tier 1.2/1.4/2.3 統合含む) | T1-11 (get_errors), T1-11b (api_health, token_monitor_health), T2-7 |
+| AC-7: イベント観測ポイント (Tier 1/2 イベント含む) | T1-1, T1-2, T1-2b, T1-3, T1-3b |
 | AC-8: パフォーマンス | T1-14, T2-16 (デプロイ後の手動確認) |
 | AC-9: 既存挙動の回帰なし | T1-13 (既存テスト pass)、T2-12 |
-| AC-10: ドキュメント更新 | T2-15 |
+| AC-10: ドキュメント更新 (運用手順含む) | T2-15 |
+| AC-11: フィードバック分析画面 (Tier 2.4) | T1-11b (feedback_aggregation), T2-7b |
 
-すべての T が完了 = すべての AC が満たされる、の整合を保つ。
+### NFR との対応 (セキュリティ軽量ベースライン S1〜S4)
+
+| requirements.md NFR-3 | 対応する tasklist タスク |
+|---|---|
+| S1: CSP / セキュリティヘッダー | T2-14 (CloudFront Response Headers Policy 追加) |
+| S2: IAM 最小権限 | T1-12 (各 Lambda の `*` 禁止 + ARN 限定) |
+| S3: OAuth state 単一回限り + フィンガープリント | T1-9b (auth_login / auth_callback 組み込み) |
+| S4: AWS Budget + 年次手動ローテーション | T2-14b (Budget アラート), T2-15 (運用手順) |
+
+すべての T が完了 = すべての AC + S1〜S4 が満たされる、の整合を保つ。
 
 ---
 
