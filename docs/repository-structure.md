@@ -161,7 +161,7 @@ Claude Code CLIを使ってマルチAIエージェントを実行するメイン
 | ルール | 説明 |
 |--------|------|
 | Lambda関数は `src/trigger/` に配置 | SAMテンプレートの `CodeUri` で参照 |
-| ECSアプリケーションは `src/agent/` に配置 | Dockerfileでビルド（Dockerfileはリポジトリ外管理） |
+| ECSアプリケーションは `src/agent/` に配置 | `src/agent/Dockerfile` で管理（`sam build` 時に Docker daemon が読み取る） |
 | 外部API連携は機能別サブディレクトリに分離 | `storage/`, `state/`, `notify/` |
 
 ### IaC
