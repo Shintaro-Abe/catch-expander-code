@@ -642,13 +642,43 @@ Resources:
   # ==============================================================
   # Dashboard API (Observability Web UI)
   # ==============================================================
+  DashboardAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-authorizer
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/authorizer/
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          JWT_KEY_SECRET_ARN: !Ref DashboardJwtKeySecret
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref DashboardJwtKeySecret
+
   DashboardApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       Description: Dashboard REST API for Catch-Expander observability
       StageName: $default
       # CORS は不要: CloudFront が /api/* を proxy するため同一オリジン経路のみ
-      # DefaultAuthorizer は T1-8 の DashboardAuthorizerFunction 実装後に追加
+      Auth:
+        DefaultAuthorizer: DashboardAuthorizer
+        Authorizers:
+          DashboardAuthorizer:
+            FunctionArn: !GetAtt DashboardAuthorizerFunction.Arn
+            AuthorizerPayloadFormatVersion: "2.0"
+            EnableSimpleResponses: true
+            Identity:
+              ReauthorizeEvery: 300
+              Headers:
+                - Cookie
 
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
