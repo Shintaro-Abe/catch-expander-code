@@ -609,6 +609,17 @@ Resources:
               Resource:
                 - !Ref ClaudeOAuthSecretArn
 
+  # ==============================================================
+  # Dashboard API (Observability Web UI)
+  # ==============================================================
+  DashboardApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: Dashboard REST API for Catch-Expander observability
+      StageName: $default
+      # CORS は不要: CloudFront が /api/* を proxy するため同一オリジン経路のみ
+      # DefaultAuthorizer は T1-8 の DashboardAuthorizerFunction 実装後に追加
+
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
 
