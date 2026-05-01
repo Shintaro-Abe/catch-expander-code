@@ -101,6 +101,19 @@ Catch-Expander/
 │       ├── conftest.py                # _load_prompt モック（プロンプトファイル不在対応）
 │       └── test_workflow.py
 │
+├── frontend/                          # ダッシュボード SPA（Vite + React + TypeScript）
+│   ├── index.html
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   └── src/
+│       ├── api/                       # API クライアント・エンドポイント定義・型
+│       ├── components/                # UI コンポーネント（shadcn/ui + カスタム）
+│       ├── contexts/                  # AuthContext（JWT cookie セッション管理）
+│       ├── lib/                       # ユーティリティ（時刻フォーマット等）
+│       ├── routes/                    # ページレベルのルートコンポーネント
+│       └── test/                      # Vitest セットアップ
+│
 └── .github/                           # GitHub設定
     └── workflows/
 ```
@@ -153,6 +166,19 @@ Claude Code CLIを使ってマルチAIエージェントを実行するメイン
 |----------------|------|
 | `unit/` | 各モジュールの単体テスト |
 | `integration/` | ワークフロー全体の統合テスト |
+
+### `frontend/` — ダッシュボード SPA
+
+Vite 8 + React 19 + TypeScript で構築したオブザービリティダッシュボード。SAM ではなく `aws s3 sync` + CloudFront でデプロイする。
+
+| サブディレクトリ | 役割 |
+|----------------|------|
+| `src/api/` | TanStack Query フック・エンドポイント定義・レスポンス型 |
+| `src/components/` | shadcn/ui ベースの共通 UI コンポーネント |
+| `src/contexts/` | `AuthContext`（`/api/v1/auth/me` ポーリング、5 分間隔） |
+| `src/lib/` | 時刻フォーマット等のユーティリティ |
+| `src/routes/` | ページコンポーネント（DashboardHome / ExecutionList / ExecutionDetail / ReviewQuality / ErrorList） |
+| `src/test/` | Vitest グローバルセットアップ |
 
 ## 4. ファイル配置ルール
 

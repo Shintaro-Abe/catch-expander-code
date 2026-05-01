@@ -8,11 +8,17 @@
 graph TB
     User[ユーザー] -->|トピック送信| Slack[Slack]
     User -->|フィードバック投稿<br/>完了通知スレッドへ| Slack
-    Slack -->|イベント通知| Gateway[API Gateway]
+    Slack -->|イベント通知| Gateway[API Gateway<br/>REST API]
     Gateway -->|リクエスト転送| Lambda[Lambda<br/>トリガー関数]
     Lambda -->|ACK応答| Slack
     Lambda -->|RunTask<br/>TASK_TYPE=topic| Orch
     Lambda -->|RunTask<br/>TASK_TYPE=feedback| FP
+
+    Browser[ブラウザ<br/>管理者] -->|/ SPA| CF[CloudFront]
+    CF -->|静的配信| S3[S3<br/>SPA]
+    Browser -->|/api/*| CF
+    CF -->|プロキシ| DashAPI[API Gateway<br/>HTTP API]
+    DashAPI --> DashLambda[Lambda<br/>ダッシュボード API]
 
     subgraph MultiAgent [マルチAIエージェント / ECS Container]
         Orch[オーケストレーター<br/>エージェント]
@@ -26,6 +32,7 @@ graph TB
 
     Orch -->|プロファイル取得<br/>（learned_preferences 含む）| ProfileDB[(プロファイルDB<br/>DynamoDB)]
     FP -->|preferences 更新| ProfileDB
+    DashLambda -->|読み取り| ProfileDB
     Researcher1 -->|Web検索| SearchAPI[Web検索API]
     Researcher2 -->|Web検索| SearchAPI
     ResearcherN -->|Web検索| SearchAPI
@@ -43,6 +50,8 @@ graph TB
     style Generator fill:#66bb6a,color:#fff
     style Reviewer fill:#ef5350,color:#fff
     style FP fill:#ab47bc,color:#fff
+    style CF fill:#00acc1,color:#fff
+    style S3 fill:#00acc1,color:#fff
 ```
 
 ### マルチAIエージェント構成
@@ -964,3 +973,30 @@ src/agent/feedback/
     ユースケースのセクションは含まれていません」と記載
   - Slack通知に⚠️マークで失敗を明示
 ```
+
+## 9. ダッシュボード SPA
+
+ブラウザベースのオブザービリティダッシュボード。CloudFront 経由で S3 から配信される React SPA（Vite 8 + React 19 + TypeScript）。認証は Slack OAuth → JWT cookie。ダッシュボード API（`/api/*`）は CloudFront が API Gateway HTTP API へプロキシする。
+
+### 画面一覧
+
+| 画面名 | ルート | 概要 |
+|-------|--------|------|
+| ダッシュボードホーム | `/dashboard` | 実行サマリー・最新実行・メトリクス概要 |
+| 実行一覧 | `/executions` | ワークフロー実行履歴の一覧・フィルタ |
+| 実行詳細 | `/executions/:executionId` | 実行ステップ・イベントログ・成果物リンク |
+| レビュー品質 | `/review-quality` | レビュアーエージェントの合否・品質スコア推移 |
+| エラー一覧 | `/errors` | 実行エラーの一覧・原因分類 |
+
+### 認証フロー
+
+```
+ブラウザ → /api/v1/auth/login → Slack OAuth → /api/v1/auth/callback → JWT cookie 発行
+ブラウザ → /api/v1/auth/me（5分ごとにポーリング、AuthProvider）
+```
+
+### API プロキシ
+
+| パス | 実体 |
+|------|------|
+| `/api/v1/*` | CloudFront → API Gateway HTTP API → ダッシュボード Lambda 群 |
