@@ -57,4 +57,35 @@ export interface ExecutionListResponse {
   meta: { total: number; next_cursor: string | null }
 }
 
+export interface DashboardEvent {
+  execution_id: string
+  sk: string
+  event_type: string
+  timestamp: string
+  sequence_number: number
+  status_at_emit: string
+  payload: Record<string, unknown>
+}
+
+export interface Deliverable {
+  execution_id: string
+  deliverable_id?: string
+  deliverable_type?: string
+  title?: string
+  created_at?: string
+  [key: string]: unknown
+}
+
+export interface ExecutionDetailResponse {
+  data: {
+    execution: Execution
+    deliverables: Deliverable[]
+  }
+}
+
+export interface ExecutionEventsResponse {
+  data: DashboardEvent[]
+  meta: { total: number }
+}
+
 export type Period = "24h" | "7d" | "30d"

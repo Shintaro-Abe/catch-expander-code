@@ -2,6 +2,8 @@ import { api } from "./client"
 import type {
   ApiHealth,
   CostSummary,
+  ExecutionDetailResponse,
+  ExecutionEventsResponse,
   ExecutionListResponse,
   MetricsSummary,
   Period,
@@ -32,8 +34,8 @@ export const endpoints = {
   },
 
   execution: (id: string) =>
-    api.get<{ data: Record<string, unknown> }>(`/api/v1/executions/${id}`),
+    api.get<ExecutionDetailResponse>(`/api/v1/executions/${id}`),
 
   executionEvents: (id: string) =>
-    api.get<{ data: unknown[] }>(`/api/v1/executions/${id}/events`),
+    api.get<ExecutionEventsResponse>(`/api/v1/executions/${id}/events`),
 }
