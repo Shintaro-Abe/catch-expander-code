@@ -284,6 +284,21 @@ Resources:
         AttributeName: ttl
         Enabled: true
 
+  DashboardOAuthStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${DynamoDbTablePrefix}-dashboard-oauth-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: state
+          AttributeType: S
+      KeySchema:
+        - AttributeName: state
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
   # ==============================================================
   # ECR
   # ==============================================================
