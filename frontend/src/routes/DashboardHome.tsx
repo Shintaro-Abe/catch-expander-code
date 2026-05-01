@@ -9,6 +9,7 @@ import { CheckCircle2, XCircle, Clock, RefreshCw } from "lucide-react"
 
 import { endpoints } from "@/api/endpoints"
 import type { Period } from "@/api/types"
+import { durationMs, fmtDuration, fmtRelative } from "@/lib/time"
 import { KpiCard } from "@/components/KpiCard"
 import { PeriodSelector } from "@/components/PeriodSelector"
 import { StatusBadge } from "@/components/StatusBadge"
@@ -19,11 +20,6 @@ import {
 } from "@/components/ui/table"
 
 /* ── helpers ───────────────────────────────────────────────────────────── */
-
-function fmtDuration(ms: number | null): string {
-  if (ms == null) return "—"
-  return ms >= 60_000 ? `${Math.round(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s` : `${Math.round(ms / 1000)}s`
-}
 
 function fmtCost(usd: number | null): string {
   if (usd == null) return "—"
@@ -40,15 +36,6 @@ function fmtRate(r: number | null): string {
   return `${(r * 100).toFixed(1)}%`
 }
 
-function fmtRelative(iso: string | null): string {
-  if (!iso) return "—"
-  const diff = Date.now() - new Date(iso).getTime()
-  const h = Math.floor(diff / 3_600_000)
-  const m = Math.floor((diff % 3_600_000) / 60_000)
-  if (h > 24) return `${Math.floor(h / 24)}日前`
-  if (h > 0)  return `${h}時間前`
-  return `${m}分前`
-}
 
 const CHART_COLORS: Record<string, string> = {
   success: "#22c55e",
@@ -89,7 +76,7 @@ export function DashboardHome() {
 
   const qExecutions = useQuery({
     queryKey: ["executions-recent"],
-    queryFn: () => endpoints.executions(5),
+    queryFn: () => endpoints.executions({ limit: 5 }),
     staleTime: 30_000,
   })
 
@@ -372,7 +359,7 @@ export function DashboardHome() {
                       <span className="text-xs text-foreground line-clamp-1">{ex.topic}</span>
                     </TableCell>
                     <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
-                      {fmtDuration(ex.duration_ms)}
+                      {fmtDuration(durationMs(ex.created_at, ex.completed_at))}
                     </TableCell>
                     <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
                       {fmtRelative(ex.created_at)}

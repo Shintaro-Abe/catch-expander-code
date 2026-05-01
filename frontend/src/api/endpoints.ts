@@ -21,6 +21,19 @@ export const endpoints = {
   tokenMonitor: (period: Period) =>
     api.get<{ data: TokenMonitorHealth }>(`/api/v1/metrics/token-monitor?period=${period}`),
 
-  executions: (limit = 5) =>
-    api.get<ExecutionListResponse>(`/api/v1/executions?limit=${limit}`),
+  executions: (params?: { limit?: number; from?: string; to?: string; status?: string; topic?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.limit)  q.set("limit",  String(params.limit))
+    if (params?.from)   q.set("from",   params.from)
+    if (params?.to)     q.set("to",     params.to)
+    if (params?.status) q.set("status", params.status)
+    if (params?.topic)  q.set("topic",  params.topic)
+    return api.get<ExecutionListResponse>(`/api/v1/executions?${q}`)
+  },
+
+  execution: (id: string) =>
+    api.get<{ data: Record<string, unknown> }>(`/api/v1/executions/${id}`),
+
+  executionEvents: (id: string) =>
+    api.get<{ data: unknown[] }>(`/api/v1/executions/${id}/events`),
 }

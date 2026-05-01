@@ -39,12 +39,17 @@ export interface TokenMonitorHealth {
 
 export interface Execution {
   execution_id: string
-  status: string
+  user_id: string
   topic: string
+  status: string
   created_at: string
-  duration_ms: number | null
-  total_tokens_used: number | null
-  total_cost_usd: number | null
+  completed_at?: string
+  category?: string
+  slack_channel?: string
+  workflow_plan?: Record<string, unknown>
+  intent?: string
+  perspectives?: string[]
+  deliverable_types?: string[]
 }
 
 export interface ExecutionListResponse {
