@@ -300,6 +300,28 @@ Resources:
         Enabled: true
 
   # ==============================================================
+  # Secrets Manager (Dashboard)
+  # ==============================================================
+  DashboardJwtKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: catch-expander/dashboard-jwt-key
+      Description: HMAC-SHA256 signing key for dashboard JWT session cookies
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  DashboardSlackOAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: catch-expander/dashboard-slack-oauth
+      Description: >-
+        Slack OAuth credentials for dashboard login.
+        Manually populate after stack creation:
+        {"client_id": "...", "client_secret": "...", "workspace_id": "T..."}
+      SecretString: "{}"
+
+  # ==============================================================
   # ECR
   # ==============================================================
   AgentRepository:
