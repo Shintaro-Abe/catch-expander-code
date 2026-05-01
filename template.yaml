@@ -489,12 +489,29 @@ Resources:
               Value: !Ref GitHubTokenSecretArn
             - Name: CLAUDE_OAUTH_SECRET_ARN
               Value: !Ref ClaudeOAuthSecretArn
+            - Name: EVENTS_TABLE
+              Value: !Ref DashboardEventsTable
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref AgentLogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: agent
+
+  # ==============================================================
+  # Lambda Layer (共通ライブラリ)
+  # ==============================================================
+  ObservabilityLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: catch-expander-observability
+      ContentUri: src/observability/
+      CompatibleRuntimes:
+        - python3.13
+      CompatibleArchitectures:
+        - arm64
+    Metadata:
+      BuildMethod: makefile
 
   # ==============================================================
   # Lambda + API Gateway
@@ -520,6 +537,8 @@ Resources:
       CodeUri: src/trigger/
       MemorySize: 256
       Timeout: 10
+      Layers:
+        - !Ref ObservabilityLayer
       Environment:
         Variables:
           DYNAMODB_TABLE_PREFIX: !Ref DynamoDbTablePrefix
@@ -530,6 +549,7 @@ Resources:
           ECS_SECURITY_GROUP: !GetAtt AgentSecurityGroup.GroupId
           SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
           SLACK_SIGNING_SECRET_ARN: !Ref SlackSigningSecretArn
+          EVENTS_TABLE: !Ref DashboardEventsTable
       Events:
         SlackEvent:
           Type: Api
@@ -581,12 +601,15 @@ Resources:
       CodeUri: src/token_monitor/
       MemorySize: 128
       Timeout: 30
+      Layers:
+        - !Ref ObservabilityLayer
       Environment:
         Variables:
           CLAUDE_OAUTH_SECRET_ARN: !Ref ClaudeOAuthSecretArn
           SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
           SLACK_NOTIFICATION_CHANNEL_ID: !Ref SlackNotificationChannelId
           STALE_THRESHOLD_HOURS: "24"
+          EVENTS_TABLE: !Ref DashboardEventsTable
       Events:
         ScheduleEvent:
           Type: Schedule
