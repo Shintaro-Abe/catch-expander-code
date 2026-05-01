@@ -5,7 +5,6 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # _needs_refresh
 # ---------------------------------------------------------------------------
@@ -102,26 +101,32 @@ class TestCallRefreshEndpoint:
             hdrs=None,
             fp=None,
         )
-        with patch("handler.urlopen", side_effect=err):
-            with pytest.raises(HTTPError) as exc_info:
-                _call_refresh_endpoint("rt")
+        with (
+            patch("handler.urlopen", side_effect=err),
+            pytest.raises(HTTPError) as exc_info,
+        ):
+            _call_refresh_endpoint("rt")
         assert exc_info.value.code == 401
 
     def test_propagates_http_500(self):
         from handler import _call_refresh_endpoint
 
         err = HTTPError(url="...", code=500, msg="ISE", hdrs=None, fp=None)
-        with patch("handler.urlopen", side_effect=err):
-            with pytest.raises(HTTPError) as exc_info:
-                _call_refresh_endpoint("rt")
+        with (
+            patch("handler.urlopen", side_effect=err),
+            pytest.raises(HTTPError) as exc_info,
+        ):
+            _call_refresh_endpoint("rt")
         assert exc_info.value.code == 500
 
     def test_propagates_url_error(self):
         from handler import _call_refresh_endpoint
 
-        with patch("handler.urlopen", side_effect=URLError("dns fail")):
-            with pytest.raises(URLError):
-                _call_refresh_endpoint("rt")
+        with (
+            patch("handler.urlopen", side_effect=URLError("dns fail")),
+            pytest.raises(URLError),
+        ):
+            _call_refresh_endpoint("rt")
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +233,8 @@ class TestPostSlackFailure:
         assert "不明" in text
 
     def test_swallows_slack_error(self):
-        from slack_sdk.errors import SlackApiError
-
         from handler import _post_slack_failure
+        from slack_sdk.errors import SlackApiError
 
         mock_client = MagicMock()
         mock_client.chat_postMessage.side_effect = SlackApiError(
@@ -257,7 +261,7 @@ class TestLambdaHandlerFlow:
         for k, v in self._COMMON_ENV.items():
             monkeypatch.setenv(k, v)
 
-    def _creds_json(self, expires_at_ms: int, refresh_token: str | None = "rt") -> str:
+    def _creds_json(self, expires_at_ms: int, refresh_token: str | None = "rt") -> str:  # noqa: S107
         oauth = {"expiresAt": expires_at_ms}
         if refresh_token is not None:
             oauth["refreshToken"] = refresh_token
@@ -393,3 +397,148 @@ class TestLambdaHandlerFlow:
         mock_put.assert_not_called()
         mock_refresh.assert_not_called()
         mock_notify.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# emit (T1-3b)
+# ---------------------------------------------------------------------------
+
+
+class TestEmitEvents:
+    _COMMON_ENV = {
+        "CLAUDE_OAUTH_SECRET_ARN": "arn:claude",
+        "SLACK_BOT_TOKEN_SECRET_ARN": "arn:slack",
+        "SLACK_NOTIFICATION_CHANNEL_ID": "C_MONITOR",
+    }
+
+    def _set_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for k, v in self._COMMON_ENV.items():
+            monkeypatch.setenv(k, v)
+
+    def _creds_json(self, expires_at_ms: int, refresh_token: str | None = "rt") -> str:  # noqa: S107
+        oauth: dict = {"expiresAt": expires_at_ms}
+        if refresh_token is not None:
+            oauth["refreshToken"] = refresh_token
+        return json.dumps({"claudeAiOauth": oauth})
+
+    def _mock_emitter(self) -> tuple[MagicMock, MagicMock]:
+        """(_EventEmitter class mock, instance mock)"""
+        instance = MagicMock()
+        cls = MagicMock(return_value=instance)
+        return cls, instance
+
+    def test_oauth_refresh_completed_emitted_on_success(self, monkeypatch):
+        self._set_env(monkeypatch)
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
+        refresh_response = {"access_token": "new", "refresh_token": "rt2", "expires_in": 7200}
+        emitter_cls, emitter = self._mock_emitter()
+
+        with (
+            patch("handler._get_secret", return_value=self._creds_json(past_ms)),
+            patch("handler._put_secret"),
+            patch("handler._call_refresh_endpoint", return_value=refresh_response),
+            patch("handler._post_slack_failure"),
+            patch("handler._EventEmitter", emitter_cls),
+        ):
+            from handler import lambda_handler
+            lambda_handler({}, None)
+
+        emitter.emit.assert_called_once()
+        call = emitter.emit.call_args
+        assert call.args[0] == "oauth_refresh_completed"
+        assert call.kwargs["status_at_emit"] == "success"
+        assert call.args[1]["status"] == "success"
+        assert "new_expires_at_ms" in call.args[1]
+
+    def test_oauth_refresh_failed_emitted_on_no_expires_at(self, monkeypatch):
+        self._set_env(monkeypatch)
+        creds = json.dumps({"claudeAiOauth": {"refreshToken": "rt"}})
+        emitter_cls, emitter = self._mock_emitter()
+
+        with (
+            patch("handler._get_secret", side_effect=[creds, "slack-token"]),
+            patch("handler._put_secret"),
+            patch("handler._call_refresh_endpoint"),
+            patch("handler._post_slack_failure"),
+            patch("handler._EventEmitter", emitter_cls),
+        ):
+            from handler import lambda_handler
+            lambda_handler({}, None)
+
+        emitter.emit.assert_called_once()
+        call = emitter.emit.call_args
+        assert call.args[0] == "oauth_refresh_failed"
+        assert call.kwargs["status_at_emit"] == "failed"
+
+    def test_oauth_refresh_failed_emitted_on_http_error(self, monkeypatch):
+        self._set_env(monkeypatch)
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
+        err = HTTPError(url="...", code=401, msg="Unauthorized", hdrs=None, fp=None)
+        emitter_cls, emitter = self._mock_emitter()
+
+        with (
+            patch("handler._get_secret", side_effect=[self._creds_json(past_ms), "slack-token"]),
+            patch("handler._put_secret"),
+            patch("handler._call_refresh_endpoint", side_effect=err),
+            patch("handler._post_slack_failure"),
+            patch("handler._EventEmitter", emitter_cls),
+        ):
+            from handler import lambda_handler
+            lambda_handler({}, None)
+
+        emitter.emit.assert_called_once()
+        call = emitter.emit.call_args
+        assert call.args[0] == "oauth_refresh_failed"
+        assert call.args[1]["error_message"] == "http_401"
+
+    def test_oauth_refresh_failed_emitted_on_url_error(self, monkeypatch):
+        self._set_env(monkeypatch)
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
+        emitter_cls, emitter = self._mock_emitter()
+
+        with (
+            patch("handler._get_secret", side_effect=[self._creds_json(past_ms), "slack-token"]),
+            patch("handler._put_secret"),
+            patch("handler._call_refresh_endpoint", side_effect=URLError("dns")),
+            patch("handler._post_slack_failure"),
+            patch("handler._EventEmitter", emitter_cls),
+        ):
+            from handler import lambda_handler
+            lambda_handler({}, None)
+
+        emitter.emit.assert_called_once()
+        assert emitter.emit.call_args.args[0] == "oauth_refresh_failed"
+
+    def test_no_emit_when_token_still_valid(self, monkeypatch):
+        self._set_env(monkeypatch)
+        future_ms = int(time.time() * 1000) + 2 * 60 * 60 * 1000
+        emitter_cls, emitter = self._mock_emitter()
+
+        with (
+            patch("handler._get_secret", return_value=self._creds_json(future_ms)),
+            patch("handler._put_secret"),
+            patch("handler._call_refresh_endpoint"),
+            patch("handler._post_slack_failure"),
+            patch("handler._EventEmitter", emitter_cls),
+        ):
+            from handler import lambda_handler
+            lambda_handler({}, None)
+
+        emitter.emit.assert_not_called()
+
+    def test_no_emit_when_event_emitter_none(self, monkeypatch):
+        self._set_env(monkeypatch)
+        past_ms = int(time.time() * 1000) - 60 * 60 * 1000
+        refresh_response = {"access_token": "new", "expires_in": 7200}
+
+        with (
+            patch("handler._get_secret", return_value=self._creds_json(past_ms)),
+            patch("handler._put_secret"),
+            patch("handler._call_refresh_endpoint", return_value=refresh_response),
+            patch("handler._post_slack_failure"),
+            patch("handler._EventEmitter", None),
+        ):
+            from handler import lambda_handler
+            result = lambda_handler({}, None)
+
+        assert result["refreshed"] is True

@@ -25,7 +25,7 @@ secrets_client = boto3.client("secretsmanager")
 
 # AS OF 2026-04-25: Anthropic OAuth エンドポイント / Claude Code CLI の公開クライアント ID
 # 仕様変更で動かなくなった場合はここを更新する単一の差し替え点
-TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"  # noqa: S105
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
@@ -80,7 +80,7 @@ def _call_refresh_endpoint(refresh_token: str) -> dict[str, Any]:
             "scope": SCOPES,
         }
     ).encode("utf-8")
-    req = Request(
+    req = Request(  # noqa: S310
         TOKEN_URL,
         data=payload,
         headers={
@@ -90,7 +90,7 @@ def _call_refresh_endpoint(refresh_token: str) -> dict[str, Any]:
         },
         method="POST",
     )
-    with urlopen(req, timeout=10) as resp:
+    with urlopen(req, timeout=10) as resp:  # noqa: S310
         return json.loads(resp.read().decode("utf-8"))
 
 
