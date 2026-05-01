@@ -882,6 +882,93 @@ Resources:
               Resource:
                 - !GetAtt DashboardEventsTable.Arn
 
+  # ==============================================================
+  # Dashboard: メトリクス系 Lambda
+  # ==============================================================
+  DashboardGetMetricsSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-metrics-summary
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_metrics_summary/
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetMetricsSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/metrics/summary
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/*
+
+  DashboardGetReviewQualityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-review-quality
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_review_quality/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetReviewQuality:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/metrics/review-quality
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/*
+
+  DashboardGetErrorsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-errors
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_errors/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetErrors:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/errors
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/*
+
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
 
