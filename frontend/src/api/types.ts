@@ -107,4 +107,18 @@ export interface ReviewQualityResponse {
   data: ReviewQualityData
 }
 
+export interface ErrorItem {
+  execution_id: string
+  timestamp: string
+  error_type: string
+  error_message: string
+  stage: string
+  is_recoverable: boolean | null
+}
+
+export interface ErrorListResponse {
+  data: ErrorItem[]
+  meta: { total: number; by_type: Record<string, number> }
+}
+
 export type Period = "24h" | "7d" | "30d"

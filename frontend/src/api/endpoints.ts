@@ -2,6 +2,7 @@ import { api } from "./client"
 import type {
   ApiHealth,
   CostSummary,
+  ErrorListResponse,
   ExecutionDetailResponse,
   ExecutionEventsResponse,
   ExecutionListResponse,
@@ -36,6 +37,9 @@ export const endpoints = {
 
   reviewQuality: (days: number) =>
     api.get<ReviewQualityResponse>(`/api/v1/review-quality?days=${days}`),
+
+  errors: (days: number) =>
+    api.get<ErrorListResponse>(`/api/v1/errors?days=${days}`),
 
   execution: (id: string) =>
     api.get<ExecutionDetailResponse>(`/api/v1/executions/${id}`),
