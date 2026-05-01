@@ -423,7 +423,7 @@ Resources:
                   - !GetAtt WorkflowStepsTable.Arn
                   - !GetAtt DeliverablesTable.Arn
                   - !GetAtt SourcesTable.Arn
-                  - !Sub ${WorkflowExecutionsTable.Arn}/index/*
+                  - !Sub ${WorkflowExecutionsTable.Arn}/index/user-id-index
                   - !GetAtt DashboardEventsTable.Arn
         - PolicyName: SecretsManagerAccess
           PolicyDocument:
@@ -572,7 +572,7 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt WorkflowExecutionsTable.Arn
-                - !Sub ${WorkflowExecutionsTable.Arn}/index/*
+                - !Sub ${WorkflowExecutionsTable.Arn}/index/user-id-index
                 - !GetAtt DeliverablesTable.Arn
             - Effect: Allow
               Action:
@@ -815,7 +815,7 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt DashboardEventsTable.Arn
-                - !Sub ${DashboardEventsTable.Arn}/index/*
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_global_timestamp
             - Effect: Allow
               Action:
                 - dynamodb:GetItem
@@ -911,7 +911,7 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt DashboardEventsTable.Arn
-                - !Sub ${DashboardEventsTable.Arn}/index/*
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_global_timestamp
 
   DashboardGetReviewQualityFunction:
     Type: AWS::Serverless::Function
@@ -939,7 +939,7 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt DashboardEventsTable.Arn
-                - !Sub ${DashboardEventsTable.Arn}/index/*
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
 
   DashboardGetErrorsFunction:
     Type: AWS::Serverless::Function
@@ -967,7 +967,119 @@ Resources:
                 - dynamodb:Query
               Resource:
                 - !GetAtt DashboardEventsTable.Arn
-                - !Sub ${DashboardEventsTable.Arn}/index/*
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
+
+  DashboardGetCostSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-cost-summary
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_cost_summary/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetCostSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/metrics/cost
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
+
+  DashboardGetApiHealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-api-health
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_api_health/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetApiHealth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/metrics/api-health
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
+
+  DashboardGetTokenMonitorHealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-token-monitor-health
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_token_monitor_health/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetTokenMonitorHealth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/metrics/token-monitor
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
+
+  DashboardGetFeedbackAggregationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-feedback-aggregation
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_feedback_aggregation/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetFeedbackAggregation:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/metrics/feedback
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
 
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
