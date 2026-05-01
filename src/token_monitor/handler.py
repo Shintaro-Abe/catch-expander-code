@@ -11,6 +11,13 @@ import boto3
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+# Lambda zip packaging (`CodeUri: src/token_monitor/`) では `src/observability/` が同梱されない。
+# T1-12 SAM Layer 化で解消されるまでの graceful skip パターン (T1-3 と同じ方式)。
+try:
+    from src.observability import EventEmitter as _EventEmitter
+except ImportError:
+    _EventEmitter = None  # type: ignore[assignment, misc]
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -169,10 +176,19 @@ def lambda_handler(event: dict, context: object) -> dict[str, Any]:
 
     now_ms = int(time.time() * 1000)
 
+    # T1-3b: token_monitor は execution_id を持たないため合成 ID を使う (design.md §2.5)
+    _emitter = _EventEmitter(f"system-token-refresh-{int(time.time())}") if _EventEmitter is not None else None
+
     if not isinstance(expires_at_ms, int):
         logger.error("expiresAt missing or invalid in credentials")
         slack_token = _get_secret(slack_token_arn)
         _post_slack_failure(slack_token, channel_id, "no_expires_at", None)
+        if _emitter is not None:
+            _emitter.emit(
+                "oauth_refresh_failed",
+                {"error_message": "no_expires_at"},
+                status_at_emit="failed",
+            )
         return {"refreshed": False, "reason": "no_expires_at"}
 
     if not _needs_refresh(expires_at_ms, REFRESH_BUFFER_MS, now_ms):
@@ -184,6 +200,15 @@ def lambda_handler(event: dict, context: object) -> dict[str, Any]:
         logger.error("No refresh_token in credentials")
         slack_token = _get_secret(slack_token_arn)
         _post_slack_failure(slack_token, channel_id, "no_refresh_token", expires_at_ms)
+        if _emitter is not None:
+            _emitter.emit(
+                "oauth_refresh_failed",
+                {
+                    "error_message": "no_refresh_token",
+                    "token_remaining_seconds_before": (expires_at_ms - now_ms) // 1000,
+                },
+                status_at_emit="failed",
+            )
         return {"refreshed": False, "reason": "no_refresh_token"}
 
     try:
@@ -201,11 +226,29 @@ def lambda_handler(event: dict, context: object) -> dict[str, Any]:
         )
         slack_token = _get_secret(slack_token_arn)
         _post_slack_failure(slack_token, channel_id, reason, expires_at_ms)
+        if _emitter is not None:
+            _emitter.emit(
+                "oauth_refresh_failed",
+                {
+                    "error_message": reason,
+                    "token_remaining_seconds_before": (expires_at_ms - now_ms) // 1000,
+                },
+                status_at_emit="failed",
+            )
         return {"refreshed": False, "reason": reason}
     except URLError as e:
         logger.error("Refresh URL error", extra={"error_class": type(e).__name__})
         slack_token = _get_secret(slack_token_arn)
         _post_slack_failure(slack_token, channel_id, "url_error", expires_at_ms)
+        if _emitter is not None:
+            _emitter.emit(
+                "oauth_refresh_failed",
+                {
+                    "error_message": "url_error",
+                    "token_remaining_seconds_before": (expires_at_ms - now_ms) // 1000,
+                },
+                status_at_emit="failed",
+            )
         return {"refreshed": False, "reason": "url_error"}
 
     new_creds = _build_updated_credentials(creds, result, now_ms)
@@ -217,4 +260,14 @@ def lambda_handler(event: dict, context: object) -> dict[str, Any]:
         "Token refreshed successfully",
         extra={"refreshed": True, "new_expires_in_min": new_expires_in_min},
     )
+    if _emitter is not None:
+        _emitter.emit(
+            "oauth_refresh_completed",
+            {
+                "status": "success",
+                "token_remaining_seconds_before": (expires_at_ms - now_ms) // 1000,
+                "new_expires_at_ms": new_expires_at_ms,
+            },
+            status_at_emit="success",
+        )
     return {"refreshed": True, "new_expires_at_ms": new_expires_at_ms}
