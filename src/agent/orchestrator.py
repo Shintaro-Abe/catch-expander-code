@@ -22,9 +22,23 @@ from storage.notion_client import NotionClient
 # ImportError は graceful skip し、no-op emitter にフォールバックする。
 # Docker build context の整備は別タスク (T1-12 周辺) で対応する。
 try:
-    from src.observability import EventEmitter as _EventEmitter
+    from src.observability import (
+        EventEmitter as _EventEmitter,
+    )
+    from src.observability import (
+        emit_api_call_completed as _emit_api_call_completed,
+    )
+    from src.observability import (
+        emit_rate_limit_hit as _emit_rate_limit_hit,
+    )
 except ImportError:  # pragma: no cover - 本番 ECS image でのみ発生
     _EventEmitter = None
+
+    def _emit_api_call_completed(emitter, **kwargs) -> None:  # type: ignore[no-redef]
+        return None
+
+    def _emit_rate_limit_hit(emitter, **kwargs) -> None:  # type: ignore[no-redef]
+        return None
 
 logger = logging.getLogger("catch-expander-agent")
 
@@ -181,13 +195,34 @@ def _namespace_source_ids(result: dict, step_id: str) -> None:
         src["source_id"] = f"{prefix}{original}"
 
 
-def call_claude(prompt: str, allowed_tools: list[str] | None = None, model: str = "sonnet") -> str:
+def _claude_stderr_indicates_rate_limit(stderr_text: str) -> bool:
+    """claude CLI の stderr に Anthropic rate limit を示唆する文字列が含まれるか判定する。
+
+    CLI は HTTP status code を直接返さないため、文字列ベースの簡易判定。
+    完全網羅ではないが、`429` / `rate limit` / `rate_limit` のいずれかを含めば
+    rate_limit_hit として記録する。
+    """
+    if not stderr_text:
+        return False
+    lowered = stderr_text.lower()
+    return "429" in lowered or "rate limit" in lowered or "rate_limit" in lowered
+
+
+def call_claude(
+    prompt: str,
+    allowed_tools: list[str] | None = None,
+    model: str = "sonnet",
+    *,
+    emitter: Any = None,
+) -> str:
     """Claude Code CLIを呼び出し、結果を返す（リトライ付き）
 
     Args:
         prompt: CLIに渡すプロンプト
         allowed_tools: 許可するツールのリスト
         model: 使用するモデル名（デフォルト: sonnet）
+        emitter: T1-2b で追加。Orchestrator から伝搬された EventEmitter。
+            None なら observability emit は no-op (既存テスト互換性のためデフォルト None)。
 
     Returns:
         CLIのstdout出力（JSON文字列）
@@ -196,29 +231,57 @@ def call_claude(prompt: str, allowed_tools: list[str] | None = None, model: str 
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
 
-    last_error: subprocess.CalledProcessError | None = None
-    for attempt in range(MAX_CLAUDE_RETRIES):
-        try:
-            result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
-            return result.stdout
-        except subprocess.CalledProcessError as e:
-            last_error = e
-            wait = 2 ** (attempt + 1)
-            stderr_snippet = e.stderr[:500] if e.stderr else ""
-            stdout_snippet = e.stdout[:500] if e.stdout else ""
-            logger.warning(
-                "Claude CLI error, retrying | rc=%s | stderr=%s | stdout=%s",
-                e.returncode,
-                stderr_snippet,
-                stdout_snippet,
-                extra={"attempt": attempt + 1, "wait_seconds": wait},
-            )
-            time.sleep(wait)
+    # T1-2b (Codex 2 回目 P2 対応): claude CLI は subprocess なので HTTP status を取得できない。
+    # exit code 0 = success、非 0 = failure として扱い、subtype="anthropic" で emit する。
+    # rate limit は stderr の文字列マッチで簡易判定する (完全網羅ではないが第一歩)。
+    start_ns = time.monotonic_ns()
+    success = False
+    final_status: int | None = None
+    endpoint_path = f"/claude/cli?model={model}"
+    try:
+        last_error: subprocess.CalledProcessError | None = None
+        for attempt in range(MAX_CLAUDE_RETRIES):
+            try:
+                result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
+                success = True
+                final_status = result.returncode
+                return result.stdout
+            except subprocess.CalledProcessError as e:
+                last_error = e
+                final_status = e.returncode
+                wait = 2 ** (attempt + 1)
+                stderr_snippet = e.stderr[:500] if e.stderr else ""
+                stdout_snippet = e.stdout[:500] if e.stdout else ""
+                if _claude_stderr_indicates_rate_limit(e.stderr or ""):
+                    _emit_rate_limit_hit(
+                        emitter,
+                        subtype="anthropic_429",
+                        endpoint_path=endpoint_path,
+                        detail=f"stderr_snippet={stderr_snippet[:200]}",
+                    )
+                logger.warning(
+                    "Claude CLI error, retrying | rc=%s | stderr=%s | stdout=%s",
+                    e.returncode,
+                    stderr_snippet,
+                    stdout_snippet,
+                    extra={"attempt": attempt + 1, "wait_seconds": wait},
+                )
+                time.sleep(wait)
 
-    if last_error:
-        raise last_error
-    msg = "Unexpected: no error and no response"
-    raise RuntimeError(msg)
+        if last_error:
+            raise last_error
+        msg = "Unexpected: no error and no response"
+        raise RuntimeError(msg)
+    finally:
+        duration_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+        _emit_api_call_completed(
+            emitter,
+            subtype="anthropic",
+            success=success,
+            duration_ms=duration_ms,
+            response_status_code=final_status,
+            endpoint_path=endpoint_path,
+        )
 
 
 def _parse_claude_response(raw: str) -> dict:
@@ -422,6 +485,7 @@ def call_claude_with_workspace(
     code_type: str,
     *,
     model: str = "sonnet",
+    emitter: Any = None,
 ) -> tuple[str, dict[str, str], dict]:
     """Claude CLI に Write ツールを許可して sandbox にファイルを書かせ、収集結果を返す。
 
@@ -429,10 +493,18 @@ def call_claude_with_workspace(
     エスケープミスで失敗するため、コード成果物のみこの経路を使う。テキスト成果物の
     パスは call_claude のままで変更しない。
 
+    Args:
+        emitter: T1-2b 追加。EventEmitter (None なら observability emit は no-op)。
+
     Returns:
         (raw_stdout, files, outcome)
     """
     sandbox = Path(tempfile.mkdtemp(prefix=f"agent-output-{code_type}-"))
+    # T1-2b (Codex 2 回目 P2 対応): workspace 経由の claude CLI も api_call_completed で観測する。
+    api_start_ns = time.monotonic_ns()
+    api_success = False
+    api_final_status: int | None = None
+    endpoint_path = f"/claude/cli?model={model}&mode=workspace&code_type={code_type}"
     try:
         cmd = [
             "claude",
@@ -458,10 +530,20 @@ def call_claude_with_workspace(
                     cwd=str(sandbox),
                 )
                 raw_stdout = result.stdout
+                api_success = True
+                api_final_status = result.returncode
                 break
             except subprocess.CalledProcessError as e:
                 last_error = e
+                api_final_status = e.returncode
                 wait = 2 ** (attempt + 1)
+                if _claude_stderr_indicates_rate_limit(e.stderr or ""):
+                    _emit_rate_limit_hit(
+                        emitter,
+                        subtype="anthropic_429",
+                        endpoint_path=endpoint_path,
+                        detail=f"stderr_snippet={(e.stderr or '')[:200]}",
+                    )
                 logger.warning(
                     "Claude CLI error (workspace mode), retrying | rc=%s | stderr=%s",
                     e.returncode,
@@ -479,6 +561,15 @@ def call_claude_with_workspace(
         outcome = _classify_workspace_outcome(files, rejected)
         return raw_stdout, files, outcome
     finally:
+        api_duration_ms = (time.monotonic_ns() - api_start_ns) // 1_000_000
+        _emit_api_call_completed(
+            emitter,
+            subtype="anthropic",
+            success=api_success,
+            duration_ms=api_duration_ms,
+            response_status_code=api_final_status,
+            endpoint_path=endpoint_path,
+        )
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
@@ -574,6 +665,12 @@ class Orchestrator:
         # 未配置の場合 (_EventEmitter is None) は _NoOpEmitter のままで継続する。
         if _EventEmitter is not None:
             self._emitter = _EventEmitter(execution_id)
+            # T1-2b: storage / notify クライアントにも EventEmitter を伝搬し、
+            # 各クライアントの `_request_with_retry` / `_post_with_retry` から
+            # api_call_completed / rate_limit_hit を emit させる。
+            self.notion._emitter = self._emitter
+            self.github._emitter = self._emitter
+            self.slack._emitter = self._emitter
 
         overall_start_ns = time.monotonic_ns()
         final_status = "in_progress"
@@ -604,7 +701,7 @@ class Orchestrator:
                 f"トピック: {topic}\n\n"
                 f"ユーザープロファイル:\n{profile_text}"
             )
-            analysis_raw = call_claude(analysis_prompt)
+            analysis_raw = call_claude(analysis_prompt, emitter=self._emitter)
             analysis = _parse_claude_response(analysis_raw)
             logger.info(
                 "Topic analyzed",
@@ -620,7 +717,7 @@ class Orchestrator:
                 f"トピック解析結果:\n```json\n{json.dumps(analysis, ensure_ascii=False)}\n```\n\n"
                 f"ユーザープロファイル:\n{profile_text}"
             )
-            wf_raw = call_claude(wf_prompt)
+            wf_raw = call_claude(wf_prompt, emitter=self._emitter)
             workflow = _parse_claude_response(wf_raw)
             logger.info(
                 "Workflow designed",
@@ -749,7 +846,7 @@ class Orchestrator:
                 {"subagent": "generator", "input_summary": f"category={category}"},
             )
             try:
-                gen_raw = call_claude(gen_prompt)
+                gen_raw = call_claude(gen_prompt, emitter=self._emitter)
                 deliverables = _parse_claude_response(gen_raw)
             except Exception as e:
                 self._emitter.emit(
@@ -787,7 +884,9 @@ class Orchestrator:
                     # CalledProcessError 等を捕捉し、subagent_failed をペアで emit してから再 raise する
                     # (既存挙動 = 上位 try でも捕捉されるが、subagent_started/failed 対応を維持するため明示)。
                     try:
-                        raw_stdout, files, outcome = call_claude_with_workspace(prompt, code_type)
+                        raw_stdout, files, outcome = call_claude_with_workspace(
+                            prompt, code_type, emitter=self._emitter
+                        )
                     except Exception as e:
                         self._emitter.emit(
                             "subagent_failed",
@@ -1059,7 +1158,7 @@ class Orchestrator:
                     f"内容: {step['description']}\n"
                     f"検索ヒント: {json.dumps(step.get('search_hints', []), ensure_ascii=False)}"
                 )
-                raw = call_claude(prompt, allowed_tools=["WebSearch", "WebFetch"])
+                raw = call_claude(prompt, allowed_tools=["WebSearch", "WebFetch"], emitter=self._emitter)
                 result = _parse_claude_response(raw)
                 _namespace_source_ids(result, step_id)
                 self.db.update_step_status(execution_id, step_id, "completed", result)
@@ -1139,7 +1238,7 @@ class Orchestrator:
                 f"成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```\n\n"
                 f"出典リスト:\n```json\n{sources_text}\n```"
             )
-            raw = call_claude(review_prompt, allowed_tools=["WebFetch"], model="opus")
+            raw = call_claude(review_prompt, allowed_tools=["WebFetch"], model="opus", emitter=self._emitter)
             review_result = _parse_claude_response(raw)
 
             # 各 iteration ごとの review_completed (T1-2): シグネチャ・戻り値・分岐ロジックは不変。
@@ -1200,7 +1299,7 @@ class Orchestrator:
                 f"指摘事項:\n```json\n{fix_instructions}\n```\n\n"
                 f"現在の成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```"
             )
-            fix_raw = call_claude(fix_prompt)
+            fix_raw = call_claude(fix_prompt, emitter=self._emitter)
             parsed = _parse_claude_response(fix_raw)
             if parsed.get("parse_error"):
                 logger.warning(

@@ -5,10 +5,18 @@ from notify.slack_client import SlackClient
 from orchestrator import _parse_claude_response, call_claude
 from state.dynamodb_client import DynamoDbClient
 
+# T1-2b (Tier 2.4): F8 フィードバック受信 → feedback_received イベントを emit。
+# Lambda zip / ECS image で `src/observability/` 未配置時は graceful skip。
+try:
+    from src.observability import EventEmitter as _EventEmitter
+except ImportError:  # pragma: no cover
+    _EventEmitter = None
+
 logger = logging.getLogger("catch-expander-agent")
 
 MAX_PREFERENCES_PER_FEEDBACK = 3
 MAX_TOTAL_PREFERENCES = 10
+_FEEDBACK_REPLY_SUMMARY_MAX_CHARS = 200
 
 
 class FeedbackProcessor:
@@ -42,9 +50,15 @@ class FeedbackProcessor:
             profile = self.db.get_user_profile(user_id) or {}
             existing_prefs: list[dict] = profile.get("learned_preferences", [])
 
+            # T1-2b (Codex 2 回目 P2 対応): emitter を Claude / Slack 呼び出しの **前** に作成し、
+            # それぞれの API call が api_call_completed として観測されるようにする。
+            emitter = _EventEmitter(execution_id) if _EventEmitter is not None else None
+            if emitter is not None:
+                self.slack._emitter = emitter
+
             # 3. Claude による好み抽出
             prompt = self._build_extraction_prompt(topic, category, existing_prefs, feedback_text)
-            raw = call_claude(prompt, allowed_tools=None)
+            raw = call_claude(prompt, allowed_tools=None, emitter=emitter)
             parsed = _parse_claude_response(raw)
 
             if parsed.get("parse_error"):
@@ -70,7 +84,32 @@ class FeedbackProcessor:
                 },
             )
 
-            # 6. Slack 応答
+            # 6. T1-2b: feedback_received イベント emit (Tier 2.4)。
+            # F8 はメンション必須経路のみ実装済み (project_slack_feedback_requires_mention)。
+            # emoji_reaction subtype は将来拡張のため、現状は mention_reply 固定。
+            # PII 配慮: feedback_text は raw 保存せず先頭 200 文字 + 「…」のサマリのみ。
+            #
+            # Codex 3 回目 P2 対応: Slack 通知前に emit する。Slack post が retry exhaust
+            # で失敗した場合、後続の self.slack.post_feedback_result が例外を投げて
+            # outer except に飛んでも、フィードバックを受信・処理した事実は events に
+            # 残る (DB 更新は成功している)。
+            if emitter is not None:
+                reply_summary = feedback_text[:_FEEDBACK_REPLY_SUMMARY_MAX_CHARS]
+                if len(feedback_text) > _FEEDBACK_REPLY_SUMMARY_MAX_CHARS:
+                    reply_summary += "…"
+                emitter.emit(
+                    "feedback_received",
+                    {
+                        "subtype": "mention_reply",
+                        "execution_id": execution_id,
+                        "reply_text_summary": reply_summary,
+                        "learned_preferences_updated": bool(new_preferences),
+                        "new_preferences_count": len(new_preferences),
+                        "total_preferences_count": len(merged),
+                    },
+                )
+
+            # 7. Slack 応答 (emitter は step 2 直後で作成済み、self.slack._emitter も伝搬済み)
             if new_preferences:
                 self.slack.post_feedback_result(
                     slack_channel,

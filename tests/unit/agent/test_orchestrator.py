@@ -251,7 +251,8 @@ class TestRunResearchers:
     def test_partial_failure_continues(self, mock_claude):
         from orchestrator import Orchestrator
 
-        def side_effect(prompt, allowed_tools=None):
+        def side_effect(prompt, allowed_tools=None, **_kwargs):
+            # T1-2b: call_claude に emitter kwarg が追加されたため、未知の kwarg を吸収する
             if "概要" in prompt:
                 return json.dumps({"result": json.dumps({"step_id": "r-1", "summary": "ok", "sources": []})})
             raise RuntimeError("Search failed")

@@ -285,3 +285,97 @@ class TestFeedbackProcessorProcess:
         # Slack通知に渡すのも3件以内
         notified_prefs = mock_slack.post_feedback_result.call_args[0][2]
         assert len(notified_prefs) == 3
+
+
+class TestFeedbackReceivedEmit:
+    """T1-2b (Tier 2.4): feedback_received イベントが Slack 応答後に emit される。"""
+
+    def _make_processor(self, mock_slack=None, mock_db=None):
+        from feedback.feedback_processor import FeedbackProcessor
+
+        slack = mock_slack or MagicMock()
+        db = mock_db or MagicMock()
+        return FeedbackProcessor(slack_client=slack, db_client=db)
+
+    @patch("feedback.feedback_processor._EventEmitter")
+    @patch("feedback.feedback_processor.call_claude")
+    def test_feedback_received_emitted_with_preferences_updated(self, mock_call_claude, mock_emitter_cls):
+        """好みが抽出された場合、learned_preferences_updated=True で emit される"""
+        mock_db = MagicMock()
+        mock_db.get_execution.return_value = {"topic": "T", "category": "技術"}
+        mock_db.get_user_profile.return_value = None
+        mock_call_claude.return_value = json.dumps(
+            {"result": json.dumps({"preferences": [{"text": "新しい好み", "replaces_index": None}]})}
+        )
+
+        emitter_instance = MagicMock()
+        mock_emitter_cls.return_value = emitter_instance
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "コードが良かった", "exec-001", "C1", "ts1")
+
+        mock_emitter_cls.assert_called_once_with("exec-001")
+        emitter_instance.emit.assert_called_once()
+        event_type, payload = emitter_instance.emit.call_args.args[:2]
+        assert event_type == "feedback_received"
+        assert payload["subtype"] == "mention_reply"
+        assert payload["execution_id"] == "exec-001"
+        assert payload["learned_preferences_updated"] is True
+        assert payload["new_preferences_count"] == 1
+        assert payload["total_preferences_count"] == 1
+        assert payload["reply_text_summary"] == "コードが良かった"
+
+    @patch("feedback.feedback_processor._EventEmitter")
+    @patch("feedback.feedback_processor.call_claude")
+    def test_feedback_received_marks_learned_preferences_false_when_no_extraction(
+        self, mock_call_claude, mock_emitter_cls
+    ):
+        mock_db = MagicMock()
+        mock_db.get_execution.return_value = {"topic": "T", "category": "技術"}
+        mock_db.get_user_profile.return_value = None
+        # parse_error → preferences 空配列 → learned_preferences_updated False
+        mock_call_claude.return_value = "garbage"
+
+        emitter_instance = MagicMock()
+        mock_emitter_cls.return_value = emitter_instance
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "feedback", "exec-002", "C1", "ts1")
+
+        emitter_instance.emit.assert_called_once()
+        payload = emitter_instance.emit.call_args.args[1]
+        assert payload["learned_preferences_updated"] is False
+        assert payload["new_preferences_count"] == 0
+
+    @patch("feedback.feedback_processor._EventEmitter")
+    @patch("feedback.feedback_processor.call_claude")
+    def test_feedback_received_truncates_long_feedback_text(self, mock_call_claude, mock_emitter_cls):
+        """200 文字超の feedback_text は先頭 200 + 「…」に切り詰められる (PII 配慮)"""
+        mock_db = MagicMock()
+        mock_db.get_execution.return_value = {"topic": "T", "category": "技術"}
+        mock_db.get_user_profile.return_value = None
+        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+
+        emitter_instance = MagicMock()
+        mock_emitter_cls.return_value = emitter_instance
+
+        long_feedback = "あ" * 250
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", long_feedback, "exec-003", "C1", "ts1")
+
+        payload = emitter_instance.emit.call_args.args[1]
+        assert len(payload["reply_text_summary"]) == 201  # 200 + 「…」
+        assert payload["reply_text_summary"].endswith("…")
+
+    @patch("feedback.feedback_processor._EventEmitter", None)
+    @patch("feedback.feedback_processor.call_claude")
+    def test_emit_skipped_when_event_emitter_unavailable(self, mock_call_claude):
+        """_EventEmitter が None でも process() は完走する (graceful skip)"""
+        mock_db = MagicMock()
+        mock_db.get_execution.return_value = {"topic": "T", "category": "技術"}
+        mock_db.get_user_profile.return_value = None
+        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "feedback", "exec-004", "C1", "ts1")
+        # 例外なく完走すれば OK

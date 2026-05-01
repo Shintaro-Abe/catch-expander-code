@@ -117,3 +117,49 @@ class TestSlackClient:
         assert call_kwargs["thread_ts"] == "ts1"
         assert "📝" in call_kwargs["text"]
         assert "抽出できませんでした" in call_kwargs["text"]
+
+
+class TestSlackApiCallEmit:
+    """T1-2b: SlackClient の api_call_completed / rate_limit_hit emit"""
+
+    def _make_client(self, emitter=None):
+        from notify.slack_client import SlackClient
+
+        client = SlackClient("xoxb-test-token")
+        if emitter is not None:
+            client._emitter = emitter
+        return client
+
+    def test_success_emits_api_call_completed(self):
+        emitter = MagicMock()
+        client = self._make_client(emitter=emitter)
+        client.client = MagicMock()
+
+        client.post_progress("C1", "ts1", "メッセージ")
+
+        events = [c.args[0] for c in emitter.emit.call_args_list]
+        assert "api_call_completed" in events
+        payload = next(c.args[1] for c in emitter.emit.call_args_list if c.args[0] == "api_call_completed")
+        assert payload["subtype"] == "slack"
+        assert payload["success"] is True
+        assert payload["endpoint_path"] == "/chat.postMessage"
+
+    @patch("notify.slack_client.time.sleep")
+    def test_ratelimited_emits_rate_limit_hit(self, mock_sleep):
+        emitter = MagicMock()
+        client = self._make_client(emitter=emitter)
+        client.client = MagicMock()
+        # SlackApiError で error="ratelimited" を再現
+        mock_response = MagicMock()
+        mock_response.__getitem__.side_effect = lambda key: "ratelimited" if key == "error" else None
+        mock_response.status_code = 429
+        mock_response.headers = {"Retry-After": "10"}
+        client.client.chat_postMessage.side_effect = SlackApiError("rate limited", response=mock_response)
+
+        with pytest.raises(SlackApiError):
+            client.post_progress("C1", "ts1", "メッセージ")
+
+        emitted = {c.args[0]: c.args[1] for c in emitter.emit.call_args_list}
+        assert emitted["rate_limit_hit"]["subtype"] == "slack_rate_limit"
+        assert emitted["rate_limit_hit"]["retry_after_seconds"] == 10
+        assert emitted["api_call_completed"]["success"] is False

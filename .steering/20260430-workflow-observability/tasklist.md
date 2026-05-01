@@ -24,7 +24,7 @@
 
 - [x] T1-1: 共通ヘルパー `src/observability/event_emitter.py` を実装 (合成 ID対応、9 ユニットテスト含む、`__init__.py` 経由で `EventEmitter` を export)
 - [x] T1-2: orchestrator (`src/agent/orchestrator.py`) に **基本 9 観測ポイント** の emit 呼び出しを追加 (`workflow_planned` / `subagent_started` × 3 / `subagent_completed` × 3 / `subagent_failed` / `research_completed` / `review_completed` / `notion_stored` / `github_stored` / `slack_notified` / `execution_completed` / `error`、_run_review_loop は シグネチャ・ロジック・戻り値不変、ECS Docker context 未配置時は `_NoOpEmitter` フォールバック、253 既存テスト回帰なし)
-- [ ] **T1-2b**: orchestrator + storage clients に **Tier 1/2 拡張イベント (4 種)** の emit 呼び出しを追加 (`api_call_completed` / `rate_limit_hit` / `feedback_received`)
+- [x] **T1-2b**: orchestrator + storage clients に **Tier 1/2 拡張イベント** の emit 呼び出しを追加 (`api_call_completed` / `rate_limit_hit` / `feedback_received`、Notion / GitHub / Slack / Anthropic CLI を観測、PII 配慮で feedback_text は 200 文字 + 「…」サマリ、Codex 連続レビュー 4 回で収束 = preflight GET 観測漏れ → feedback Slack & Anthropic 観測なし → feedback_received が Slack 失敗で欠落 → 収束)
 - [x] T1-3: Lambda Trigger (`src/trigger/app.py`) に `topic_received` emit を追加 (PII: user_id を SHA-256 16 文字 prefix にハッシュ化、Codex 連続レビュー 2 回で収束、Lambda zip 未同梱問題は T1-12 SAM Layer 化に集約)
 - [ ] **T1-3b**: token_monitor (`src/token_monitor/handler.py`) に `oauth_refresh_completed` / `oauth_refresh_failed` emit を追加 (Tier 1.4)
 - [ ] T1-4: SAM template に events テーブル + GSI 3 種 + TTL を定義

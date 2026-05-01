@@ -1,12 +1,26 @@
+import contextlib
 import logging
 import time
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+# T1-2b (Tier 1.2): API 呼び出し成否 + rate limit emit。詳細は notion_client.py 参照。
+try:
+    from src.observability import emit_api_call_completed, emit_rate_limit_hit
+except ImportError:  # pragma: no cover
+
+    def emit_api_call_completed(emitter, **kwargs) -> None:  # type: ignore[no-redef]
+        return None
+
+    def emit_rate_limit_hit(emitter, **kwargs) -> None:  # type: ignore[no-redef]
+        return None
+
+
 logger = logging.getLogger("catch-expander-agent")
 
 MAX_RETRIES = 3
+_SLACK_CHAT_POSTMESSAGE_PATH = "/chat.postMessage"
 
 
 class SlackClient:
@@ -14,24 +28,64 @@ class SlackClient:
 
     def __init__(self, bot_token: str) -> None:
         self.client = WebClient(token=bot_token)
+        # T1-2b: orchestrator が後から self._emitter を代入。未代入時は graceful skip。
+        self._emitter = None
 
     def _post_with_retry(self, channel: str, thread_ts: str, text: str) -> None:
         """リトライ付きでメッセージを投稿する"""
-        last_error: SlackApiError | None = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
-                return
-            except SlackApiError as e:
-                last_error = e
-                wait = 2**attempt
-                logger.warning(
-                    "Slack API error, retrying",
-                    extra={"attempt": attempt + 1, "wait_seconds": wait, "error": str(e.response["error"])},
-                )
-                time.sleep(wait)
-        if last_error:
-            raise last_error
+        # T1-2b: 終端で api_call_completed、ratelimited は rate_limit_hit を追加 emit。
+        start_ns = time.monotonic_ns()
+        success = False
+        final_status: int | None = None
+        try:
+            last_error: SlackApiError | None = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+                    success = True
+                    final_status = 200
+                    return
+                except SlackApiError as e:
+                    last_error = e
+                    # SlackApiError の response は SlackResponse (status_code 属性あり)
+                    with contextlib.suppress(Exception):
+                        final_status = e.response.status_code
+                    error_code = ""
+                    with contextlib.suppress(Exception):
+                        error_code = str(e.response["error"])
+                    if error_code == "ratelimited":
+                        retry_after_raw = ""
+                        with contextlib.suppress(Exception):
+                            retry_after_raw = e.response.headers.get("Retry-After", "") or ""
+                        retry_after_seconds: int | None = None
+                        if retry_after_raw:
+                            with contextlib.suppress(ValueError):
+                                retry_after_seconds = int(retry_after_raw)
+                        emit_rate_limit_hit(
+                            self._emitter,
+                            subtype="slack_rate_limit",
+                            endpoint_path=_SLACK_CHAT_POSTMESSAGE_PATH,
+                            retry_after_seconds=retry_after_seconds,
+                            detail=f"error={error_code}",
+                        )
+                    wait = 2**attempt
+                    logger.warning(
+                        "Slack API error, retrying",
+                        extra={"attempt": attempt + 1, "wait_seconds": wait, "error": error_code},
+                    )
+                    time.sleep(wait)
+            if last_error:
+                raise last_error
+        finally:
+            duration_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+            emit_api_call_completed(
+                self._emitter,
+                subtype="slack",
+                success=success,
+                duration_ms=duration_ms,
+                response_status_code=final_status,
+                endpoint_path=_SLACK_CHAT_POSTMESSAGE_PATH,
+            )
 
     def post_progress(self, channel: str, thread_ts: str, message: str) -> None:
         """進捗通知をスレッドに投稿"""

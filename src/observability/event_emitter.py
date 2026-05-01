@@ -106,3 +106,80 @@ class EventEmitter:
                 self.execution_id,
                 e,
             )
+
+
+# ---------------------------------------------------------------------------
+# T1-2b 共通ヘルパー (Tier 1.2): API call 観測
+# ---------------------------------------------------------------------------
+#
+# storage/notify クライアント (NotionClient / GitHubClient / SlackClient) から
+# 同じ payload 形で emit するための共通ヘルパー。各クライアントの
+# `_request_with_retry` / `_post_with_retry` の終端で呼ぶ想定。
+#
+# emitter が None の場合は no-op (orchestrator が emitter を伝搬していない
+# ユニットテスト経路でも安全に呼べる)。
+
+
+def emit_api_call_completed(
+    emitter: EventEmitter | None,
+    *,
+    subtype: str,
+    success: bool,
+    duration_ms: int,
+    response_status_code: int | None,
+    endpoint_path: str,
+) -> None:
+    """外部 API 呼び出しの終了を `api_call_completed` イベントとして emit する (Tier 1.2)。
+
+    Args:
+        emitter: orchestrator が伝搬した EventEmitter インスタンス。
+            None の場合は no-op (テスト/ECS 未配置経路で安全)。
+        subtype: "notion" / "github" / "slack" / "anthropic" 等の API 種別。
+        success: HTTP 2xx で成功とみなしたか。
+        duration_ms: API 呼び出し所要時間 (ms)。retry 含む全所要時間。
+        response_status_code: 最終 HTTP status code。例外で取得不能なら None。
+        endpoint_path: 呼び出した URL の path 部 (host + ?query は除く想定)。
+    """
+    if emitter is None:
+        return
+    emitter.emit(
+        "api_call_completed",
+        {
+            "subtype": subtype,
+            "success": success,
+            "duration_ms": duration_ms,
+            "response_status_code": response_status_code,
+            "endpoint_path": endpoint_path,
+        },
+    )
+
+
+def emit_rate_limit_hit(
+    emitter: EventEmitter | None,
+    *,
+    subtype: str,
+    endpoint_path: str,
+    retry_after_seconds: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """rate limit 検出を `rate_limit_hit` イベントとして emit する (Tier 1.2)。
+
+    Args:
+        emitter: orchestrator が伝搬した EventEmitter インスタンス。None なら no-op。
+        subtype: "anthropic_429" / "slack_rate_limit" / "github_429" /
+            "cloudflare_block" 等の検出元種別。
+        endpoint_path: rate limit を返した URL の path 部。
+        retry_after_seconds: ``Retry-After`` ヘッダ値 (取得できれば)。
+        detail: 補助情報 (例: Cloudflare CF-Ray、Slack `error` 文字列)。
+    """
+    if emitter is None:
+        return
+    payload: dict[str, Any] = {
+        "subtype": subtype,
+        "endpoint_path": endpoint_path,
+    }
+    if retry_after_seconds is not None:
+        payload["retry_after_seconds"] = retry_after_seconds
+    if detail is not None:
+        payload["detail"] = detail
+    emitter.emit("rate_limit_hit", payload)

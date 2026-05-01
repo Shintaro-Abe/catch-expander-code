@@ -1,5 +1,5 @@
 import copy
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -227,6 +227,92 @@ class TestNotionClient:
 
         assert mock_request.call_count == 3
         assert mock_sleep.call_count == 3
+
+
+class TestNotionApiCallEmit:
+    """T1-2b: NotionClient の api_call_completed / rate_limit_hit emit"""
+
+    def _make_client(self, emitter=None):
+        from storage.notion_client import NotionClient
+
+        client = NotionClient("ntn_test_token", "db-id-123")
+        if emitter is not None:
+            client._emitter = emitter
+        return client
+
+    @patch("storage.notion_client.requests.request")
+    def test_success_emits_api_call_completed_only(self, mock_request):
+        mock_response = mock_request.return_value
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"id": "page-id", "url": "https://notion.so/page"}
+
+        emitter = MagicMock()
+        client = self._make_client(emitter=emitter)
+        client.create_page("T", "技術", [], None, "U1")
+
+        # api_call_completed 1 回のみ (rate_limit_hit は出ない)
+        events = [c.args[0] for c in emitter.emit.call_args_list]
+        assert "api_call_completed" in events
+        assert "rate_limit_hit" not in events
+        api_payload = next(c.args[1] for c in emitter.emit.call_args_list if c.args[0] == "api_call_completed")
+        assert api_payload["subtype"] == "notion"
+        assert api_payload["success"] is True
+        assert api_payload["response_status_code"] == 200
+
+    @patch("storage.notion_client.requests.request")
+    def test_429_emits_rate_limit_hit_and_failed_api_call(self, mock_request):
+        import requests
+
+        error_response = mock_request.return_value
+        error_response.status_code = 429
+        error_response.text = "rate limited"
+        error_response.headers = {"Retry-After": "30"}
+        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+
+        emitter = MagicMock()
+        client = self._make_client(emitter=emitter)
+        with pytest.raises(requests.HTTPError):
+            client.create_page("T", "技術", [], None, "U1")
+
+        emitted = {c.args[0]: c.args[1] for c in emitter.emit.call_args_list}
+        assert emitted["rate_limit_hit"]["subtype"] == "notion_429"
+        assert emitted["rate_limit_hit"]["retry_after_seconds"] == 30
+        assert emitted["api_call_completed"]["success"] is False
+        assert emitted["api_call_completed"]["response_status_code"] == 429
+
+    @patch("storage.notion_client.requests.request")
+    def test_cloudflare_block_emits_rate_limit_hit(self, mock_request):
+        import requests
+
+        error_response = mock_request.return_value
+        error_response.status_code = 403
+        error_response.text = "Attention Required! | Cloudflare"
+        error_response.headers = {"CF-Ray": "abc123-NRT"}
+        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+
+        emitter = MagicMock()
+        client = self._make_client(emitter=emitter)
+        from storage.notion_client import NotionCloudflareBlockError
+
+        with pytest.raises(NotionCloudflareBlockError):
+            client.create_page("T", "技術", [], None, "U1")
+
+        emitted = {c.args[0]: c.args[1] for c in emitter.emit.call_args_list}
+        assert emitted["rate_limit_hit"]["subtype"] == "cloudflare_block"
+        assert "abc123-NRT" in emitted["rate_limit_hit"]["detail"]
+
+    @patch("storage.notion_client.requests.request")
+    def test_emit_skipped_when_emitter_not_set(self, mock_request):
+        """_emitter 未代入 (None) でも create_page は普通に動く"""
+        mock_response = mock_request.return_value
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"id": "page-id", "url": "https://notion.so/page"}
+
+        client = self._make_client()  # emitter=None
+        client.create_page("T", "技術", [], None, "U1")
+        # 例外なく動けば OK
 
 
 class TestCloudflareBlockDetection:

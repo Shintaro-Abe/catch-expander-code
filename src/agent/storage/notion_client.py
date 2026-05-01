@@ -4,6 +4,20 @@ import time
 
 import requests
 
+# T1-2b (Tier 1.2): API 呼び出し成否 + rate limit を events DDB に emit する。
+# Lambda zip / ECS image で `src/observability/` が同梱されない環境では
+# graceful skip 用の no-op スタブにフォールバックする (T1-2 / T1-3 と同じ規律)。
+try:
+    from src.observability import emit_api_call_completed, emit_rate_limit_hit
+except ImportError:  # pragma: no cover
+
+    def emit_api_call_completed(emitter, **kwargs) -> None:  # type: ignore[no-redef]
+        return None
+
+    def emit_rate_limit_hit(emitter, **kwargs) -> None:  # type: ignore[no-redef]
+        return None
+
+
 logger = logging.getLogger("catch-expander-agent")
 
 NOTION_API_BASE = "https://api.notion.com/v1"
@@ -114,63 +128,104 @@ class NotionClient:
             "Notion-Version": NOTION_VERSION,
             "Content-Type": "application/json",
         }
+        # T1-2b: orchestrator が `self._emitter = EventEmitter(...)` を後から代入する。
+        # 代入されない経路 (テスト / ECS observability 未配置) では None で graceful skip。
+        self._emitter = None
 
     def _request_with_retry(self, method: str, url: str, json_data: dict | None = None) -> dict:
         """リトライ付きでNotion APIリクエストを送信する"""
-        last_error: requests.HTTPError | None = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = requests.request(method, url, headers=self.headers, json=json_data, timeout=30)
-                response.raise_for_status()
-                return response.json()
-            except requests.HTTPError as e:
-                last_error = e
-                response_body = ""
-                with contextlib.suppress(Exception):
-                    response_body = e.response.text[:1000]
-                # 4xxはクライアントエラーのためリトライしない
-                if e.response.status_code < 500:
-                    if _is_cloudflare_block(e.response.status_code, response_body):
-                        cf_headers = _extract_cf_headers(e.response.headers)
-                        cf_ray = cf_headers.get("cf_ray")
-                        logger.warning(
-                            "Notion request blocked by Cloudflare | method=%s url=%s status=403",
+        # T1-2b: API 呼び出しの成否・所要時間・status を api_call_completed として emit する。
+        # 4xx 内で 429 / Cloudflare ブロックを検出した場合は rate_limit_hit も追加で emit。
+        start_ns = time.monotonic_ns()
+        success = False
+        final_status: int | None = None
+        endpoint_path = url.replace(NOTION_API_BASE, "") or "/"
+        try:
+            last_error: requests.HTTPError | None = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    response = requests.request(method, url, headers=self.headers, json=json_data, timeout=30)
+                    response.raise_for_status()
+                    success = True
+                    final_status = response.status_code
+                    return response.json()
+                except requests.HTTPError as e:
+                    last_error = e
+                    final_status = e.response.status_code
+                    response_body = ""
+                    with contextlib.suppress(Exception):
+                        response_body = e.response.text[:1000]
+                    # 4xxはクライアントエラーのためリトライしない
+                    if e.response.status_code < 500:
+                        if _is_cloudflare_block(e.response.status_code, response_body):
+                            cf_headers = _extract_cf_headers(e.response.headers)
+                            cf_ray = cf_headers.get("cf_ray")
+                            logger.warning(
+                                "Notion request blocked by Cloudflare | method=%s url=%s status=403",
+                                method,
+                                url,
+                                extra={
+                                    **cf_headers,
+                                    "user_agent_sent": self.headers.get("User-Agent", "<default>"),
+                                    "body_snippet": response_body[:200],
+                                },
+                            )
+                            emit_rate_limit_hit(
+                                self._emitter,
+                                subtype="cloudflare_block",
+                                endpoint_path=endpoint_path,
+                                detail=f"CF-Ray={cf_ray}" if cf_ray else None,
+                            )
+                            raise NotionCloudflareBlockError(
+                                f"Notion request blocked by Cloudflare (CF-Ray={cf_ray})",
+                                cf_ray=cf_ray,
+                            ) from e
+                        if e.response.status_code == 429:
+                            retry_after_raw = e.response.headers.get("Retry-After")
+                            retry_after_seconds: int | None = None
+                            if retry_after_raw is not None:
+                                with contextlib.suppress(ValueError):
+                                    retry_after_seconds = int(retry_after_raw)
+                            emit_rate_limit_hit(
+                                self._emitter,
+                                subtype="notion_429",
+                                endpoint_path=endpoint_path,
+                                retry_after_seconds=retry_after_seconds,
+                            )
+                        logger.error(
+                            "Notion API client error | method=%s url=%s status=%d response_body=%r",
                             method,
                             url,
-                            extra={
-                                **cf_headers,
-                                "user_agent_sent": self.headers.get("User-Agent", "<default>"),
-                                "body_snippet": response_body[:200],
-                            },
+                            e.response.status_code,
+                            response_body,
                         )
-                        raise NotionCloudflareBlockError(
-                            f"Notion request blocked by Cloudflare (CF-Ray={cf_ray})",
-                            cf_ray=cf_ray,
-                        ) from e
-                    logger.error(
-                        "Notion API client error | method=%s url=%s status=%d response_body=%r",
+                        raise
+                    wait = 2**attempt
+                    logger.warning(
+                        "Notion API server error, retrying | attempt=%d wait_seconds=%d "
+                        "method=%s url=%s status=%d response_body=%r",
+                        attempt + 1,
+                        wait,
                         method,
                         url,
                         e.response.status_code,
                         response_body,
                     )
-                    raise
-                wait = 2**attempt
-                logger.warning(
-                    "Notion API server error, retrying | attempt=%d wait_seconds=%d "
-                    "method=%s url=%s status=%d response_body=%r",
-                    attempt + 1,
-                    wait,
-                    method,
-                    url,
-                    e.response.status_code,
-                    response_body,
-                )
-                time.sleep(wait)
-        if last_error:
-            raise last_error
-        msg = "Unexpected: no error and no response"
-        raise RuntimeError(msg)
+                    time.sleep(wait)
+            if last_error:
+                raise last_error
+            msg = "Unexpected: no error and no response"
+            raise RuntimeError(msg)
+        finally:
+            duration_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+            emit_api_call_completed(
+                self._emitter,
+                subtype="notion",
+                success=success,
+                duration_ms=duration_ms,
+                response_status_code=final_status,
+                endpoint_path=endpoint_path,
+            )
 
     def create_page(
         self,

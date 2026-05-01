@@ -6,6 +6,14 @@ feedback_processor から events DDB テーブルに best-effort で書き込む
 詳細設計は `.steering/20260430-workflow-observability/design.md` 参照。
 """
 
-from src.observability.event_emitter import EventEmitter
+from src.observability.event_emitter import (
+    EventEmitter,
+    emit_api_call_completed,
+    emit_rate_limit_hit,
+)
 
-__all__ = ["EventEmitter"]
+__all__ = [
+    "EventEmitter",
+    "emit_api_call_completed",
+    "emit_rate_limit_hit",
+]

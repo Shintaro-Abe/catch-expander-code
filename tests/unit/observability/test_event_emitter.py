@@ -194,3 +194,90 @@ class TestEventEmitterSyntheticIds:
         item = mock_table.put_item.call_args.kwargs["Item"]
         assert item["execution_id"].startswith("system-token-refresh-")
         assert item["event_type"] == "oauth_refresh_completed"
+
+
+class TestApiCallHelpers:
+    """T1-2b: emit_api_call_completed / emit_rate_limit_hit ヘルパーの単体テスト。"""
+
+    def test_emit_api_call_completed_is_noop_when_emitter_none(self):
+        from src.observability.event_emitter import emit_api_call_completed
+
+        # None 渡しで例外を出さず None を返す (no-op)
+        result = emit_api_call_completed(
+            None,
+            subtype="notion",
+            success=True,
+            duration_ms=42,
+            response_status_code=200,
+            endpoint_path="/pages",
+        )
+        assert result is None
+
+    def test_emit_api_call_completed_forwards_payload(self):
+        from src.observability.event_emitter import emit_api_call_completed
+
+        mock_emitter = MagicMock()
+        emit_api_call_completed(
+            mock_emitter,
+            subtype="github",
+            success=False,
+            duration_ms=120,
+            response_status_code=500,
+            endpoint_path="/repos/foo/bar/contents/baz",
+        )
+
+        mock_emitter.emit.assert_called_once()
+        event_type, payload = mock_emitter.emit.call_args.args[:2]
+        assert event_type == "api_call_completed"
+        assert payload == {
+            "subtype": "github",
+            "success": False,
+            "duration_ms": 120,
+            "response_status_code": 500,
+            "endpoint_path": "/repos/foo/bar/contents/baz",
+        }
+
+    def test_emit_rate_limit_hit_is_noop_when_emitter_none(self):
+        from src.observability.event_emitter import emit_rate_limit_hit
+
+        result = emit_rate_limit_hit(
+            None,
+            subtype="slack_rate_limit",
+            endpoint_path="/chat.postMessage",
+        )
+        assert result is None
+
+    def test_emit_rate_limit_hit_forwards_optional_fields(self):
+        from src.observability.event_emitter import emit_rate_limit_hit
+
+        mock_emitter = MagicMock()
+        emit_rate_limit_hit(
+            mock_emitter,
+            subtype="cloudflare_block",
+            endpoint_path="/pages",
+            retry_after_seconds=60,
+            detail="CF-Ray=abc123",
+        )
+
+        mock_emitter.emit.assert_called_once()
+        event_type, payload = mock_emitter.emit.call_args.args[:2]
+        assert event_type == "rate_limit_hit"
+        assert payload["subtype"] == "cloudflare_block"
+        assert payload["endpoint_path"] == "/pages"
+        assert payload["retry_after_seconds"] == 60
+        assert payload["detail"] == "CF-Ray=abc123"
+
+    def test_emit_rate_limit_hit_omits_unset_optional_fields(self):
+        """retry_after_seconds / detail を渡さないと payload に含めない (省略可)。"""
+        from src.observability.event_emitter import emit_rate_limit_hit
+
+        mock_emitter = MagicMock()
+        emit_rate_limit_hit(
+            mock_emitter,
+            subtype="anthropic_429",
+            endpoint_path="/v1/messages",
+        )
+
+        payload = mock_emitter.emit.call_args.args[1]
+        assert "retry_after_seconds" not in payload
+        assert "detail" not in payload

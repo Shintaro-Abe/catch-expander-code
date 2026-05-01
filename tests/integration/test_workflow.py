@@ -177,7 +177,8 @@ class TestWorkflowE2E:
 
         call_count = 0
 
-        def mock_claude_side_effect(prompt, allowed_tools=None, model="sonnet"):
+        def mock_claude_side_effect(prompt, allowed_tools=None, model="sonnet", **_kwargs):
+            # T1-2b: call_claude に emitter kwarg が追加されたため、未知の kwarg を吸収する
             nonlocal call_count
             call_count += 1
             if call_count == 1:
