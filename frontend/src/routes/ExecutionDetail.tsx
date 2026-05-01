@@ -302,6 +302,7 @@ function JsonCard({ title, value }: { title: string; value: Record<string, unkno
           type="button"
           className="flex items-center justify-between w-full text-left"
           onClick={() => setOpen((v) => !v)}
+          aria-label={open ? "閉じる" : "開く"}
         >
           <CardTitle className="text-sm font-semibold text-foreground">{title}</CardTitle>
           {open ? <ChevronUp size={13} className="text-muted-foreground" /> : <ChevronDown size={13} className="text-muted-foreground" />}

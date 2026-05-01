@@ -121,22 +121,24 @@ export function ExecutionList() {
             <EmptyState />
           ) : (
             <>
-              <Table>
-                <TableHeader>
-                  <TableRow className="border-border hover:bg-transparent">
-                    <TableHead className="text-xs text-muted-foreground w-[80px]">状態</TableHead>
-                    <TableHead className="text-xs text-muted-foreground w-[110px]">ID</TableHead>
-                    <TableHead className="text-xs text-muted-foreground">トピック</TableHead>
-                    <TableHead className="text-xs text-muted-foreground text-right w-[80px]">実行時間</TableHead>
-                    <TableHead className="text-xs text-muted-foreground text-right w-[100px]">開始日時</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {pageRows.map((ex) => (
-                    <ExecutionRow key={ex.execution_id} ex={ex} />
-                  ))}
-                </TableBody>
-              </Table>
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="border-border hover:bg-transparent">
+                      <TableHead className="text-xs text-muted-foreground w-[80px]">状態</TableHead>
+                      <TableHead className="text-xs text-muted-foreground w-[110px]">ID</TableHead>
+                      <TableHead className="text-xs text-muted-foreground">トピック</TableHead>
+                      <TableHead className="text-xs text-muted-foreground text-right w-[80px]">実行時間</TableHead>
+                      <TableHead className="text-xs text-muted-foreground text-right w-[100px]">開始日時</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {pageRows.map((ex) => (
+                      <ExecutionRow key={ex.execution_id} ex={ex} />
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
 
               {/* Pagination */}
               {totalPages > 1 && (
@@ -202,6 +204,7 @@ function Pagination({
           type="button"
           onClick={onPrev}
           disabled={page === 1}
+          aria-label="前のページ"
           className="p-1 rounded text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
         >
           <ChevronLeft size={14} />
@@ -213,6 +216,7 @@ function Pagination({
           type="button"
           onClick={onNext}
           disabled={page === total}
+          aria-label="次のページ"
           className="p-1 rounded text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
         >
           <ChevronRight size={14} />

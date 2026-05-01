@@ -110,23 +110,25 @@ export function ErrorList() {
               この期間のエラーなし
             </div>
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow className="border-border hover:bg-transparent">
-                  <TableHead className="text-xs text-muted-foreground w-[100px]">日時</TableHead>
-                  <TableHead className="text-xs text-muted-foreground w-[110px]">実行 ID</TableHead>
-                  <TableHead className="text-xs text-muted-foreground w-[130px]">エラータイプ</TableHead>
-                  <TableHead className="text-xs text-muted-foreground w-[90px]">ステージ</TableHead>
-                  <TableHead className="text-xs text-muted-foreground">メッセージ</TableHead>
-                  <TableHead className="text-xs text-muted-foreground w-[70px] text-right">回復可否</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {filtered.map((err) => (
-                  <ErrorRow key={`${err.execution_id}-${err.timestamp}`} err={err} />
-                ))}
-              </TableBody>
-            </Table>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="border-border hover:bg-transparent">
+                    <TableHead className="text-xs text-muted-foreground w-[100px]">日時</TableHead>
+                    <TableHead className="text-xs text-muted-foreground w-[110px]">実行 ID</TableHead>
+                    <TableHead className="text-xs text-muted-foreground w-[130px]">エラータイプ</TableHead>
+                    <TableHead className="text-xs text-muted-foreground w-[90px]">ステージ</TableHead>
+                    <TableHead className="text-xs text-muted-foreground">メッセージ</TableHead>
+                    <TableHead className="text-xs text-muted-foreground w-[70px] text-right">回復可否</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filtered.map((err) => (
+                    <ErrorRow key={`${err.execution_id}-${err.timestamp}`} err={err} />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
           )}
         </CardContent>
       </Card>

@@ -93,21 +93,23 @@ export function ReviewQuality() {
               未修正コード問題なし
             </div>
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow className="border-border hover:bg-transparent">
-                  <TableHead className="text-xs text-muted-foreground w-[110px]">実行 ID</TableHead>
-                  <TableHead className="text-xs text-muted-foreground w-[90px] text-right">イテレーション</TableHead>
-                  <TableHead className="text-xs text-muted-foreground w-[90px] text-right">未修正件数</TableHead>
-                  <TableHead className="text-xs text-muted-foreground text-right w-[100px]">日時</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {issues.map((issue) => (
-                  <IssueRow key={`${issue.execution_id}-${issue.timestamp}`} issue={issue} />
-                ))}
-              </TableBody>
-            </Table>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="border-border hover:bg-transparent">
+                    <TableHead className="text-xs text-muted-foreground w-[110px]">実行 ID</TableHead>
+                    <TableHead className="text-xs text-muted-foreground w-[90px] text-right">イテレーション</TableHead>
+                    <TableHead className="text-xs text-muted-foreground w-[90px] text-right">未修正件数</TableHead>
+                    <TableHead className="text-xs text-muted-foreground text-right w-[100px]">日時</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {issues.map((issue) => (
+                    <IssueRow key={`${issue.execution_id}-${issue.timestamp}`} issue={issue} />
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
           )}
         </CardContent>
       </Card>
