@@ -25,7 +25,7 @@
 - [x] T1-1: 共通ヘルパー `src/observability/event_emitter.py` を実装 (合成 ID対応、9 ユニットテスト含む、`__init__.py` 経由で `EventEmitter` を export)
 - [x] T1-2: orchestrator (`src/agent/orchestrator.py`) に **基本 9 観測ポイント** の emit 呼び出しを追加 (`workflow_planned` / `subagent_started` × 3 / `subagent_completed` × 3 / `subagent_failed` / `research_completed` / `review_completed` / `notion_stored` / `github_stored` / `slack_notified` / `execution_completed` / `error`、_run_review_loop は シグネチャ・ロジック・戻り値不変、ECS Docker context 未配置時は `_NoOpEmitter` フォールバック、253 既存テスト回帰なし)
 - [ ] **T1-2b**: orchestrator + storage clients に **Tier 1/2 拡張イベント (4 種)** の emit 呼び出しを追加 (`api_call_completed` / `rate_limit_hit` / `feedback_received`)
-- [ ] T1-3: Lambda Trigger (`src/trigger/app.py`) に `topic_received` emit を追加
+- [x] T1-3: Lambda Trigger (`src/trigger/app.py`) に `topic_received` emit を追加 (PII: user_id を SHA-256 16 文字 prefix にハッシュ化、Codex 連続レビュー 2 回で収束、Lambda zip 未同梱問題は T1-12 SAM Layer 化に集約)
 - [ ] **T1-3b**: token_monitor (`src/token_monitor/handler.py`) に `oauth_refresh_completed` / `oauth_refresh_failed` emit を追加 (Tier 1.4)
 - [ ] T1-4: SAM template に events テーブル + GSI 3 種 + TTL を定義
 - [ ] T1-5: SAM template に OAuth state 一時保存テーブルを定義 (PK = state、`fingerprint` 属性も保存、TTL 10 分)
@@ -37,7 +37,7 @@
 - [ ] T1-10: 実行データ系 Lambda (list_executions / get_execution / get_execution_events) の実装 + SAM 定義
 - [ ] T1-11: メトリクス系 Lambda (get_metrics_summary / get_review_quality / get_errors) の実装 + SAM 定義
 - [ ] **T1-11b**: Tier 1/2 拡張メトリクス系 Lambda (get_cost_summary / get_api_health / get_token_monitor_health / get_feedback_aggregation) の実装 + SAM 定義
-- [ ] T1-12: 既存 IAM ロールに events テーブル PutItem 権限追加 + **各 Lambda の IAM ポリシーで `*` ワイルドカード使用禁止 / リソース ARN 限定を明示** (S2 対応) — **Docker build context は T1-2 内で解消済み** (T1-2 Codex P1 対応で `src/agent/Dockerfile` を repo root context に変更し `src/observability/` を `/app/src/observability/` に COPY)
+- [ ] T1-12: 既存 IAM ロールに events テーブル PutItem 権限追加 + **各 Lambda の IAM ポリシーで `*` ワイルドカード使用禁止 / リソース ARN 限定を明示** (S2 対応) — **Docker build context は T1-2 内で解消済み** (T1-2 Codex P1 対応で `src/agent/Dockerfile` を repo root context に変更し `src/observability/` を `/app/src/observability/` に COPY) / **`src/observability/` の SAM Lambda Layer 化を本タスクで追加** (Trigger / token_monitor / 将来の dashboard_api Lambda 群で共有、T1-3 / T1-3b の `_EventEmitter = None` graceful skip を本番で実 emit に転換するため必須、T1-14 dev デプロイ前に完了)
 - [ ] T1-13: バックエンドユニットテスト追加
 - [ ] T1-14: dev 環境への `sam deploy` + 手動 E2E (Slack OAuth ログインまで)
 - [ ] T1-15: Codex 連続レビュー (2〜3 回、収束まで)

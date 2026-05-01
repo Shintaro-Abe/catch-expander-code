@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import uuid
@@ -8,6 +9,15 @@ from aws_lambda_powertools import Logger
 from boto3.dynamodb.conditions import Attr, Key
 from slack_sdk import WebClient
 from slack_verify import verify_slack_signature
+
+# events DDB への構造化イベント書き込み (T1-3、design.md §7.3)。
+# Lambda zip packaging (`CodeUri: src/trigger/`) では `src/observability/` が同梱されない。
+# SAM Layer 化等の根本解決は別タスク (T1-12 / T1-2b 周辺) で対応するため、
+# 現状は ImportError を graceful skip して既存挙動を維持する。
+try:
+    from src.observability import EventEmitter as _EventEmitter
+except ImportError:  # pragma: no cover - Lambda zip 内でのみ発生
+    _EventEmitter = None
 
 logger = Logger(service="catch-expander-trigger")
 
@@ -371,5 +381,21 @@ def lambda_handler(event: dict, context: object) -> dict:
     )
 
     logger.info("ECS task started", extra={"execution_id": execution_id})
+
+    # T1-3: topic_received イベント (design.md §7.3)。
+    # ECS RunTask 成功直後で emit。EventEmitter は best-effort 設計なので
+    # 書き込み失敗してもここで例外は伝播せず、Slack ACK / DDB / RunTask には影響しない。
+    # PII: Slack user ID は SHA-256 ハッシュ化して保存、topic / channel は raw 保持 (§7.4)。
+    if _EventEmitter is not None:
+        emitter = _EventEmitter(execution_id)
+        emitter.emit(
+            "topic_received",
+            {
+                "topic": topic,
+                "user_id_hash": hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16],
+                "channel_id": channel,
+                "workflow_run_id": execution_id,
+            },
+        )
 
     return {"statusCode": 200, "body": ""}

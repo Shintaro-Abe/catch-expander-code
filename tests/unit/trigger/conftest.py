@@ -25,3 +25,9 @@ if "app" not in sys.modules:
             sys.modules.pop("boto3", None)
         sys.modules.pop("boto3.dynamodb", None)
         sys.modules.pop("boto3.dynamodb.conditions", None)
+        # T1-3 で追加した `from src.observability import EventEmitter` の連鎖で、
+        # event_emitter モジュール内の `boto3` 参照がモック化された MagicMock に固着する。
+        # 後続の tests/unit/observability/ で実 boto3 ベースの mock が効かなくなるため
+        # ここで sys.modules から落として、observability テストで新規 import させる。
+        sys.modules.pop("src.observability.event_emitter", None)
+        sys.modules.pop("src.observability", None)

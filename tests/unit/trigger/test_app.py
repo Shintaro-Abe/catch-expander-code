@@ -1210,3 +1210,83 @@ class TestHistoryCommandRouting:
         text = mock_slack.chat_postMessage.call_args[1]["text"]
         assert "❌" in text
         assert "エラー" in text
+
+
+@pytest.mark.usefixtures("_env_vars")
+class TestTopicReceivedEmit:
+    """T1-3: 新規トピック受領時に topic_received イベントが emit される"""
+
+    @staticmethod
+    def _make_event_body() -> dict:
+        return {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "text": "<@U_BOT> Terraform 入門",
+                "user": "U_USER123",
+                "channel": "C_CHANNEL",
+            },
+        }
+
+    def _setup_basic_mocks(self, mock_secrets, mock_webclient_cls, mock_dynamodb):
+        mock_secrets.get_secret_value.side_effect = lambda SecretId: {  # noqa: N803
+            "arn:aws:secretsmanager:ap-northeast-1:123:secret:signing": {"SecretString": SIGNING_SECRET},
+            "arn:aws:secretsmanager:ap-northeast-1:123:secret:bot-token": {"SecretString": "xoxb-test"},
+        }[SecretId]
+        mock_slack = MagicMock()
+        mock_webclient_cls.return_value = mock_slack
+        mock_slack.chat_postMessage.return_value = {"ts": "1234567890.000100"}
+        mock_dynamodb.Table.return_value = MagicMock()
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_topic_received_emitted_with_correct_payload(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb, mock_ecs
+    ):
+        from app import lambda_handler
+
+        self._setup_basic_mocks(mock_secrets, mock_webclient_cls, mock_dynamodb)
+        emitter_instance = MagicMock()
+        with patch("app._EventEmitter") as mock_emitter_cls:
+            mock_emitter_cls.return_value = emitter_instance
+            result = lambda_handler(_make_event(self._make_event_body()), _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_ecs.run_task.assert_called_once()
+
+        # EventEmitter は execution_id (= workflow_run_id) で初期化される
+        mock_emitter_cls.assert_called_once()
+        execution_id_arg = mock_emitter_cls.call_args.args[0]
+        assert execution_id_arg.startswith("exec-")
+
+        # emit は topic_received で 1 回
+        emitter_instance.emit.assert_called_once()
+        event_type, payload = emitter_instance.emit.call_args.args[:2]
+        assert event_type == "topic_received"
+        assert payload["topic"] == "Terraform 入門"
+        assert payload["channel_id"] == "C_CHANNEL"
+        # PII: user_id_hash は SHA-256 16 文字 prefix (raw user_id を含まない)
+        expected_hash = hashlib.sha256(b"U_USER123").hexdigest()[:16]
+        assert payload["user_id_hash"] == expected_hash
+        assert "U_USER123" not in str(payload)
+        # workflow_run_id は execution_id と一致 (design.md §2.5 整合性)
+        assert payload["workflow_run_id"] == execution_id_arg
+
+    @patch("app.ecs_client")
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_emit_skipped_when_event_emitter_unavailable(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb, mock_ecs
+    ):
+        """_EventEmitter が None (Lambda zip 内 fallback) でも 200 + 既存挙動を維持する"""
+        from app import lambda_handler
+
+        self._setup_basic_mocks(mock_secrets, mock_webclient_cls, mock_dynamodb)
+        with patch("app._EventEmitter", None):
+            result = lambda_handler(_make_event(self._make_event_body()), _make_lambda_context())
+
+        assert result["statusCode"] == 200
+        mock_ecs.run_task.assert_called_once()
