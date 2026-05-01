@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "src/agent/**"
+      - "src/observability/**"
 
 permissions:
   id-token: write
@@ -41,7 +42,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: ./src/agent
+          context: .
+          file: ./src/agent/Dockerfile
           platforms: linux/arm64
           push: true
           tags: |

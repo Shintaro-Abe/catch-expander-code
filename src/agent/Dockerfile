@@ -11,7 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     && rm -rf /var/lib/apt/lists/*
 
 # アプリケーションコード
-COPY . /app/
+# build context は repo root (T1-2 P1 対応)。
+# - src/agent/ を /app/ に直置き (既存の `from notify.* import ...` 等を維持)
+# - src/observability/ を /app/src/observability/ に配置して
+#   orchestrator.py の `from src.observability import EventEmitter` を
+#   コンテナ内でも解決可能にする (Codex P1: 観測 dead code 解消)。
+COPY src/agent/ /app/
+COPY src/observability/ /app/src/observability/
+RUN : > /app/src/__init__.py
 WORKDIR /app
 
 # Python依存パッケージ

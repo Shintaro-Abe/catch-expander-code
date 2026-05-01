@@ -1,22 +1,103 @@
 import concurrent.futures
 import json
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+import traceback
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 from notify.slack_client import SlackClient
 from state.dynamodb_client import DynamoDbClient
 from storage.github_client import GitHubClient
 from storage.notion_client import NotionClient
 
+# events DDB への構造化イベント書き込みヘルパー (T1-1 で追加、design.md §7)。
+# orchestrator は ECS Fargate 上で動作するため、Docker build context (`./src/agent`) には
+# `src/observability/` が含まれない。ECR ビルド時に未解決にならないよう
+# ImportError は graceful skip し、no-op emitter にフォールバックする。
+# Docker build context の整備は別タスク (T1-12 周辺) で対応する。
+try:
+    from src.observability import EventEmitter as _EventEmitter
+except ImportError:  # pragma: no cover - 本番 ECS image でのみ発生
+    _EventEmitter = None
+
 logger = logging.getLogger("catch-expander-agent")
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 MAX_REVIEW_LOOPS = 2
 MAX_CLAUDE_RETRIES = 3
+
+_CODE_RELATED_UNFIXED_PATTERN = re.compile(r"コード関連指摘\s*(\d+)\s*件は本ループ未修正")
+
+
+class _NoOpEmitter:
+    """EventEmitter が import できない / Orchestrator が __init__ 直後にメソッド単体で
+    呼ばれた場合のためのデフォルト実装。emit は何もしない。"""
+
+    def emit(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+        return
+
+
+def _extract_code_related_unfixed_count(notes: list[str]) -> int:
+    """fixer notes から「コード関連指摘 N 件は本ループ未修正」の N を抽出して合計する。
+
+    対症療法アンチパターン緩和パッチ (8c5b220) で fixer が記録するメッセージ。
+    review_completed イベントの payload に集計値として含める (design.md §2.3)。
+    """
+    total = 0
+    for note in notes:
+        if not isinstance(note, str):
+            continue
+        m = _CODE_RELATED_UNFIXED_PATTERN.search(note)
+        if m:
+            total += int(m.group(1))
+    return total
+
+
+def _summarize_issues(issues: list[dict], limit: int = 10) -> list[dict]:
+    """review_result.issues を payload 用に縮約する。message は先頭 200 文字に切り詰める。"""
+    summary: list[dict] = []
+    for issue in issues[:limit]:
+        if not isinstance(issue, dict):
+            continue
+        message = issue.get("message", "")
+        if isinstance(message, str) and len(message) > 200:
+            message = message[:200] + "…"
+        summary.append(
+            {
+                "severity": issue.get("severity"),
+                "target_field": issue.get("target_field"),
+                "message_excerpt": message,
+            }
+        )
+    return summary
+
+
+def _extract_source_domains(sources: list[dict]) -> list[str]:
+    """sources の URL からホスト名を抽出して uniq + 30 件上限で返す。"""
+    domains: list[str] = []
+    seen: set[str] = set()
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        url = src.get("url")
+        if not isinstance(url, str):
+            continue
+        try:
+            host = urlparse(url).netloc
+        except ValueError:
+            continue
+        if host and host not in seen:
+            seen.add(host)
+            domains.append(host)
+            if len(domains) >= 30:
+                break
+    return domains
 
 # generator は text 成果物のみを返す契約のため、レビュー修正レスポンスを
 # current_deliverables に代入すると iac_code/program_code 由来の code_files が失われる。
@@ -469,6 +550,9 @@ class Orchestrator:
         self.db = db_client
         self.notion = NotionClient(notion_token, notion_database_id)
         self.github = GitHubClient(github_token, github_repo)
+        # run() で本物の EventEmitter に差し替え。run() を経由しないテスト/直接呼び出し
+        # では _NoOpEmitter のままなので副作用なし。
+        self._emitter: Any = _NoOpEmitter()
 
     def run(
         self,
@@ -478,265 +562,463 @@ class Orchestrator:
         slack_channel: str,
         slack_thread_ts: str,
     ) -> None:
-        """ワークフローを実行する"""
+        """ワークフローを実行する
+
+        T1-2 (design.md §7.2): 主要パスは不変、観測ポイントに best-effort emit を挿入。
+        run() 全体を try/except/finally で包み、終端で必ず ``execution_completed`` を emit する
+        (best-effort 設計: emit 失敗は業務継続をブロックしない、event_emitter.py 参照)。
+        """
         logger.info("Orchestrator started", extra={"execution_id": execution_id, "topic": topic})
 
-        # 1. プロファイル取得
-        profile = self.db.get_user_profile(user_id) or {}
-        profile_text_base = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
-        learned_prefs = profile.get("learned_preferences", [])
-        if learned_prefs:
-            prefs_lines = "\n".join(f"- {p['text']}" for p in learned_prefs)
-            profile_text = (
-                f"{profile_text_base}\n\n"
-                "## ユーザーの蓄積された好み（学習済み）\n"
-                "以下の好みを成果物の生成方針に必ず反映してください：\n"
-                f"{prefs_lines}"
-            )
-        else:
-            profile_text = profile_text_base
+        # _NoOpEmitter (__init__) を本物に差し替え。ECS image で src.observability が
+        # 未配置の場合 (_EventEmitter is None) は _NoOpEmitter のままで継続する。
+        if _EventEmitter is not None:
+            self._emitter = _EventEmitter(execution_id)
 
-        # 2. トピック解析
-        orchestrator_prompt = _load_prompt("orchestrator")
-        analysis_prompt = (
-            f"{orchestrator_prompt}\n\n"
-            f"## トピック解析を実行してください\n\n"
-            f"トピック: {topic}\n\n"
-            f"ユーザープロファイル:\n{profile_text}"
-        )
-        analysis_raw = call_claude(analysis_prompt)
-        analysis = _parse_claude_response(analysis_raw)
-        logger.info("Topic analyzed", extra={"execution_id": execution_id, "category": analysis.get("category")})
+        overall_start_ns = time.monotonic_ns()
+        final_status = "in_progress"
+        notion_url: str | None = None
+        github_url: str | None = None
 
-        self.db.update_execution_status(execution_id, "planning")
-
-        # 3. ワークフロー設計
-        wf_prompt = (
-            f"{orchestrator_prompt}\n\n"
-            f"## ワークフロー設計を実行してください\n\n"
-            f"トピック解析結果:\n```json\n{json.dumps(analysis, ensure_ascii=False)}\n```\n\n"
-            f"ユーザープロファイル:\n{profile_text}"
-        )
-        wf_raw = call_claude(wf_prompt)
-        workflow = _parse_claude_response(wf_raw)
-        logger.info(
-            "Workflow designed",
-            extra={
-                "execution_id": execution_id,
-                "research_steps": len(workflow.get("research_steps", [])),
-                "generate_steps": [s.get("deliverable_type") for s in workflow.get("generate_steps", [])],
-                "storage_targets": workflow.get("storage_targets", ["notion"]),
-            },
-        )
-
-        # ワークフロー計画をSlack通知
-        research_names = [s["step_name"] for s in workflow.get("research_steps", [])]
-        generate_names = [s["step_name"] for s in workflow.get("generate_steps", [])]
-        storage_targets = workflow.get("storage_targets", ["notion"])
-        plan_text = (
-            f"📋 以下の計画で進めます：\n"
-            f"  調査 [{', '.join(research_names)}]\n"
-            f"  成果物 [{', '.join(generate_names)}]\n"
-            f"  格納先 [{' + '.join(t.capitalize() for t in storage_targets)}]"
-        )
-        self.slack.post_progress(slack_channel, slack_thread_ts, plan_text)
-
-        # ワークフロー計画をDynamoDBに保存
-        self.db._table("workflow-executions").update_item(
-            Key={"execution_id": execution_id},
-            UpdateExpression=(
-                "SET workflow_plan = :plan, category = :cat, intent = :intent,"
-                " perspectives = :persp, deliverable_types = :dtypes"
-            ),
-            ExpressionAttributeValues={
-                ":plan": workflow,
-                ":cat": analysis.get("category", ""),
-                ":intent": analysis.get("intent", ""),
-                ":persp": analysis.get("perspectives", []),
-                ":dtypes": analysis.get("deliverable_types", []),
-            },
-        )
-
-        self.db.update_execution_status(execution_id, "researching")
-
-        # 4. リサーチャー並列実行
-        researcher_prompt = _load_prompt("researcher")
-        research_steps = workflow.get("research_steps", [])
-        category = analysis.get("category", "技術")
-
-        research_results = self._run_researchers(
-            execution_id, research_steps, researcher_prompt, category, slack_channel, slack_thread_ts
-        )
-
-        self.slack.post_progress(slack_channel, slack_thread_ts, "🔍 調査が完了しました")
-
-        # 5. ジェネレーター起動
-        self.db.update_execution_status(execution_id, "generating")
-        self.slack.post_progress(slack_channel, slack_thread_ts, "📝 成果物を生成中...")
-
-        generator_prompt = _load_prompt("generator")
-        combined_research = json.dumps(research_results, ensure_ascii=False)
-        gen_prompt = (
-            f"{generator_prompt}\n\n"
-            f"## 成果物を生成してください\n\n"
-            f"トピック: {topic}\n"
-            f"カテゴリ: {category}\n\n"
-            f"ワークフロー計画:\n```json\n{json.dumps(workflow, ensure_ascii=False)}\n```\n\n"
-            f"調査結果:\n```json\n{combined_research}\n```\n\n"
-            f"ユーザープロファイル:\n{profile_text}"
-        )
-        gen_raw = call_claude(gen_prompt)
-        deliverables = _parse_claude_response(gen_raw)
-        # ジェネレーターは text 成果物のみを返す。code_files は常に独立生成する
-        deliverables.pop("code_files", None)
-
-        # 5b. コード成果物のタイプ別独立生成（ファイル書き込み方式）
-        # 旧 JSON 文字列値方式は HCL/Python の JSON エスケープが LLM 任せで確率的に壊れたため、
-        # Claude Code CLI の Write ツールに sandbox cwd 配下へ直接書かせる方式へ移行。
-        generate_step_types = [s.get("deliverable_type") for s in workflow.get("generate_steps", [])]
-        code_types = [t for t in generate_step_types if t in ("iac_code", "program_code")]
-        if code_types and "github" in storage_targets:
-            self.slack.post_progress(slack_channel, slack_thread_ts, "⚙️ コード成果物を生成中...")
-            code_files_merged: dict[str, str] = {}
-            readme_parts: list[str] = []
-            failed_code_types: list[str] = []
-            for code_type in code_types:
-                logger.info(
-                    "Generating code files for type (workspace mode)",
-                    extra={"execution_id": execution_id, "code_type": code_type},
+        try:
+            # 1. プロファイル取得
+            profile = self.db.get_user_profile(user_id) or {}
+            profile_text_base = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
+            learned_prefs = profile.get("learned_preferences", [])
+            if learned_prefs:
+                prefs_lines = "\n".join(f"- {p['text']}" for p in learned_prefs)
+                profile_text = (
+                    f"{profile_text_base}\n\n"
+                    "## ユーザーの蓄積された好み（学習済み）\n"
+                    "以下の好みを成果物の生成方針に必ず反映してください：\n"
+                    f"{prefs_lines}"
                 )
-                prompt = _build_code_generation_prompt(topic, category, research_results, profile_text, code_type)
-                raw_stdout, files, outcome = call_claude_with_workspace(prompt, code_type)
+            else:
+                profile_text = profile_text_base
 
-                if outcome["files_kind"] == "valid":
-                    readme_text = files.pop("README.md", None)
-                    if readme_text and readme_text.strip():
-                        label = _CODE_TYPE_LABELS.get(code_type, code_type)
-                        readme_parts.append(f"## {label}\n\n{readme_text}")
-                    code_files_merged.update(files)
+            # 2. トピック解析
+            orchestrator_prompt = _load_prompt("orchestrator")
+            analysis_prompt = (
+                f"{orchestrator_prompt}\n\n"
+                f"## トピック解析を実行してください\n\n"
+                f"トピック: {topic}\n\n"
+                f"ユーザープロファイル:\n{profile_text}"
+            )
+            analysis_raw = call_claude(analysis_prompt)
+            analysis = _parse_claude_response(analysis_raw)
+            logger.info(
+                "Topic analyzed",
+                extra={"execution_id": execution_id, "category": analysis.get("category")},
+            )
+
+            self.db.update_execution_status(execution_id, "planning")
+
+            # 3. ワークフロー設計
+            wf_prompt = (
+                f"{orchestrator_prompt}\n\n"
+                f"## ワークフロー設計を実行してください\n\n"
+                f"トピック解析結果:\n```json\n{json.dumps(analysis, ensure_ascii=False)}\n```\n\n"
+                f"ユーザープロファイル:\n{profile_text}"
+            )
+            wf_raw = call_claude(wf_prompt)
+            workflow = _parse_claude_response(wf_raw)
+            logger.info(
+                "Workflow designed",
+                extra={
+                    "execution_id": execution_id,
+                    "research_steps": len(workflow.get("research_steps", [])),
+                    "generate_steps": [s.get("deliverable_type") for s in workflow.get("generate_steps", [])],
+                    "storage_targets": workflow.get("storage_targets", ["notion"]),
+                },
+            )
+
+            # ワークフロー計画をSlack通知
+            research_names = [s["step_name"] for s in workflow.get("research_steps", [])]
+            generate_names = [s["step_name"] for s in workflow.get("generate_steps", [])]
+            storage_targets = workflow.get("storage_targets", ["notion"])
+            plan_text = (
+                f"📋 以下の計画で進めます：\n"
+                f"  調査 [{', '.join(research_names)}]\n"
+                f"  成果物 [{', '.join(generate_names)}]\n"
+                f"  格納先 [{' + '.join(t.capitalize() for t in storage_targets)}]"
+            )
+            self.slack.post_progress(slack_channel, slack_thread_ts, plan_text)
+
+            # ワークフロー設計完了 (T1-2 観測ポイント): planned_subagents は本実装の固定構成。
+            generate_step_types_for_emit = [s.get("deliverable_type") for s in workflow.get("generate_steps", [])]
+            self._emitter.emit(
+                "workflow_planned",
+                {
+                    "topic_category": analysis.get("category", ""),
+                    "expected_deliverable_type": (
+                        generate_step_types_for_emit[0] if generate_step_types_for_emit else None
+                    ),
+                    "deliverable_types": generate_step_types_for_emit,
+                    "planned_subagents": ["researcher", "generator", "reviewer"],
+                    "planning_summary": (analysis.get("intent") or "")[:500],
+                    "storage_targets": storage_targets,
+                },
+            )
+
+            # ワークフロー計画をDynamoDBに保存
+            self.db._table("workflow-executions").update_item(
+                Key={"execution_id": execution_id},
+                UpdateExpression=(
+                    "SET workflow_plan = :plan, category = :cat, intent = :intent,"
+                    " perspectives = :persp, deliverable_types = :dtypes"
+                ),
+                ExpressionAttributeValues={
+                    ":plan": workflow,
+                    ":cat": analysis.get("category", ""),
+                    ":intent": analysis.get("intent", ""),
+                    ":persp": analysis.get("perspectives", []),
+                    ":dtypes": analysis.get("deliverable_types", []),
+                },
+            )
+
+            self.db.update_execution_status(execution_id, "researching")
+
+            # 4. リサーチャー並列実行
+            researcher_prompt = _load_prompt("researcher")
+            research_steps = workflow.get("research_steps", [])
+            category = analysis.get("category", "技術")
+
+            researcher_start_ns = time.monotonic_ns()
+            self._emitter.emit(
+                "subagent_started",
+                {"subagent": "researcher", "input_summary": f"{len(research_steps)} research steps"},
+            )
+            try:
+                research_results = self._run_researchers(
+                    execution_id, research_steps, researcher_prompt, category, slack_channel, slack_thread_ts
+                )
+            except Exception as e:
+                self._emitter.emit(
+                    "subagent_failed",
+                    {
+                        "subagent": "researcher",
+                        "duration_ms": (time.monotonic_ns() - researcher_start_ns) // 1_000_000,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)[:500],
+                    },
+                    status_at_emit="failed",
+                )
+                raise
+            researcher_duration_ms = (time.monotonic_ns() - researcher_start_ns) // 1_000_000
+            all_sources: list[dict] = []
+            for r in research_results:
+                all_sources.extend(r.get("sources", []))
+            self._emitter.emit(
+                "subagent_completed",
+                {
+                    "subagent": "researcher",
+                    "duration_ms": researcher_duration_ms,
+                    "tokens_used": None,
+                    "output_summary": f"{len(research_results)} steps, {len(all_sources)} sources",
+                },
+            )
+            self._emitter.emit(
+                "research_completed",
+                {
+                    "source_count": len(all_sources),
+                    "source_domains": _extract_source_domains(all_sources),
+                    "total_tokens_used": None,
+                },
+            )
+
+            self.slack.post_progress(slack_channel, slack_thread_ts, "🔍 調査が完了しました")
+
+            # 5. ジェネレーター起動
+            self.db.update_execution_status(execution_id, "generating")
+            self.slack.post_progress(slack_channel, slack_thread_ts, "📝 成果物を生成中...")
+
+            generator_prompt = _load_prompt("generator")
+            combined_research = json.dumps(research_results, ensure_ascii=False)
+            gen_prompt = (
+                f"{generator_prompt}\n\n"
+                f"## 成果物を生成してください\n\n"
+                f"トピック: {topic}\n"
+                f"カテゴリ: {category}\n\n"
+                f"ワークフロー計画:\n```json\n{json.dumps(workflow, ensure_ascii=False)}\n```\n\n"
+                f"調査結果:\n```json\n{combined_research}\n```\n\n"
+                f"ユーザープロファイル:\n{profile_text}"
+            )
+            generator_start_ns = time.monotonic_ns()
+            self._emitter.emit(
+                "subagent_started",
+                {"subagent": "generator", "input_summary": f"category={category}"},
+            )
+            try:
+                gen_raw = call_claude(gen_prompt)
+                deliverables = _parse_claude_response(gen_raw)
+            except Exception as e:
+                self._emitter.emit(
+                    "subagent_failed",
+                    {
+                        "subagent": "generator",
+                        "stage": "text_generation",
+                        "duration_ms": (time.monotonic_ns() - generator_start_ns) // 1_000_000,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)[:500],
+                    },
+                    status_at_emit="failed",
+                )
+                raise
+            # ジェネレーターは text 成果物のみを返す。code_files は常に独立生成する
+            deliverables.pop("code_files", None)
+
+            # 5b. コード成果物のタイプ別独立生成（ファイル書き込み方式）
+            # 旧 JSON 文字列値方式は HCL/Python の JSON エスケープが LLM 任せで確率的に壊れたため、
+            # Claude Code CLI の Write ツールに sandbox cwd 配下へ直接書かせる方式へ移行。
+            generate_step_types = [s.get("deliverable_type") for s in workflow.get("generate_steps", [])]
+            code_types = [t for t in generate_step_types if t in ("iac_code", "program_code")]
+            failed_code_types: list[str] = []
+            if code_types and "github" in storage_targets:
+                self.slack.post_progress(slack_channel, slack_thread_ts, "⚙️ コード成果物を生成中...")
+                code_files_merged: dict[str, str] = {}
+                readme_parts: list[str] = []
+                for code_type in code_types:
                     logger.info(
-                        "Code files generated (workspace mode) | execution_id=%s code_type=%s "
-                        "files_count=%d files_total_bytes=%d rejected_count=%d",
-                        execution_id,
-                        code_type,
-                        outcome["files_count"],
-                        outcome["files_total_bytes"],
-                        len(outcome["rejected"]),
+                        "Generating code files for type (workspace mode)",
+                        extra={"execution_id": execution_id, "code_type": code_type},
                     )
-                else:
-                    stdout_preview = (raw_stdout or "")[:_WORKSPACE_STDOUT_PREVIEW_LIMIT]
-                    logger.warning(
-                        "Code generation failed (workspace mode) | execution_id=%s code_type=%s "
-                        "files_kind=%s files_count=%d rejected=%s stdout_preview=%r",
-                        execution_id,
-                        code_type,
-                        outcome["files_kind"],
-                        outcome["files_count"],
-                        outcome["rejected"][:5],
-                        stdout_preview,
+                    prompt = _build_code_generation_prompt(topic, category, research_results, profile_text, code_type)
+                    # T1-2 P2 対応: call_claude_with_workspace の retry exhaust で発生する
+                    # CalledProcessError 等を捕捉し、subagent_failed をペアで emit してから再 raise する
+                    # (既存挙動 = 上位 try でも捕捉されるが、subagent_started/failed 対応を維持するため明示)。
+                    try:
+                        raw_stdout, files, outcome = call_claude_with_workspace(prompt, code_type)
+                    except Exception as e:
+                        self._emitter.emit(
+                            "subagent_failed",
+                            {
+                                "subagent": "generator",
+                                "stage": "code_generation",
+                                "code_type": code_type,
+                                "duration_ms": (time.monotonic_ns() - generator_start_ns) // 1_000_000,
+                                "error_type": type(e).__name__,
+                                "error_message": str(e)[:500],
+                            },
+                            status_at_emit="failed",
+                        )
+                        raise
+
+                    if outcome["files_kind"] == "valid":
+                        readme_text = files.pop("README.md", None)
+                        if readme_text and readme_text.strip():
+                            label = _CODE_TYPE_LABELS.get(code_type, code_type)
+                            readme_parts.append(f"## {label}\n\n{readme_text}")
+                        code_files_merged.update(files)
+                        logger.info(
+                            "Code files generated (workspace mode) | execution_id=%s code_type=%s "
+                            "files_count=%d files_total_bytes=%d rejected_count=%d",
+                            execution_id,
+                            code_type,
+                            outcome["files_count"],
+                            outcome["files_total_bytes"],
+                            len(outcome["rejected"]),
+                        )
+                    else:
+                        stdout_preview = (raw_stdout or "")[:_WORKSPACE_STDOUT_PREVIEW_LIMIT]
+                        logger.warning(
+                            "Code generation failed (workspace mode) | execution_id=%s code_type=%s "
+                            "files_kind=%s files_count=%d rejected=%s stdout_preview=%r",
+                            execution_id,
+                            code_type,
+                            outcome["files_kind"],
+                            outcome["files_count"],
+                            outcome["rejected"][:5],
+                            stdout_preview,
+                        )
+                        failed_code_types.append(code_type)
+
+                if code_files_merged:
+                    deliverables["code_files"] = {
+                        "files": code_files_merged,
+                        "readme_content": "\n\n".join(readme_parts) if readme_parts else "",
+                    }
+
+                if failed_code_types:
+                    labels = [_CODE_TYPE_LABELS.get(t, t) for t in failed_code_types]
+                    self.slack.post_progress(
+                        slack_channel,
+                        slack_thread_ts,
+                        "⚠️ 一部のコード成果物の生成に失敗しました（"
+                        + " / ".join(labels)
+                        + "）。GitHub への push は省略されました。再投入で改善する場合があります。",
                     )
-                    failed_code_types.append(code_type)
 
-            if code_files_merged:
-                deliverables["code_files"] = {
-                    "files": code_files_merged,
-                    "readme_content": "\n\n".join(readme_parts) if readme_parts else "",
-                }
+            generator_duration_ms = (time.monotonic_ns() - generator_start_ns) // 1_000_000
+            code_files_for_emit = deliverables.get("code_files")
+            self._emitter.emit(
+                "subagent_completed",
+                {
+                    "subagent": "generator",
+                    "duration_ms": generator_duration_ms,
+                    "tokens_used": None,
+                    "output_summary": (
+                        f"summary={'present' if deliverables.get('summary') else 'missing'},"
+                        f" code_files={'yes' if code_files_for_emit else 'no'}"
+                    ),
+                    "failed_code_types": failed_code_types,
+                },
+            )
 
-            if failed_code_types:
-                labels = [_CODE_TYPE_LABELS.get(t, t) for t in failed_code_types]
-                self.slack.post_progress(
+            # 6. レビュアー起動 + レビューループ
+            self.db.update_execution_status(execution_id, "reviewing")
+            self.slack.post_progress(slack_channel, slack_thread_ts, "🔎 品質検証中...")
+
+            reviewer_prompt = _load_prompt("reviewer")
+
+            reviewer_start_ns = time.monotonic_ns()
+            self._emitter.emit("subagent_started", {"subagent": "reviewer"})
+            try:
+                review_result, deliverables = self._run_review_loop(
+                    reviewer_prompt,
+                    deliverables,
+                    all_sources,
+                    category,
+                    gen_prompt,
                     slack_channel,
                     slack_thread_ts,
-                    "⚠️ 一部のコード成果物の生成に失敗しました（"
-                    + " / ".join(labels)
-                    + "）。GitHub への push は省略されました。再投入で改善する場合があります。",
+                )
+            except Exception as e:
+                self._emitter.emit(
+                    "subagent_failed",
+                    {
+                        "subagent": "reviewer",
+                        "duration_ms": (time.monotonic_ns() - reviewer_start_ns) // 1_000_000,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)[:500],
+                    },
+                    status_at_emit="failed",
+                )
+                raise
+            reviewer_duration_ms = (time.monotonic_ns() - reviewer_start_ns) // 1_000_000
+            quality_metadata = review_result.get("quality_metadata", {})
+            self._emitter.emit(
+                "subagent_completed",
+                {
+                    "subagent": "reviewer",
+                    "duration_ms": reviewer_duration_ms,
+                    "tokens_used": None,
+                    "output_summary": f"passed={review_result.get('passed', False)}",
+                },
+            )
+
+            # 7. 格納処理
+            self.db.update_execution_status(execution_id, "storing")
+            self.slack.post_progress(slack_channel, slack_thread_ts, "💾 成果物を格納中...")
+
+            # GitHub格納（コード成果物がある場合）
+            code_files = deliverables.get("code_files")
+            logger.info(
+                "Storage decision",
+                extra={
+                    "execution_id": execution_id,
+                    "storage_targets": storage_targets,
+                    "has_code_files": bool(code_files),
+                    "github_triggered": bool(code_files and "github" in storage_targets),
+                    "deliverables_parse_error": deliverables.get("parse_error", False),
+                },
+            )
+            if code_files and "github" in storage_targets:
+                import datetime
+
+                dir_name = f"{topic.replace(' ', '-').lower()}-{datetime.date.today().strftime('%Y%m%d')}"
+                github_url = self.github.push_files(dir_name, code_files.get("files", {}))
+                notion_url_placeholder = ""  # Notionページ作成後に更新
+                self.github.create_readme(dir_name, code_files.get("readme_content", ""), notion_url_placeholder)
+                self._emitter.emit(
+                    "github_stored",
+                    {
+                        "url": github_url,
+                        "code_files_present": True,
+                        "files_count": len(code_files.get("files", {})),
+                    },
                 )
 
-        # 6. レビュアー起動 + レビューループ
-        self.db.update_execution_status(execution_id, "reviewing")
-        self.slack.post_progress(slack_channel, slack_thread_ts, "🔎 品質検証中...")
+            # Notion格納
+            content_blocks = deliverables.get("content_blocks", [])
+            # 品質メタデータブロックを追加
+            quality_block = self._build_quality_metadata_block(quality_metadata)
+            content_blocks.extend(quality_block)
 
-        reviewer_prompt = _load_prompt("reviewer")
-        all_sources = []
-        for r in research_results:
-            all_sources.extend(r.get("sources", []))
+            notion_url, notion_page_id = self.notion.create_page(
+                title=topic,
+                category=category,
+                content_blocks=content_blocks,
+                github_url=github_url,
+                slack_user=user_id,
+            )
 
-        review_result, deliverables = self._run_review_loop(
-            reviewer_prompt, deliverables, all_sources, category, gen_prompt, slack_channel, slack_thread_ts
-        )
-        quality_metadata = review_result.get("quality_metadata", {})
+            # GitHubのREADMEをNotionリンクで更新
+            if github_url and code_files:
+                import datetime
 
-        # 7. 格納処理
-        self.db.update_execution_status(execution_id, "storing")
-        self.slack.post_progress(slack_channel, slack_thread_ts, "💾 成果物を格納中...")
+                dir_name = f"{topic.replace(' ', '-').lower()}-{datetime.date.today().strftime('%Y%m%d')}"
+                self.github.create_readme(dir_name, code_files.get("readme_content", ""), notion_url)
 
-        # GitHub格納（コード成果物がある場合）
-        github_url = None
-        code_files = deliverables.get("code_files")
-        logger.info(
-            "Storage decision",
-            extra={
+            self.notion.update_page_status(notion_page_id, "完了")
+            self._emitter.emit(
+                "notion_stored",
+                {"url": notion_url, "page_id": notion_page_id},
+            )
+
+            # 成果物レコードをDynamoDBに保存
+            deliverable_record = {
                 "execution_id": execution_id,
-                "storage_targets": storage_targets,
-                "has_code_files": bool(code_files),
-                "github_triggered": bool(code_files and "github" in storage_targets),
-                "deliverables_parse_error": deliverables.get("parse_error", False),
-            },
-        )
-        if code_files and "github" in storage_targets:
-            import datetime
+                "deliverable_id": f"dlv-{execution_id}",
+                "type": "all",
+                "storage": "notion" if not github_url else "notion+github",
+                "external_url": notion_url,
+                "quality_metadata": quality_metadata,
+            }
+            if github_url:
+                deliverable_record["github_url"] = github_url
+            self.db.put_deliverable(deliverable_record)
 
-            dir_name = f"{topic.replace(' ', '-').lower()}-{datetime.date.today().strftime('%Y%m%d')}"
-            github_url = self.github.push_files(dir_name, code_files.get("files", {}))
-            notion_url_placeholder = ""  # Notionページ作成後に更新
-            self.github.create_readme(dir_name, code_files.get("readme_content", ""), notion_url_placeholder)
+            # 出典をDynamoDBに保存
+            if all_sources:
+                self.db.put_sources(execution_id, all_sources)
 
-        # Notion格納
-        content_blocks = deliverables.get("content_blocks", [])
-        # 品質メタデータブロックを追加
-        quality_block = self._build_quality_metadata_block(quality_metadata)
-        content_blocks.extend(quality_block)
+            # 8. 完了通知
+            summary = deliverables.get("summary", f"{topic}の成果物が完成しました。")
+            self.slack.post_completion(slack_channel, slack_thread_ts, summary, notion_url, github_url)
+            self._emitter.emit(
+                "slack_notified",
+                {"channel_id": slack_channel, "thread_ts": slack_thread_ts},
+            )
 
-        notion_url, notion_page_id = self.notion.create_page(
-            title=topic,
-            category=category,
-            content_blocks=content_blocks,
-            github_url=github_url,
-            slack_user=user_id,
-        )
-
-        # GitHubのREADMEをNotionリンクで更新
-        if github_url and code_files:
-            import datetime
-
-            dir_name = f"{topic.replace(' ', '-').lower()}-{datetime.date.today().strftime('%Y%m%d')}"
-            self.github.create_readme(dir_name, code_files.get("readme_content", ""), notion_url)
-
-        self.notion.update_page_status(notion_page_id, "完了")
-
-        # 成果物レコードをDynamoDBに保存
-        deliverable_record = {
-            "execution_id": execution_id,
-            "deliverable_id": f"dlv-{execution_id}",
-            "type": "all",
-            "storage": "notion" if not github_url else "notion+github",
-            "external_url": notion_url,
-            "quality_metadata": quality_metadata,
-        }
-        if github_url:
-            deliverable_record["github_url"] = github_url
-        self.db.put_deliverable(deliverable_record)
-
-        # 出典をDynamoDBに保存
-        if all_sources:
-            self.db.put_sources(execution_id, all_sources)
-
-        # 8. 完了通知
-        summary = deliverables.get("summary", f"{topic}の成果物が完成しました。")
-        self.slack.post_completion(slack_channel, slack_thread_ts, summary, notion_url, github_url)
-
-        logger.info("Workflow completed", extra={"execution_id": execution_id, "notion_url": notion_url})
+            logger.info("Workflow completed", extra={"execution_id": execution_id, "notion_url": notion_url})
+            final_status = "success"
+        except Exception as e:
+            final_status = "failed"
+            self._emitter.emit(
+                "error",
+                {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e)[:500],
+                    "stack_trace": traceback.format_exc()[:5000],
+                    "stage": "orchestrator",
+                    "is_recoverable": False,
+                },
+                status_at_emit="failed",
+            )
+            raise
+        finally:
+            total_duration_ms = (time.monotonic_ns() - overall_start_ns) // 1_000_000
+            self._emitter.emit(
+                "execution_completed",
+                {
+                    "status": final_status,
+                    "total_duration_ms": total_duration_ms,
+                    "total_tokens_used": None,
+                    "final_deliverable_url": notion_url,
+                    "github_url": github_url,
+                },
+                status_at_emit=final_status,
+            )
 
     def _run_researchers(
         self,
@@ -859,6 +1141,24 @@ class Orchestrator:
             )
             raw = call_claude(review_prompt, allowed_tools=["WebFetch"], model="opus")
             review_result = _parse_claude_response(raw)
+
+            # 各 iteration ごとの review_completed (T1-2): シグネチャ・戻り値・分岐ロジックは不変。
+            # accumulated_fixer_notes は本 iteration 開始時点までの累積で集計する
+            # (memory/project_review_loop_recurring_patch_site.md の「コード関連指摘 N 件未修正」の N を抽出)。
+            review_issues_for_emit = review_result.get("issues", [])
+            if not isinstance(review_issues_for_emit, list):
+                review_issues_for_emit = []
+            self._emitter.emit(
+                "review_completed",
+                {
+                    "iteration": loop + 1,
+                    "passed": bool(review_result.get("passed", False)),
+                    "issues_count": len(review_issues_for_emit),
+                    "fixer_notes_count": len(accumulated_fixer_notes),
+                    "code_related_unfixed_count": _extract_code_related_unfixed_count(accumulated_fixer_notes),
+                    "issues_summary": _summarize_issues(review_issues_for_emit),
+                },
+            )
 
             if review_result.get("passed", False):
                 _accumulate_fixer_notes(accumulated_fixer_notes, current_deliverables)

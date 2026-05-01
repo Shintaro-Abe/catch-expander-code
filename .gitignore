@@ -55,3 +55,6 @@ coverage.xml
 
 # Ruff
 .ruff_cache/
+
+# graphify (knowledge graph generator output — environment-specific paths, multi-MB HTML/JSON)
+graphify-out/
