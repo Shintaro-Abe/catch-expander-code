@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from "react-router-dom"
-import { LayoutDashboard, List, Star, AlertTriangle } from "lucide-react"
+import { LayoutDashboard, List, Star, AlertTriangle, LogOut, User } from "lucide-react"
+import { useAuth } from "@/contexts/AuthContext"
 
 const NAV = [
   { to: "/dashboard",      icon: LayoutDashboard, label: "ダッシュボード" },
@@ -9,6 +10,7 @@ const NAV = [
 ]
 
 export function Layout() {
+  const { user_name } = useAuth()
   return (
     <div className="flex min-h-screen bg-background">
       {/* Sidebar */}
@@ -37,11 +39,16 @@ export function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="p-4 border-t border-sidebar-border">
+        <div className="p-4 border-t border-sidebar-border space-y-2">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <User size={12} className="shrink-0" />
+            <span className="truncate">{user_name}</span>
+          </div>
           <a
             href="/api/v1/auth/logout"
-            className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+            className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
           >
+            <LogOut size={12} className="shrink-0" />
             ログアウト
           </a>
         </div>

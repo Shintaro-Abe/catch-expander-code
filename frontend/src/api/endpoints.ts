@@ -1,6 +1,7 @@
 import { api } from "./client"
 import type {
   ApiHealth,
+  AuthMeResponse,
   CostSummary,
   ErrorListResponse,
   ExecutionDetailResponse,
@@ -13,6 +14,9 @@ import type {
 } from "./types"
 
 export const endpoints = {
+  authMe: () =>
+    api.get<AuthMeResponse>("/api/v1/auth/me"),
+
   metricsSummary: (period: Period) =>
     api.get<{ data: MetricsSummary }>(`/api/v1/metrics/summary?period=${period}`),
 

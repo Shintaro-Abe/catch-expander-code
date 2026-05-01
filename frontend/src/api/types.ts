@@ -121,4 +121,10 @@ export interface ErrorListResponse {
   meta: { total: number; by_type: Record<string, number> }
 }
 
+export interface AuthMeResponse {
+  user_sub: string
+  user_name: string
+  expires_at: number
+}
+
 export type Period = "24h" | "7d" | "30d"
