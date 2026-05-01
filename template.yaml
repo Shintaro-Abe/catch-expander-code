@@ -424,6 +424,7 @@ Resources:
                   - !GetAtt DeliverablesTable.Arn
                   - !GetAtt SourcesTable.Arn
                   - !Sub ${WorkflowExecutionsTable.Arn}/index/*
+                  - !GetAtt DashboardEventsTable.Arn
         - PolicyName: SecretsManagerAccess
           PolicyDocument:
             Version: "2012-10-17"
@@ -565,6 +566,7 @@ Resources:
                 - dynamodb:PutItem
               Resource:
                 - !GetAtt WorkflowExecutionsTable.Arn
+                - !GetAtt DashboardEventsTable.Arn
             - Effect: Allow
               Action:
                 - dynamodb:Query
@@ -620,6 +622,11 @@ Resources:
       Policies:
         - Version: "2012-10-17"
           Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
             - Effect: Allow
               Action:
                 - secretsmanager:GetSecretValue
