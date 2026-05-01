@@ -57,6 +57,7 @@ def lambda_handler(event: dict, context: object) -> dict[str, Any]:
             "context": {
                 "user_sub": claims["sub"],
                 "user_name": claims["name"],
+                "exp": claims["exp"],
             },
         }
     except jwt.PyJWTError as e:

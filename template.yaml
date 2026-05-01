@@ -680,6 +680,111 @@ Resources:
               Headers:
                 - Cookie
 
+  DashboardAuthLoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-auth-login
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/auth_login/
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          OAUTH_STATE_TABLE: !Ref DashboardOAuthStateTable
+          SLACK_OAUTH_SECRET_ARN: !Ref DashboardSlackOAuthSecret
+      Events:
+        AuthLogin:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/auth/login
+            Method: GET
+            Auth:
+              Authorizer: NONE
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource:
+                - !GetAtt DashboardOAuthStateTable.Arn
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref DashboardSlackOAuthSecret
+
+  DashboardAuthCallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-auth-callback
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/auth_callback/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          OAUTH_STATE_TABLE: !Ref DashboardOAuthStateTable
+          SLACK_OAUTH_SECRET_ARN: !Ref DashboardSlackOAuthSecret
+          JWT_KEY_SECRET_ARN: !Ref DashboardJwtKeySecret
+      Events:
+        AuthCallback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/auth/callback
+            Method: GET
+            Auth:
+              Authorizer: NONE
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+              Resource:
+                - !GetAtt DashboardOAuthStateTable.Arn
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref DashboardSlackOAuthSecret
+                - !Ref DashboardJwtKeySecret
+
+  DashboardAuthLogoutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-auth-logout
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/auth_logout/
+      MemorySize: 128
+      Timeout: 5
+      Events:
+        AuthLogout:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/auth/logout
+            Method: POST
+
+  DashboardAuthMeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-auth-me
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/auth_me/
+      MemorySize: 128
+      Timeout: 5
+      Events:
+        AuthMe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/auth/me
+            Method: GET
+
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
 
