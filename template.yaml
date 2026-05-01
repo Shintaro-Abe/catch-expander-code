@@ -36,6 +36,10 @@ Parameters:
   SlackNotificationChannelId:
     Type: String
     Description: Slack channel ID for operational notifications (e.g. Claude OAuth token expiry)
+  FrontendDomain:
+    Type: String
+    Default: ""
+    Description: CloudFront distribution domain (e.g. xxxxx.cloudfront.net). Used as OAuth redirect URI host.
 
 Globals:
   Function:
@@ -692,6 +696,7 @@ Resources:
         Variables:
           OAUTH_STATE_TABLE: !Ref DashboardOAuthStateTable
           SLACK_OAUTH_SECRET_ARN: !Ref DashboardSlackOAuthSecret
+          FRONTEND_DOMAIN: !Ref FrontendDomain
       Events:
         AuthLogin:
           Type: HttpApi
@@ -728,6 +733,7 @@ Resources:
           OAUTH_STATE_TABLE: !Ref DashboardOAuthStateTable
           SLACK_OAUTH_SECRET_ARN: !Ref DashboardSlackOAuthSecret
           JWT_KEY_SECRET_ARN: !Ref DashboardJwtKeySecret
+          FRONTEND_DOMAIN: !Ref FrontendDomain
       Events:
         AuthCallback:
           Type: HttpApi

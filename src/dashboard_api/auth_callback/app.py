@@ -85,7 +85,9 @@ def lambda_handler(event: dict, context: object) -> dict:
     table.delete_item(Key={"state": state})
 
     config = _get_slack_config()
-    host = (event.get("headers") or {}).get("host") or event["requestContext"]["domainName"]
+    host = os.environ.get("FRONTEND_DOMAIN") or \
+           (event.get("headers") or {}).get("host") or \
+           event["requestContext"]["domainName"]
     redirect_uri = f"https://{host}/api/v1/auth/callback"
 
     try:

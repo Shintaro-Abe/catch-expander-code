@@ -46,8 +46,11 @@ def lambda_handler(event: dict, context: object) -> dict:
         "ttl": int(time.time()) + _OAUTH_STATE_TTL_SEC,
     })
 
-    # Host ヘッダを使うことで CloudFront 経由 / 直接 API GW の両方に対応
-    host = (event.get("headers") or {}).get("host") or event["requestContext"]["domainName"]
+    # FRONTEND_DOMAIN が設定されていれば優先 (CloudFront 経由時に Host が APIGW ドメインに
+    # 書き換わる問題への対処)。未設定時は Host ヘッダにフォールバック。
+    host = os.environ.get("FRONTEND_DOMAIN") or \
+           (event.get("headers") or {}).get("host") or \
+           event["requestContext"]["domainName"]
     redirect_uri = f"https://{host}/api/v1/auth/callback"
 
     params = urlencode({
