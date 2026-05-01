@@ -7,6 +7,7 @@ import type {
   ExecutionListResponse,
   MetricsSummary,
   Period,
+  ReviewQualityResponse,
   TokenMonitorHealth,
 } from "./types"
 
@@ -32,6 +33,9 @@ export const endpoints = {
     if (params?.topic)  q.set("topic",  params.topic)
     return api.get<ExecutionListResponse>(`/api/v1/executions?${q}`)
   },
+
+  reviewQuality: (days: number) =>
+    api.get<ReviewQualityResponse>(`/api/v1/review-quality?days=${days}`),
 
   execution: (id: string) =>
     api.get<ExecutionDetailResponse>(`/api/v1/executions/${id}`),

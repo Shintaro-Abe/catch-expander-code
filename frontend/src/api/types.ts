@@ -88,4 +88,23 @@ export interface ExecutionEventsResponse {
   meta: { total: number }
 }
 
+export interface UnfixedCodeIssue {
+  execution_id: string
+  timestamp: string
+  iteration: number | null
+  code_related_unfixed_count: number
+}
+
+export interface ReviewQualityData {
+  period_days: number
+  total_reviews: number
+  pass_count: number
+  pass_rate: number | null
+  unfixed_code_issues: UnfixedCodeIssue[]
+}
+
+export interface ReviewQualityResponse {
+  data: ReviewQualityData
+}
+
 export type Period = "24h" | "7d" | "30d"
