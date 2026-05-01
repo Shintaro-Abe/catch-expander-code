@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,13 @@ def _get_slack_config() -> dict:
     return _slack_config
 
 
+def _fingerprint(event: dict) -> str:
+    """IP + User-Agent の SHA-256 ハッシュ (S3 フィンガープリントバインド)。"""
+    ip = (event.get("requestContext") or {}).get("http", {}).get("sourceIp", "")
+    ua = (event.get("headers") or {}).get("user-agent", "")
+    return hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()
+
+
 def lambda_handler(event: dict, context: object) -> dict:
     config = _get_slack_config()
     state = secrets.token_urlsafe(32)
@@ -34,6 +42,7 @@ def lambda_handler(event: dict, context: object) -> dict:
     table = _dynamodb.Table(os.environ["OAUTH_STATE_TABLE"])
     table.put_item(Item={
         "state": state,
+        "fingerprint": _fingerprint(event),
         "ttl": int(time.time()) + _OAUTH_STATE_TTL_SEC,
     })
 

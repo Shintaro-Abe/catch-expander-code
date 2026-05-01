@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -50,6 +51,13 @@ def _slack_post(url: str, data: dict, token: str | None = None) -> dict:
         return json.loads(resp.read())
 
 
+def _fingerprint(event: dict) -> str:
+    """IP + User-Agent の SHA-256 ハッシュ (S3 フィンガープリントバインド)。"""
+    ip = (event.get("requestContext") or {}).get("http", {}).get("sourceIp", "")
+    ua = (event.get("headers") or {}).get("user-agent", "")
+    return hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()
+
+
 def _error(status: int, message: str) -> dict:
     return {"statusCode": status, "body": json.dumps({"error": message})}
 
@@ -66,7 +74,14 @@ def lambda_handler(event: dict, context: object) -> dict:
     result = table.get_item(Key={"state": state})
     if "Item" not in result:
         return _error(400, "invalid_state")
-    # 単一回限り削除 (T1-9b でフィンガープリント検証を追加)
+
+    # フィンガープリント照合 (削除前に実施: 失敗時は DDB レコードを残す)
+    stored_fp = result["Item"].get("fingerprint", "")
+    if stored_fp and stored_fp != _fingerprint(event):
+        logger.warning("OAuth state fingerprint mismatch")
+        return _error(400, "fingerprint_mismatch")
+
+    # 単一回限り削除
     table.delete_item(Key={"state": state})
 
     config = _get_slack_config()

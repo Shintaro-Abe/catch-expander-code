@@ -8,10 +8,13 @@
 - Slack token exchange ネットワークエラー → 502
 - workspace mismatch → 401
 - userInfo 失敗 → 502
+- フィンガープリント不一致 → 400
+- フィンガープリント一致 → 正常 302
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from unittest.mock import MagicMock, patch
@@ -45,9 +48,18 @@ def _event(code: str = "CODE", state: str = "STATE") -> dict:
     }
 
 
+_DEFAULT_FP = hashlib.sha256(b"|").hexdigest()  # ip="" ua="" → default event fingerprint
+
+
 def _ddb_found(state: str = "STATE") -> MagicMock:
     mock = MagicMock()
     mock.get_item.return_value = {"Item": {"state": state, "ttl": int(time.time()) + 600}}
+    return mock
+
+
+def _ddb_found_with_fp(fp: str, state: str = "STATE") -> MagicMock:
+    mock = MagicMock()
+    mock.get_item.return_value = {"Item": {"state": state, "fingerprint": fp, "ttl": int(time.time()) + 600}}
     return mock
 
 
@@ -219,3 +231,41 @@ class TestSlackErrors:
             result = lambda_handler(_event(), None)
 
         assert result["statusCode"] == 502
+
+
+class TestFingerprint:
+    def test_fingerprint_mismatch_returns_400(self, mock_secrets):
+        from src.dashboard_api.auth_callback.app import lambda_handler
+
+        resource = MagicMock()
+        resource.Table.return_value = _ddb_found_with_fp("different-fingerprint-hash")
+        with patch("src.dashboard_api.auth_callback.app._dynamodb", resource):
+            result = lambda_handler(_event(), None)
+
+        assert result["statusCode"] == 400
+        assert json.loads(result["body"])["error"] == "fingerprint_mismatch"
+
+    def test_fingerprint_mismatch_does_not_delete_state(self, mock_secrets):
+        from src.dashboard_api.auth_callback.app import lambda_handler
+
+        table = _ddb_found_with_fp("different-fingerprint-hash")
+        resource = MagicMock()
+        resource.Table.return_value = table
+        with patch("src.dashboard_api.auth_callback.app._dynamodb", resource):
+            lambda_handler(_event(), None)
+
+        table.delete_item.assert_not_called()
+
+    def test_fingerprint_match_returns_302(self, mock_secrets):
+        from src.dashboard_api.auth_callback.app import lambda_handler
+
+        resource = MagicMock()
+        resource.Table.return_value = _ddb_found_with_fp(_DEFAULT_FP)
+        with (
+            patch("src.dashboard_api.auth_callback.app._dynamodb", resource),
+            patch("src.dashboard_api.auth_callback.app._slack_post") as mock_post,
+        ):
+            mock_post.side_effect = [_TOKEN_RESP_OK, _USER_INFO]
+            result = lambda_handler(_event(), None)
+
+        assert result["statusCode"] == 302
