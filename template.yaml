@@ -785,6 +785,103 @@ Resources:
             Path: /api/v1/auth/me
             Method: GET
 
+  # ==============================================================
+  # Dashboard: 実行データ系 Lambda
+  # ==============================================================
+  DashboardListExecutionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-list-executions
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/list_executions/
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+          EXECUTIONS_TABLE: !Ref WorkflowExecutionsTable
+      Events:
+        ListExecutions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/executions
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+                - !Sub ${DashboardEventsTable.Arn}/index/*
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                - !GetAtt WorkflowExecutionsTable.Arn
+
+  DashboardGetExecutionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-execution
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_execution/
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          EXECUTIONS_TABLE: !Ref WorkflowExecutionsTable
+          DELIVERABLES_TABLE: !Ref DeliverablesTable
+      Events:
+        GetExecution:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/executions/{execution_id}
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                - !GetAtt WorkflowExecutionsTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DeliverablesTable.Arn
+
+  DashboardGetExecutionEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-execution-events
+      Handler: app.lambda_handler
+      CodeUri: src/dashboard_api/get_execution_events/
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref DashboardEventsTable
+      Events:
+        GetExecutionEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/executions/{execution_id}/events
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !GetAtt DashboardEventsTable.Arn
+
 Conditions:
   HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
 
