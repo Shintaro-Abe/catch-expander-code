@@ -55,7 +55,7 @@ def lambda_handler(event: dict, context: object) -> dict:
 
     params = urlencode({
         "client_id": config["client_id"],
-        "scope": "openid profile email",
+        "user_scope": "openid profile email",
         "state": state,
         "redirect_uri": redirect_uri,
     })
