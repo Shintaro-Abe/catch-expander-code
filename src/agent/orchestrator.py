@@ -1047,13 +1047,10 @@ class Orchestrator:
                     "deliverables_parse_error": deliverables.get("parse_error", False),
                 },
             )
+            github_dir_name = f"{topic.replace(' ', '-').lower()}-{execution_id}"
             if code_files and "github" in storage_targets:
-                import datetime
-
-                dir_name = f"{topic.replace(' ', '-').lower()}-{datetime.date.today().strftime('%Y%m%d')}"
-                github_url = self.github.push_files(dir_name, code_files.get("files", {}))
-                notion_url_placeholder = ""  # Notionページ作成後に更新
-                self.github.create_readme(dir_name, code_files.get("readme_content", ""), notion_url_placeholder)
+                github_url = self.github.push_files(github_dir_name, code_files.get("files", {}))
+                self.github.create_readme(github_dir_name, code_files.get("readme_content", ""), "")
                 self._emitter.emit(
                     "github_stored",
                     {
@@ -1079,10 +1076,7 @@ class Orchestrator:
 
             # GitHubのREADMEをNotionリンクで更新
             if github_url and code_files:
-                import datetime
-
-                dir_name = f"{topic.replace(' ', '-').lower()}-{datetime.date.today().strftime('%Y%m%d')}"
-                self.github.create_readme(dir_name, code_files.get("readme_content", ""), notion_url)
+                self.github.create_readme(github_dir_name, code_files.get("readme_content", ""), notion_url)
 
             self.notion.update_page_status(notion_page_id, "完了")
             self._emitter.emit(
