@@ -46,6 +46,8 @@ logger = logging.getLogger("catch-expander-agent")
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 MAX_REVIEW_LOOPS = 2
 MAX_CLAUDE_RETRIES = 3
+MAX_CODEX_RETRIES = 3
+CODEX_REVIEW_MODEL = "gpt-5.5"
 
 _CODE_RELATED_UNFIXED_PATTERN = re.compile(r"コード関連指摘\s*(\d+)\s*件は本ループ未修正")
 
@@ -596,6 +598,73 @@ def call_claude_with_workspace(
             endpoint_path=endpoint_path,
         )
         shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def call_codex(
+    prompt: str,
+    model: str = CODEX_REVIEW_MODEL,
+    *,
+    emitter: Any = None,
+    cost_acc: dict | None = None,
+) -> str:
+    """Codex CLI (GPT系モデル) を非インタラクティブ実行し、最終応答テキストを返す（リトライ付き）"""
+    import os
+    import tempfile
+
+    fd, output_file = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+
+    cmd = [
+        "codex", "exec",
+        "--model", model,
+        "--ephemeral",
+        "-c", 'sandbox_mode="danger-full-access"',
+        "-o", output_file,
+        "-",
+    ]
+
+    start_ns = time.monotonic_ns()
+    success = False
+    final_status: int | None = None
+    endpoint_path = f"/codex/exec?model={model}"
+    try:
+        last_error: subprocess.CalledProcessError | None = None
+        for attempt in range(MAX_CODEX_RETRIES):
+            try:
+                subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
+                success = True
+                with open(output_file) as f:
+                    return f.read()
+            except subprocess.CalledProcessError as e:
+                last_error = e
+                final_status = e.returncode
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "Codex CLI error, retrying | rc=%s | stderr=%s",
+                    e.returncode,
+                    (e.stderr or "")[:500],
+                    extra={"attempt": attempt + 1, "wait_seconds": wait},
+                )
+                time.sleep(wait)
+
+        if last_error:
+            raise last_error
+        msg = "Unexpected: no error and no response"
+        raise RuntimeError(msg)
+    finally:
+        duration_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+        _emit_api_call_completed(
+            emitter,
+            subtype="openai",
+            success=success,
+            duration_ms=duration_ms,
+            response_status_code=final_status,
+            endpoint_path=endpoint_path,
+        )
+        try:
+            os.unlink(output_file)
+        except OSError:
+            pass
 
 
 def _build_code_generation_prompt(
@@ -1261,7 +1330,7 @@ class Orchestrator:
                 f"成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```\n\n"
                 f"出典リスト:\n```json\n{sources_text}\n```"
             )
-            raw = call_claude(review_prompt, allowed_tools=["WebFetch"], model="opus", emitter=self._emitter, cost_acc=self._cost_acc)
+            raw = call_codex(review_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             review_result = _parse_claude_response(raw)
 
             # 各 iteration ごとの review_completed (T1-2): シグネチャ・戻り値・分岐ロジックは不変。
