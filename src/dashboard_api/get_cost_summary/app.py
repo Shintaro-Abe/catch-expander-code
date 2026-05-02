@@ -55,18 +55,26 @@ def lambda_handler(event: dict, context: object) -> dict:
         return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
 
     total = len(items)
-    tokens_list = [
-        int(p["total_tokens_used"])
-        for i in items
-        if isinstance((p := (i.get("payload") or {})).get("total_tokens_used"), int | float)
-        and p["total_tokens_used"] >= 0
-    ]
-    cost_list = [
-        float(p["total_cost_usd"])
-        for i in items
-        if isinstance((p := (i.get("payload") or {})).get("total_cost_usd"), int | float)
-        and p["total_cost_usd"] >= 0
-    ]
+    tokens_list = []
+    cost_list = []
+    for i in items:
+        p = i.get("payload") or {}
+        t = p.get("total_tokens_used")
+        if t is not None:
+            try:
+                v = int(float(t))
+                if v >= 0:
+                    tokens_list.append(v)
+            except (TypeError, ValueError):
+                pass
+        c = p.get("total_cost_usd")
+        if c is not None:
+            try:
+                v2 = float(c)
+                if v2 >= 0:
+                    cost_list.append(v2)
+            except (TypeError, ValueError):
+                pass
 
     total_tokens = sum(tokens_list) if tokens_list else None
     total_cost = round(sum(cost_list), 6) if cost_list else None

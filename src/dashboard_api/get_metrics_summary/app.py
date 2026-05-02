@@ -73,8 +73,13 @@ def lambda_handler(event: dict, context: object) -> dict:
         if et == "execution_completed":
             exec_statuses[eid] = payload.get("status", "unknown")
             dur = payload.get("total_duration_ms")
-            if isinstance(dur, int | float) and dur > 0:
-                durations.append(int(dur))
+            if dur is not None:
+                try:
+                    v = int(float(dur))
+                    if v > 0:
+                        durations.append(v)
+                except (TypeError, ValueError):
+                    pass
 
         elif et == "review_completed":
             review_total += 1

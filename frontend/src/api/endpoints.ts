@@ -40,7 +40,7 @@ export const endpoints = {
   },
 
   reviewQuality: (days: number) =>
-    api.get<ReviewQualityResponse>(`/api/v1/review-quality?days=${days}`),
+    api.get<ReviewQualityResponse>(`/api/v1/metrics/review-quality?days=${days}`),
 
   errors: (days: number) =>
     api.get<ErrorListResponse>(`/api/v1/errors?days=${days}`),
