@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -1133,7 +1134,7 @@ class Orchestrator:
         finally:
             total_duration_ms = (time.monotonic_ns() - overall_start_ns) // 1_000_000
             total_tokens = self._cost_acc["total_tokens_used"] or None
-            total_cost = round(self._cost_acc["total_cost_usd"], 6) if self._cost_acc["total_cost_usd"] else None
+            total_cost = Decimal(str(round(self._cost_acc["total_cost_usd"], 6))) if self._cost_acc["total_cost_usd"] else None
             self._emitter.emit(
                 "execution_completed",
                 {
