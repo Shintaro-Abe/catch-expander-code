@@ -58,11 +58,14 @@ def lambda_handler(event: dict, context: object) -> dict:
     preferences_updated = sum(
         1 for i in items if (i.get("payload") or {}).get("learned_preferences_updated")
     )
-    new_prefs_list = [
-        int(p["new_preferences_count"])
-        for i in items
-        if isinstance((p := (i.get("payload") or {})).get("new_preferences_count"), int | float)
-    ]
+    new_prefs_list = []
+    for i in items:
+        v = (i.get("payload") or {}).get("new_preferences_count")
+        if v is not None:
+            try:
+                new_prefs_list.append(int(float(v)))
+            except (TypeError, ValueError):
+                pass
     avg_new_prefs = round(sum(new_prefs_list) / len(new_prefs_list), 2) if new_prefs_list else None
 
     # Most recent item's total_preferences_count as a snapshot

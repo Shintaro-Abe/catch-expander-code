@@ -80,8 +80,13 @@ def lambda_handler(event: dict, context: object) -> dict:
         if p.get("success"):
             by_service[svc]["success_count"] += 1
         dur = p.get("duration_ms")
-        if isinstance(dur, int | float) and dur >= 0:
-            by_service[svc]["duration_ms_list"].append(int(dur))
+        if dur is not None:
+            try:
+                v = int(float(dur))
+                if v >= 0:
+                    by_service[svc]["duration_ms_list"].append(v)
+            except (TypeError, ValueError):
+                pass
 
     for item in rate_limits:
         p = item.get("payload") or {}
