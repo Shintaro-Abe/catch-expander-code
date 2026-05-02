@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from boto3.dynamodb.conditions import Key
 
-from src.dashboard_api._common import error_response, json_response
+from _common import error_response, json_response
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

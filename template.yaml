@@ -650,8 +650,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-authorizer
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/authorizer/
+      Handler: authorizer.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 5
       Environment:
@@ -696,8 +696,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-auth-login
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/auth_login/
+      Handler: auth_login.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 10
       Environment:
@@ -732,8 +732,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-auth-callback
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/auth_callback/
+      Handler: auth_callback.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 15
       Environment:
@@ -771,8 +771,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-auth-logout
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/auth_logout/
+      Handler: auth_logout.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 5
       Events:
@@ -787,8 +787,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-auth-me
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/auth_me/
+      Handler: auth_me.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 5
       Events:
@@ -806,8 +806,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-list-executions
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/list_executions/
+      Handler: list_executions.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 256
       Timeout: 15
       Environment:
@@ -840,8 +840,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-execution
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_execution/
+      Handler: get_execution.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 10
       Environment:
@@ -873,8 +873,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-execution-events
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_execution_events/
+      Handler: get_execution_events.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 10
       Environment:
@@ -903,8 +903,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-metrics-summary
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_metrics_summary/
+      Handler: get_metrics_summary.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 256
       Timeout: 15
       Environment:
@@ -931,8 +931,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-review-quality
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_review_quality/
+      Handler: get_review_quality.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 15
       Environment:
@@ -959,8 +959,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-errors
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_errors/
+      Handler: get_errors.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 15
       Environment:
@@ -987,8 +987,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-cost-summary
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_cost_summary/
+      Handler: get_cost_summary.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 15
       Environment:
@@ -1015,8 +1015,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-api-health
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_api_health/
+      Handler: get_api_health.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 15
       Environment:
@@ -1043,8 +1043,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-token-monitor-health
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_token_monitor_health/
+      Handler: get_token_monitor_health.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 15
       Environment:
@@ -1071,8 +1071,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: catch-expander-dashboard-get-feedback-aggregation
-      Handler: app.lambda_handler
-      CodeUri: src/dashboard_api/get_feedback_aggregation/
+      Handler: get_feedback_aggregation.app.lambda_handler
+      CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 15
       Environment:
