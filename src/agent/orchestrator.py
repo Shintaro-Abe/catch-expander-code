@@ -48,6 +48,7 @@ MAX_REVIEW_LOOPS = 2
 MAX_CLAUDE_RETRIES = 3
 MAX_CODEX_RETRIES = 3
 CODEX_REVIEW_MODEL = "gpt-5.5"
+CLAUDE_ADVISOR_MODEL = "claude-opus-4-7"
 
 _CODE_RELATED_UNFIXED_PATTERN = re.compile(r"コード関連指摘\s*(\d+)\s*件は本ループ未修正")
 
@@ -292,6 +293,25 @@ def call_claude(
                     extra={"attempt": attempt + 1, "wait_seconds": wait},
                 )
                 time.sleep(wait)
+
+        # Sonnet がリトライを使い切った場合、Opus 4.7 を advisor として1回試行する
+        if last_error and model == "sonnet" and not _claude_stderr_indicates_rate_limit(last_error.stderr or ""):
+            advisor_cmd = ["claude", "-p", "-", "--model", CLAUDE_ADVISOR_MODEL, "--output-format", "json"]
+            if allowed_tools:
+                advisor_cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+            logger.warning(
+                "Sonnet retries exhausted, escalating to advisor model %s",
+                CLAUDE_ADVISOR_MODEL,
+                extra={"original_error": str(last_error)[:200]},
+            )
+            try:
+                result = subprocess.run(advisor_cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
+                success = True
+                final_status = result.returncode
+                _accumulate_cost(result.stdout, cost_acc)
+                return result.stdout
+            except subprocess.CalledProcessError:
+                pass
 
         if last_error:
             raise last_error
@@ -579,10 +599,40 @@ def call_claude_with_workspace(
                 )
                 time.sleep(wait)
         else:
-            if last_error:
-                raise last_error
-            msg = "Unexpected: no error and no response (workspace mode)"
-            raise RuntimeError(msg)
+            # Sonnet がリトライを使い切った場合、Opus 4.7 を advisor として1回試行する
+            if last_error and model == "sonnet" and not _claude_stderr_indicates_rate_limit(last_error.stderr or ""):
+                advisor_cmd = [
+                    "claude", "-p", "-",
+                    "--model", CLAUDE_ADVISOR_MODEL,
+                    "--output-format", "json",
+                    "--allowedTools", "Write,Edit,Read",
+                ]
+                logger.warning(
+                    "Sonnet retries exhausted (workspace mode), escalating to advisor model %s",
+                    CLAUDE_ADVISOR_MODEL,
+                    extra={"original_error": str(last_error)[:200]},
+                )
+                try:
+                    result = subprocess.run(  # noqa: S603
+                        advisor_cmd,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        cwd=str(sandbox),
+                    )
+                    raw_stdout = result.stdout
+                    api_success = True
+                    api_final_status = result.returncode
+                    _accumulate_cost(raw_stdout, cost_acc)
+                except subprocess.CalledProcessError:
+                    pass
+
+            if not api_success:
+                if last_error:
+                    raise last_error
+                msg = "Unexpected: no error and no response (workspace mode)"
+                raise RuntimeError(msg)
 
         files, rejected = _collect_workspace_files(sandbox)
         outcome = _classify_workspace_outcome(files, rejected)
