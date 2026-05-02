@@ -208,12 +208,33 @@ def _claude_stderr_indicates_rate_limit(stderr_text: str) -> bool:
     return "429" in lowered or "rate limit" in lowered or "rate_limit" in lowered
 
 
+def _accumulate_cost(raw_stdout: str, cost_acc: dict | None) -> None:
+    """CLI JSON 出力から cost と tokens を取得してアキュムレータに加算する。"""
+    if cost_acc is None:
+        return
+    try:
+        data = json.loads(raw_stdout)
+        cost = data.get("total_cost_usd") or 0.0
+        usage = data.get("usage") or {}
+        tokens = (
+            (usage.get("input_tokens") or 0)
+            + (usage.get("output_tokens") or 0)
+            + (usage.get("cache_creation_input_tokens") or 0)
+            + (usage.get("cache_read_input_tokens") or 0)
+        )
+        cost_acc["total_cost_usd"] += float(cost)
+        cost_acc["total_tokens_used"] += int(tokens)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def call_claude(
     prompt: str,
     allowed_tools: list[str] | None = None,
     model: str = "sonnet",
     *,
     emitter: Any = None,
+    cost_acc: dict | None = None,
 ) -> str:
     """Claude Code CLIを呼び出し、結果を返す（リトライ付き）
 
@@ -245,6 +266,7 @@ def call_claude(
                 result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
                 success = True
                 final_status = result.returncode
+                _accumulate_cost(result.stdout, cost_acc)
                 return result.stdout
             except subprocess.CalledProcessError as e:
                 last_error = e
@@ -486,6 +508,7 @@ def call_claude_with_workspace(
     *,
     model: str = "sonnet",
     emitter: Any = None,
+    cost_acc: dict | None = None,
 ) -> tuple[str, dict[str, str], dict]:
     """Claude CLI に Write ツールを許可して sandbox にファイルを書かせ、収集結果を返す。
 
@@ -532,6 +555,7 @@ def call_claude_with_workspace(
                 raw_stdout = result.stdout
                 api_success = True
                 api_final_status = result.returncode
+                _accumulate_cost(raw_stdout, cost_acc)
                 break
             except subprocess.CalledProcessError as e:
                 last_error = e
@@ -644,6 +668,7 @@ class Orchestrator:
         # run() で本物の EventEmitter に差し替え。run() を経由しないテスト/直接呼び出し
         # では _NoOpEmitter のままなので副作用なし。
         self._emitter: Any = _NoOpEmitter()
+        self._cost_acc: dict = {"total_cost_usd": 0.0, "total_tokens_used": 0}
 
     def run(
         self,
@@ -701,7 +726,7 @@ class Orchestrator:
                 f"トピック: {topic}\n\n"
                 f"ユーザープロファイル:\n{profile_text}"
             )
-            analysis_raw = call_claude(analysis_prompt, emitter=self._emitter)
+            analysis_raw = call_claude(analysis_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             analysis = _parse_claude_response(analysis_raw)
             logger.info(
                 "Topic analyzed",
@@ -717,7 +742,7 @@ class Orchestrator:
                 f"トピック解析結果:\n```json\n{json.dumps(analysis, ensure_ascii=False)}\n```\n\n"
                 f"ユーザープロファイル:\n{profile_text}"
             )
-            wf_raw = call_claude(wf_prompt, emitter=self._emitter)
+            wf_raw = call_claude(wf_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             workflow = _parse_claude_response(wf_raw)
             logger.info(
                 "Workflow designed",
@@ -846,7 +871,7 @@ class Orchestrator:
                 {"subagent": "generator", "input_summary": f"category={category}"},
             )
             try:
-                gen_raw = call_claude(gen_prompt, emitter=self._emitter)
+                gen_raw = call_claude(gen_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
                 deliverables = _parse_claude_response(gen_raw)
             except Exception as e:
                 self._emitter.emit(
@@ -885,7 +910,7 @@ class Orchestrator:
                     # (既存挙動 = 上位 try でも捕捉されるが、subagent_started/failed 対応を維持するため明示)。
                     try:
                         raw_stdout, files, outcome = call_claude_with_workspace(
-                            prompt, code_type, emitter=self._emitter
+                            prompt, code_type, emitter=self._emitter, cost_acc=self._cost_acc
                         )
                     except Exception as e:
                         self._emitter.emit(
@@ -1107,12 +1132,15 @@ class Orchestrator:
             raise
         finally:
             total_duration_ms = (time.monotonic_ns() - overall_start_ns) // 1_000_000
+            total_tokens = self._cost_acc["total_tokens_used"] or None
+            total_cost = round(self._cost_acc["total_cost_usd"], 6) if self._cost_acc["total_cost_usd"] else None
             self._emitter.emit(
                 "execution_completed",
                 {
                     "status": final_status,
                     "total_duration_ms": total_duration_ms,
-                    "total_tokens_used": None,
+                    "total_tokens_used": total_tokens,
+                    "total_cost_usd": total_cost,
                     "final_deliverable_url": notion_url,
                     "github_url": github_url,
                 },
@@ -1158,7 +1186,7 @@ class Orchestrator:
                     f"内容: {step['description']}\n"
                     f"検索ヒント: {json.dumps(step.get('search_hints', []), ensure_ascii=False)}"
                 )
-                raw = call_claude(prompt, allowed_tools=["WebSearch", "WebFetch"], emitter=self._emitter)
+                raw = call_claude(prompt, allowed_tools=["WebSearch", "WebFetch"], emitter=self._emitter, cost_acc=self._cost_acc)
                 result = _parse_claude_response(raw)
                 _namespace_source_ids(result, step_id)
                 self.db.update_step_status(execution_id, step_id, "completed", result)
@@ -1238,7 +1266,7 @@ class Orchestrator:
                 f"成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```\n\n"
                 f"出典リスト:\n```json\n{sources_text}\n```"
             )
-            raw = call_claude(review_prompt, allowed_tools=["WebFetch"], model="opus", emitter=self._emitter)
+            raw = call_claude(review_prompt, allowed_tools=["WebFetch"], model="opus", emitter=self._emitter, cost_acc=self._cost_acc)
             review_result = _parse_claude_response(raw)
 
             # 各 iteration ごとの review_completed (T1-2): シグネチャ・戻り値・分岐ロジックは不変。
@@ -1299,7 +1327,7 @@ class Orchestrator:
                 f"指摘事項:\n```json\n{fix_instructions}\n```\n\n"
                 f"現在の成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```"
             )
-            fix_raw = call_claude(fix_prompt, emitter=self._emitter)
+            fix_raw = call_claude(fix_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             parsed = _parse_claude_response(fix_raw)
             if parsed.get("parse_error"):
                 logger.warning(
