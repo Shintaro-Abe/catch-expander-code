@@ -666,6 +666,14 @@ Resources:
               Resource:
                 - !Ref DashboardJwtKeySecret
 
+  DashboardAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DashboardAuthorizerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/authorizers/*"
+
   DashboardApi:
     Type: AWS::Serverless::HttpApi
     Properties:
@@ -1147,11 +1155,8 @@ Resources:
             AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
             CachedMethods: [GET, HEAD]
         CustomErrorResponses:
-          # SPA ルーティング: S3 の 403/404 を index.html で受ける
-          - ErrorCode: 403
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-            ErrorCachingMinTTL: 0
+          # SPA ルーティング: S3 の 404 を index.html で受ける
+          # 403 は API Gateway の認証エラーと衝突するため除外
           - ErrorCode: 404
             ResponseCode: 200
             ResponsePagePath: /index.html
