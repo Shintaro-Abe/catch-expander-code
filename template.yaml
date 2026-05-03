@@ -18,6 +18,9 @@ Parameters:
   ClaudeOAuthSecretArn:
     Type: String
     Description: ARN of Secrets Manager secret for Claude Code OAuth credentials
+  CodexAuthSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret for Codex CLI auth.json (ChatGPT OAuth)
   NotionDatabaseId:
     Type: String
     Description: Notion database ID for deliverables
@@ -397,6 +400,7 @@ Resources:
                   - !Ref NotionTokenSecretArn
                   - !Ref GitHubTokenSecretArn
                   - !Ref ClaudeOAuthSecretArn
+                  - !Ref CodexAuthSecretArn
 
   AgentTaskRole:
     Type: AWS::IAM::Role
@@ -441,11 +445,13 @@ Resources:
                   - !Ref NotionTokenSecretArn
                   - !Ref GitHubTokenSecretArn
                   - !Ref ClaudeOAuthSecretArn
+                  - !Ref CodexAuthSecretArn
               - Effect: Allow
                 Action:
                   - secretsmanager:PutSecretValue
                 Resource:
                   - !Ref ClaudeOAuthSecretArn
+                  - !Ref CodexAuthSecretArn
         - PolicyName: CloudWatchLogsAccess
           PolicyDocument:
             Version: "2012-10-17"
@@ -494,6 +500,8 @@ Resources:
               Value: !Ref GitHubTokenSecretArn
             - Name: CLAUDE_OAUTH_SECRET_ARN
               Value: !Ref ClaudeOAuthSecretArn
+            - Name: CODEX_AUTH_SECRET_ARN
+              Value: !Ref CodexAuthSecretArn
             - Name: EVENTS_TABLE
               Value: !Ref DashboardEventsTable
           LogConfiguration:

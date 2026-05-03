@@ -321,6 +321,7 @@ class TestMain:
         "NOTION_TOKEN_SECRET_ARN": "arn:notion",
         "GITHUB_TOKEN_SECRET_ARN": "arn:github",
         "CLAUDE_OAUTH_SECRET_ARN": "arn:claude",
+        "CODEX_AUTH_SECRET_ARN": "arn:codex",
         "DYNAMODB_TABLE_PREFIX": "catch-expander",
     }
 
@@ -336,6 +337,8 @@ class TestMain:
             patch("main._get_secret", return_value="secret"),
             patch("main._setup_claude_credentials"),
             patch("main._writeback_claude_credentials"),
+            patch("main._setup_codex_credentials"),
+            patch("main._writeback_codex_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_feedback") as mock_feedback,
@@ -356,6 +359,8 @@ class TestMain:
             patch("main._get_secret", return_value="secret"),
             patch("main._setup_claude_credentials"),
             patch("main._writeback_claude_credentials"),
+            patch("main._setup_codex_credentials"),
+            patch("main._writeback_codex_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_feedback") as mock_feedback,
@@ -378,6 +383,8 @@ class TestMain:
             patch("main._get_secret", return_value="secret"),
             patch("main._setup_claude_credentials"),
             patch("main._writeback_claude_credentials"),
+            patch("main._setup_codex_credentials"),
+            patch("main._writeback_codex_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_orchestrator", side_effect=RuntimeError("boom")),
@@ -393,7 +400,7 @@ class TestMain:
         assert call_args[0][0] == "secret"
         assert isinstance(call_args[0][1], RuntimeError)
 
-    def test_fetches_all_four_secrets(self, monkeypatch):
+    def test_fetches_all_five_secrets(self, monkeypatch):
         self._set_common_env(monkeypatch)
         monkeypatch.delenv("TASK_TYPE", raising=False)
 
@@ -401,6 +408,8 @@ class TestMain:
             patch("main._get_secret", return_value="secret") as mock_get,
             patch("main._setup_claude_credentials"),
             patch("main._writeback_claude_credentials"),
+            patch("main._setup_codex_credentials"),
+            patch("main._writeback_codex_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_orchestrator"),
@@ -410,7 +419,7 @@ class TestMain:
             main()
 
         called_arns = {c.args[0] for c in mock_get.call_args_list}
-        assert called_arns == {"arn:slack", "arn:notion", "arn:github", "arn:claude"}
+        assert called_arns == {"arn:slack", "arn:notion", "arn:github", "arn:claude", "arn:codex"}
 
     def test_writeback_called_in_finally_on_success(self, monkeypatch):
         self._set_common_env(monkeypatch)
@@ -418,8 +427,10 @@ class TestMain:
 
         with (
             patch("main._get_secret", return_value="secret"),
-            patch("main._setup_claude_credentials", return_value="initial-hash"),
-            patch("main._writeback_claude_credentials") as mock_writeback,
+            patch("main._setup_claude_credentials", return_value="claude-hash"),
+            patch("main._writeback_claude_credentials") as mock_claude_wb,
+            patch("main._setup_codex_credentials", return_value="codex-hash"),
+            patch("main._writeback_codex_credentials") as mock_codex_wb,
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_orchestrator"),
@@ -428,7 +439,8 @@ class TestMain:
 
             main()
 
-        mock_writeback.assert_called_once_with("arn:claude", "initial-hash")
+        mock_claude_wb.assert_called_once_with("arn:claude", "claude-hash")
+        mock_codex_wb.assert_called_once_with("arn:codex", "codex-hash")
 
     def test_writeback_called_in_finally_on_failure(self, monkeypatch):
         self._set_common_env(monkeypatch)
@@ -436,8 +448,10 @@ class TestMain:
 
         with (
             patch("main._get_secret", return_value="secret"),
-            patch("main._setup_claude_credentials", return_value="initial-hash"),
-            patch("main._writeback_claude_credentials") as mock_writeback,
+            patch("main._setup_claude_credentials", return_value="claude-hash"),
+            patch("main._writeback_claude_credentials") as mock_claude_wb,
+            patch("main._setup_codex_credentials", return_value="codex-hash"),
+            patch("main._writeback_codex_credentials") as mock_codex_wb,
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_orchestrator", side_effect=RuntimeError("boom")),
@@ -448,4 +462,5 @@ class TestMain:
             with pytest.raises(RuntimeError):
                 main()
 
-        mock_writeback.assert_called_once_with("arn:claude", "initial-hash")
+        mock_claude_wb.assert_called_once_with("arn:claude", "claude-hash")
+        mock_codex_wb.assert_called_once_with("arn:codex", "codex-hash")

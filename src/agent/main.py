@@ -72,6 +72,44 @@ def _writeback_claude_credentials(secret_arn: str, initial_hash: str) -> None:
         logger.exception("Credentials writeback failed (non-fatal)")
 
 
+def _setup_codex_credentials(secret_value: str) -> str:
+    """Codex CLI auth.json をホームディレクトリに配置し、起動時の hash を返す。
+
+    Codex CLI は ~/.codex/auth.json を参照して ChatGPT OAuth 認証を行う。
+    実行中に access_token が失効した場合、CLI が自動で refresh して auth.json を上書きする。
+    戻り値の hash はタスク終了時に refresh が起きたかを _writeback_codex_credentials が判定するために使う。
+    """
+    codex_dir = Path.home() / ".codex"
+    codex_dir.mkdir(exist_ok=True)
+    auth_path = codex_dir / "auth.json"
+    auth_path.write_text(secret_value)
+    auth_path.chmod(0o600)
+    return _hash_text(secret_value)
+
+
+def _writeback_codex_credentials(secret_arn: str, initial_hash: str) -> None:
+    """タスク終了時、Codex auth.json が refresh されていれば Secrets Manager に書き戻す。
+
+    ベストエフォート: 書き戻し失敗はタスク本体の終了コードに影響させない。
+    """
+    auth_path = Path.home() / ".codex" / "auth.json"
+    try:
+        if not auth_path.exists():
+            logger.warning("Codex auth.json not found at task exit; skipping writeback")
+            return
+        current = auth_path.read_text()
+        if _hash_text(current) == initial_hash:
+            logger.info("Codex credentials unchanged at task exit")
+            return
+        boto3.client("secretsmanager").put_secret_value(
+            SecretId=secret_arn,
+            SecretString=current,
+        )
+        logger.info("Codex credentials writeback succeeded")
+    except Exception:
+        logger.exception("Codex credentials writeback failed (non-fatal)")
+
+
 def _run_feedback(slack_client: SlackClient, db_client: DynamoDbClient) -> None:
     """フィードバック処理を実行する（TASK_TYPE=feedback）"""
     user_id = os.environ["USER_ID"]
@@ -150,12 +188,16 @@ def main() -> None:
 
     slack_token = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
     claude_secret_arn = os.environ["CLAUDE_OAUTH_SECRET_ARN"]
-    initial_hash: str | None = None
+    codex_secret_arn = os.environ["CODEX_AUTH_SECRET_ARN"]
+    claude_initial_hash: str | None = None
+    codex_initial_hash: str | None = None
     try:
         notion_token = _get_secret(os.environ["NOTION_TOKEN_SECRET_ARN"])
         github_token = _get_secret(os.environ["GITHUB_TOKEN_SECRET_ARN"])
         claude_oauth = _get_secret(claude_secret_arn)
-        initial_hash = _setup_claude_credentials(claude_oauth)
+        claude_initial_hash = _setup_claude_credentials(claude_oauth)
+        codex_auth = _get_secret(codex_secret_arn)
+        codex_initial_hash = _setup_codex_credentials(codex_auth)
 
         table_prefix = os.environ["DYNAMODB_TABLE_PREFIX"]
         slack_client = SlackClient(slack_token)
@@ -172,8 +214,10 @@ def main() -> None:
         _notify_task_failure(slack_token, exc)
         raise
     finally:
-        if initial_hash is not None:
-            _writeback_claude_credentials(claude_secret_arn, initial_hash)
+        if claude_initial_hash is not None:
+            _writeback_claude_credentials(claude_secret_arn, claude_initial_hash)
+        if codex_initial_hash is not None:
+            _writeback_codex_credentials(codex_secret_arn, codex_initial_hash)
 
 
 if __name__ == "__main__":
