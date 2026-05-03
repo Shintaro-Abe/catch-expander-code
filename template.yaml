@@ -400,7 +400,6 @@ Resources:
                   - !Ref NotionTokenSecretArn
                   - !Ref GitHubTokenSecretArn
                   - !Ref ClaudeOAuthSecretArn
-                  - !Ref CodexAuthSecretArn
 
   AgentTaskRole:
     Type: AWS::IAM::Role

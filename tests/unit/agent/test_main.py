@@ -53,6 +53,136 @@ class TestSetupClaudeCredentials:
 
 
 # ---------------------------------------------------------------------------
+# _setup_codex_credentials
+# ---------------------------------------------------------------------------
+
+
+class TestSetupCodexCredentials:
+    def test_writes_auth_json(self, tmp_path):
+        from main import _setup_codex_credentials
+
+        with patch("main.Path") as mock_path_cls:
+            mock_path_cls.home.return_value = tmp_path
+            mock_path_cls.side_effect = lambda *a, **kw: __import__("pathlib").Path(*a, **kw)
+
+            _setup_codex_credentials('{"tokens": "test"}')
+
+        auth_file = tmp_path / ".codex" / "auth.json"
+        assert auth_file.exists()
+        assert auth_file.read_text() == '{"tokens": "test"}'
+
+    def test_creates_codex_dir_if_not_exists(self, tmp_path):
+        from main import _setup_codex_credentials
+
+        assert not (tmp_path / ".codex").exists()
+
+        with patch("main.Path") as mock_path_cls:
+            mock_path_cls.home.return_value = tmp_path
+            mock_path_cls.side_effect = lambda *a, **kw: __import__("pathlib").Path(*a, **kw)
+
+            _setup_codex_credentials("{}")
+
+        assert (tmp_path / ".codex").exists()
+
+    def test_sets_file_permissions_to_0600(self, tmp_path):
+        import stat
+
+        from main import _setup_codex_credentials
+
+        with patch("main.Path") as mock_path_cls:
+            mock_path_cls.home.return_value = tmp_path
+            mock_path_cls.side_effect = lambda *a, **kw: __import__("pathlib").Path(*a, **kw)
+
+            _setup_codex_credentials("{}")
+
+        auth_file = tmp_path / ".codex" / "auth.json"
+        mode = stat.S_IMODE(auth_file.stat().st_mode)
+        assert mode == 0o600
+
+    def test_returns_sha256_hash_of_secret_value(self, tmp_path):
+        import hashlib
+
+        from main import _setup_codex_credentials
+
+        secret = '{"tokens": "abc"}'
+        with patch("main.Path") as mock_path_cls:
+            mock_path_cls.home.return_value = tmp_path
+            mock_path_cls.side_effect = lambda *a, **kw: __import__("pathlib").Path(*a, **kw)
+
+            returned = _setup_codex_credentials(secret)
+
+        assert returned == hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# _writeback_codex_credentials
+# ---------------------------------------------------------------------------
+
+
+class TestWritebackCodexCredentials:
+    def _patch_home(self, tmp_path):
+        return patch.object(
+            __import__("main").Path,
+            "home",
+            staticmethod(lambda: tmp_path),
+        )
+
+    def _setup_auth_file(self, tmp_path, content: str):
+        codex_dir = tmp_path / ".codex"
+        codex_dir.mkdir(exist_ok=True)
+        (codex_dir / "auth.json").write_text(content)
+
+    def test_skips_when_credentials_unchanged(self, tmp_path):
+        from main import _hash_text, _writeback_codex_credentials
+
+        content = '{"tokens": "same"}'
+        self._setup_auth_file(tmp_path, content)
+        initial_hash = _hash_text(content)
+
+        with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
+            _writeback_codex_credentials("arn:codex", initial_hash)
+
+        mock_client_factory.assert_not_called()
+
+    def test_calls_put_when_credentials_changed(self, tmp_path):
+        from main import _hash_text, _writeback_codex_credentials
+
+        self._setup_auth_file(tmp_path, '{"tokens": "old"}')
+        initial_hash = _hash_text('{"tokens": "old"}')
+        (tmp_path / ".codex" / "auth.json").write_text('{"tokens": "new"}')
+
+        mock_client = MagicMock()
+        with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
+            _writeback_codex_credentials("arn:codex", initial_hash)
+
+        mock_client.put_secret_value.assert_called_once_with(
+            SecretId="arn:codex",
+            SecretString='{"tokens": "new"}',
+        )
+
+    def test_handles_missing_auth_file(self, tmp_path):
+        from main import _writeback_codex_credentials
+
+        with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
+            _writeback_codex_credentials("arn:codex", "any-hash")
+
+        mock_client_factory.assert_not_called()
+
+    def test_swallows_put_exception(self, tmp_path):
+        from main import _hash_text, _writeback_codex_credentials
+
+        self._setup_auth_file(tmp_path, '{"tokens": "old"}')
+        initial_hash = _hash_text('{"tokens": "old"}')
+        (tmp_path / ".codex" / "auth.json").write_text('{"tokens": "new"}')
+
+        mock_client = MagicMock()
+        mock_client.put_secret_value.side_effect = RuntimeError("AWS down")
+
+        with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
+            _writeback_codex_credentials("arn:codex", initial_hash)
+
+
+# ---------------------------------------------------------------------------
 # _writeback_claude_credentials
 # ---------------------------------------------------------------------------
 
