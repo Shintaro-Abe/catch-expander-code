@@ -12,9 +12,7 @@ class TestSetupClaudeCredentials:
         from main import _setup_claude_credentials
 
         with patch("main.Path") as mock_path_cls:
-            # Path.home() → tmp_path
             mock_path_cls.home.return_value = tmp_path
-            # Path(...) / ".claude" は実際の Path オブジェクトを返す
             mock_path_cls.side_effect = lambda *a, **kw: __import__("pathlib").Path(*a, **kw)
 
             _setup_claude_credentials('{"token": "test-value"}')
@@ -26,8 +24,7 @@ class TestSetupClaudeCredentials:
     def test_creates_claude_dir_if_not_exists(self, tmp_path):
         from main import _setup_claude_credentials
 
-        claude_dir = tmp_path / ".claude"
-        assert not claude_dir.exists()
+        assert not (tmp_path / ".claude").exists()
 
         with patch("main.Path") as mock_path_cls:
             mock_path_cls.home.return_value = tmp_path
@@ -35,7 +32,21 @@ class TestSetupClaudeCredentials:
 
             _setup_claude_credentials("{}")
 
-        assert claude_dir.exists()
+        assert (tmp_path / ".claude").exists()
+
+    def test_sets_file_permissions_to_0600(self, tmp_path):
+        import stat
+
+        from main import _setup_claude_credentials
+
+        with patch("main.Path") as mock_path_cls:
+            mock_path_cls.home.return_value = tmp_path
+            mock_path_cls.side_effect = lambda *a, **kw: __import__("pathlib").Path(*a, **kw)
+
+            _setup_claude_credentials("{}")
+
+        creds_file = tmp_path / ".claude" / ".credentials.json"
+        assert stat.S_IMODE(creds_file.stat().st_mode) == 0o600
 
     def test_returns_sha256_hash_of_secret_value(self, tmp_path):
         import hashlib
@@ -96,8 +107,7 @@ class TestSetupCodexCredentials:
             _setup_codex_credentials("{}")
 
         auth_file = tmp_path / ".codex" / "auth.json"
-        mode = stat.S_IMODE(auth_file.stat().st_mode)
-        assert mode == 0o600
+        assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
 
     def test_returns_sha256_hash_of_secret_value(self, tmp_path):
         import hashlib
@@ -147,11 +157,13 @@ class TestWritebackCodexCredentials:
     def test_calls_put_when_credentials_changed(self, tmp_path):
         from main import _hash_text, _writeback_codex_credentials
 
-        self._setup_auth_file(tmp_path, '{"tokens": "old"}')
-        initial_hash = _hash_text('{"tokens": "old"}')
+        initial_content = '{"tokens": "old"}'
+        self._setup_auth_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
         (tmp_path / ".codex" / "auth.json").write_text('{"tokens": "new"}')
 
         mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {"SecretString": initial_content}
         with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
             _writeback_codex_credentials("arn:codex", initial_hash)
 
@@ -159,6 +171,21 @@ class TestWritebackCodexCredentials:
             SecretId="arn:codex",
             SecretString='{"tokens": "new"}',
         )
+
+    def test_skips_when_remote_updated_concurrently(self, tmp_path):
+        from main import _hash_text, _writeback_codex_credentials
+
+        initial_content = '{"tokens": "old"}'
+        self._setup_auth_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
+        (tmp_path / ".codex" / "auth.json").write_text('{"tokens": "new"}')
+
+        mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {"SecretString": '{"tokens": "concurrent"}'}
+        with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
+            _writeback_codex_credentials("arn:codex", initial_hash)
+
+        mock_client.put_secret_value.assert_not_called()
 
     def test_handles_missing_auth_file(self, tmp_path):
         from main import _writeback_codex_credentials
@@ -171,11 +198,13 @@ class TestWritebackCodexCredentials:
     def test_swallows_put_exception(self, tmp_path):
         from main import _hash_text, _writeback_codex_credentials
 
-        self._setup_auth_file(tmp_path, '{"tokens": "old"}')
-        initial_hash = _hash_text('{"tokens": "old"}')
+        initial_content = '{"tokens": "old"}'
+        self._setup_auth_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
         (tmp_path / ".codex" / "auth.json").write_text('{"tokens": "new"}')
 
         mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {"SecretString": initial_content}
         mock_client.put_secret_value.side_effect = RuntimeError("AWS down")
 
         with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
@@ -215,16 +244,14 @@ class TestWritebackClaudeCredentials:
     def test_calls_put_when_credentials_changed(self, tmp_path):
         from main import _hash_text, _writeback_claude_credentials
 
-        self._setup_creds_file(tmp_path, '{"token": "old"}')
-        initial_hash = _hash_text('{"token": "old"}')
-        # 起動後、claude CLI が refresh して中身が変わったことを再現
+        initial_content = '{"token": "old"}'
+        self._setup_creds_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
         (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
 
         mock_client = MagicMock()
-        with (
-            self._patch_home(tmp_path),
-            patch("main.boto3.client", return_value=mock_client),
-        ):
+        mock_client.get_secret_value.return_value = {"SecretString": initial_content}
+        with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
             _writeback_claude_credentials("arn:claude", initial_hash)
 
         mock_client.put_secret_value.assert_called_once_with(
@@ -232,10 +259,24 @@ class TestWritebackClaudeCredentials:
             SecretString='{"token": "new"}',
         )
 
+    def test_skips_when_remote_updated_concurrently(self, tmp_path):
+        from main import _hash_text, _writeback_claude_credentials
+
+        initial_content = '{"token": "old"}'
+        self._setup_creds_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
+        (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
+
+        mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {"SecretString": '{"token": "concurrent"}'}
+        with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
+            _writeback_claude_credentials("arn:claude", initial_hash)
+
+        mock_client.put_secret_value.assert_not_called()
+
     def test_handles_missing_credentials_file(self, tmp_path):
         from main import _writeback_claude_credentials
 
-        # ファイルを作らない
         with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
             _writeback_claude_credentials("arn:claude", "any-hash")
 
@@ -244,18 +285,16 @@ class TestWritebackClaudeCredentials:
     def test_swallows_put_exception(self, tmp_path):
         from main import _hash_text, _writeback_claude_credentials
 
-        self._setup_creds_file(tmp_path, '{"token": "old"}')
-        initial_hash = _hash_text('{"token": "old"}')
+        initial_content = '{"token": "old"}'
+        self._setup_creds_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
         (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
 
         mock_client = MagicMock()
+        mock_client.get_secret_value.return_value = {"SecretString": initial_content}
         mock_client.put_secret_value.side_effect = RuntimeError("AWS down")
 
-        with (
-            self._patch_home(tmp_path),
-            patch("main.boto3.client", return_value=mock_client),
-        ):
-            # 例外が外に伝播しないこと（ベストエフォート）
+        with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
             _writeback_claude_credentials("arn:claude", initial_hash)
 
 
@@ -400,7 +439,6 @@ class TestNotifyTaskFailure:
         with patch("main.SlackClient", return_value=mock_slack):
             from main import _notify_task_failure
 
-            # 例外が外に伝播しないこと
             _notify_task_failure("slack-token")
 
     def test_cloudflare_exception_sends_retry_message(self, monkeypatch):
@@ -467,8 +505,6 @@ class TestMain:
             patch("main._get_secret", return_value="secret"),
             patch("main._setup_claude_credentials"),
             patch("main._writeback_claude_credentials"),
-            patch("main._setup_codex_credentials"),
-            patch("main._writeback_codex_credentials"),
             patch("main.SlackClient"),
             patch("main.DynamoDbClient"),
             patch("main._run_feedback") as mock_feedback,
@@ -480,6 +516,47 @@ class TestMain:
 
         mock_feedback.assert_called_once()
         mock_orch.assert_not_called()
+
+    def test_feedback_does_not_setup_codex_credentials(self, monkeypatch):
+        self._set_common_env(monkeypatch)
+        monkeypatch.setenv("TASK_TYPE", "feedback")
+
+        with (
+            patch("main._get_secret", return_value="secret"),
+            patch("main._setup_claude_credentials"),
+            patch("main._writeback_claude_credentials"),
+            patch("main._setup_codex_credentials") as mock_codex_setup,
+            patch("main._writeback_codex_credentials") as mock_codex_wb,
+            patch("main.SlackClient"),
+            patch("main.DynamoDbClient"),
+            patch("main._run_feedback"),
+        ):
+            from main import main
+
+            main()
+
+        mock_codex_setup.assert_not_called()
+        mock_codex_wb.assert_not_called()
+
+    def test_feedback_fetches_four_secrets(self, monkeypatch):
+        self._set_common_env(monkeypatch)
+        monkeypatch.setenv("TASK_TYPE", "feedback")
+
+        with (
+            patch("main._get_secret", return_value="secret") as mock_get,
+            patch("main._setup_claude_credentials"),
+            patch("main._writeback_claude_credentials"),
+            patch("main.SlackClient"),
+            patch("main.DynamoDbClient"),
+            patch("main._run_feedback"),
+        ):
+            from main import main
+
+            main()
+
+        called_arns = {c.args[0] for c in mock_get.call_args_list}
+        assert called_arns == {"arn:slack", "arn:notion", "arn:github", "arn:claude"}
+        assert "arn:codex" not in called_arns
 
     def test_routes_to_orchestrator_when_no_task_type(self, monkeypatch):
         self._set_common_env(monkeypatch)

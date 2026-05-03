@@ -35,6 +35,15 @@ def _hash_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _write_secret_file(path: Path, content: str) -> None:
+    """ファイルを 0600 権限で原子的に作成・書き込む。umask の影響を受けない。"""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+
+
 def _setup_claude_credentials(secret_value: str) -> str:
     """Claude Code OAuthクレデンシャルをホームディレクトリに配置し、起動時の hash を返す。
 
@@ -44,7 +53,7 @@ def _setup_claude_credentials(secret_value: str) -> str:
     """
     claude_dir = Path.home() / ".claude"
     claude_dir.mkdir(exist_ok=True)
-    (claude_dir / ".credentials.json").write_text(secret_value)
+    _write_secret_file(claude_dir / ".credentials.json", secret_value)
     return _hash_text(secret_value)
 
 
@@ -52,7 +61,8 @@ def _writeback_claude_credentials(secret_arn: str, initial_hash: str) -> None:
     """タスク終了時、credentials が refresh されていれば Secrets Manager に書き戻す。
 
     ベストエフォート: 書き戻し失敗はタスク本体の終了コードに影響させない。
-    Claude CLI が実行中に refresh した場合（auth status を内部的に走らせた等）の救済。
+    書き戻し前に Secrets Manager の現在値を再取得し、起動時から変更されていれば skip する
+    （並行タスクによる上書きを防ぐ optimistic concurrency）。
     """
     creds_path = Path.home() / ".claude" / ".credentials.json"
     try:
@@ -63,10 +73,12 @@ def _writeback_claude_credentials(secret_arn: str, initial_hash: str) -> None:
         if _hash_text(current) == initial_hash:
             logger.info("Credentials unchanged at task exit")
             return
-        boto3.client("secretsmanager").put_secret_value(
-            SecretId=secret_arn,
-            SecretString=current,
-        )
+        sm = boto3.client("secretsmanager")
+        remote_now = sm.get_secret_value(SecretId=secret_arn)["SecretString"]
+        if _hash_text(remote_now) != initial_hash:
+            logger.warning("Credentials in Secrets Manager changed since task start; skipping writeback")
+            return
+        sm.put_secret_value(SecretId=secret_arn, SecretString=current)
         logger.info("Credentials writeback succeeded")
     except Exception:
         logger.exception("Credentials writeback failed (non-fatal)")
@@ -81,9 +93,7 @@ def _setup_codex_credentials(secret_value: str) -> str:
     """
     codex_dir = Path.home() / ".codex"
     codex_dir.mkdir(exist_ok=True)
-    auth_path = codex_dir / "auth.json"
-    auth_path.write_text(secret_value)
-    auth_path.chmod(0o600)
+    _write_secret_file(codex_dir / "auth.json", secret_value)
     return _hash_text(secret_value)
 
 
@@ -91,6 +101,8 @@ def _writeback_codex_credentials(secret_arn: str, initial_hash: str) -> None:
     """タスク終了時、Codex auth.json が refresh されていれば Secrets Manager に書き戻す。
 
     ベストエフォート: 書き戻し失敗はタスク本体の終了コードに影響させない。
+    書き戻し前に Secrets Manager の現在値を再取得し、起動時から変更されていれば skip する
+    （並行タスクによる上書きを防ぐ optimistic concurrency）。
     """
     auth_path = Path.home() / ".codex" / "auth.json"
     try:
@@ -101,10 +113,12 @@ def _writeback_codex_credentials(secret_arn: str, initial_hash: str) -> None:
         if _hash_text(current) == initial_hash:
             logger.info("Codex credentials unchanged at task exit")
             return
-        boto3.client("secretsmanager").put_secret_value(
-            SecretId=secret_arn,
-            SecretString=current,
-        )
+        sm = boto3.client("secretsmanager")
+        remote_now = sm.get_secret_value(SecretId=secret_arn)["SecretString"]
+        if _hash_text(remote_now) != initial_hash:
+            logger.warning("Codex credentials in Secrets Manager changed since task start; skipping writeback")
+            return
+        sm.put_secret_value(SecretId=secret_arn, SecretString=current)
         logger.info("Codex credentials writeback succeeded")
     except Exception:
         logger.exception("Codex credentials writeback failed (non-fatal)")
@@ -188,16 +202,14 @@ def main() -> None:
 
     slack_token = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
     claude_secret_arn = os.environ["CLAUDE_OAUTH_SECRET_ARN"]
-    codex_secret_arn = os.environ["CODEX_AUTH_SECRET_ARN"]
     claude_initial_hash: str | None = None
+    codex_secret_arn: str | None = None
     codex_initial_hash: str | None = None
     try:
         notion_token = _get_secret(os.environ["NOTION_TOKEN_SECRET_ARN"])
         github_token = _get_secret(os.environ["GITHUB_TOKEN_SECRET_ARN"])
         claude_oauth = _get_secret(claude_secret_arn)
         claude_initial_hash = _setup_claude_credentials(claude_oauth)
-        codex_auth = _get_secret(codex_secret_arn)
-        codex_initial_hash = _setup_codex_credentials(codex_auth)
 
         table_prefix = os.environ["DYNAMODB_TABLE_PREFIX"]
         slack_client = SlackClient(slack_token)
@@ -208,6 +220,9 @@ def main() -> None:
         if task_type == "feedback":
             _run_feedback(slack_client, db_client)
         else:
+            codex_secret_arn = os.environ["CODEX_AUTH_SECRET_ARN"]
+            codex_auth = _get_secret(codex_secret_arn)
+            codex_initial_hash = _setup_codex_credentials(codex_auth)
             _run_orchestrator(slack_client, db_client, notion_token, github_token)
     except Exception as exc:
         logger.exception("Task failed")
