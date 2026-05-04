@@ -365,8 +365,8 @@ export function DashboardHome() {
                     <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
                       {fmtDuration(durationMs(ex.created_at, ex.completed_at))}
                     </TableCell>
-                    <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
-                      {fmtTokens(ex.total_tokens_used ?? null)}
+                    <TableCell className="py-2.5 text-xs text-muted-foreground">
+                      <TokenCell ex={ex} />
                     </TableCell>
                     <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
                       {fmtCost(ex.total_cost_usd ?? null)}
@@ -386,6 +386,23 @@ export function DashboardHome() {
 }
 
 /* ── sub-components ─────────────────────────────────────────────────────── */
+
+function TokenCell({ ex }: { ex: import("@/api/types").Execution }) {
+  const total = ex.total_tokens_used ?? null
+  const input = ex.total_input_tokens ?? null
+  const output = ex.total_output_tokens ?? null
+  if (total == null && input == null) return <span className="text-muted-foreground">—</span>
+  return (
+    <div className="text-right leading-tight">
+      <div className="tabular">{fmtTokens(total)}</div>
+      {(input != null || output != null) && (
+        <div className="text-[10px] text-muted-foreground/60 tabular">
+          in {fmtTokens(input)} / out {fmtTokens(output)}
+        </div>
+      )}
+    </div>
+  )
+}
 
 function EmptyState({ message }: { message: string }) {
   return (

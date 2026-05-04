@@ -63,6 +63,38 @@ class DynamoDbClient:
             ExpressionAttributeValues=attr_values,
         )
 
+    def update_execution_tokens(
+        self,
+        execution_id: str,
+        total_tokens: int | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        total_cost: "decimal.Decimal | None",
+    ) -> None:
+        """実行レコードにトークン使用量とコストを書き込む（実行完了時）"""
+        import decimal
+        attr_values: dict = {}
+        sets: list[str] = []
+        if total_tokens is not None:
+            sets.append("total_tokens_used = :tt")
+            attr_values[":tt"] = total_tokens
+        if input_tokens is not None:
+            sets.append("total_input_tokens = :ti")
+            attr_values[":ti"] = input_tokens
+        if output_tokens is not None:
+            sets.append("total_output_tokens = :to")
+            attr_values[":to"] = output_tokens
+        if total_cost is not None:
+            sets.append("total_cost_usd = :tc")
+            attr_values[":tc"] = total_cost
+        if not sets:
+            return
+        self._table("workflow-executions").update_item(
+            Key={"execution_id": execution_id},
+            UpdateExpression="SET " + ", ".join(sets),
+            ExpressionAttributeValues=attr_values,
+        )
+
     def get_execution(self, execution_id: str) -> dict:
         """実行レコードを取得する"""
         response = self._table("workflow-executions").get_item(Key={"execution_id": execution_id})

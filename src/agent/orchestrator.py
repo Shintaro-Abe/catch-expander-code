@@ -230,6 +230,8 @@ def _accumulate_cost(raw_stdout: str, cost_acc: dict | None) -> dict[str, int] |
         if cost_acc is not None:
             cost_acc["total_cost_usd"] += float(cost)
             cost_acc["total_tokens_used"] += total_tokens
+            cost_acc["total_input_tokens"] += input_tokens
+            cost_acc["total_output_tokens"] += output_tokens
         return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
     except Exception:  # noqa: BLE001
         return None
@@ -801,7 +803,12 @@ class Orchestrator:
         # run() で本物の EventEmitter に差し替え。run() を経由しないテスト/直接呼び出し
         # では _NoOpEmitter のままなので副作用なし。
         self._emitter: Any = _NoOpEmitter()
-        self._cost_acc: dict = {"total_cost_usd": 0.0, "total_tokens_used": 0}
+        self._cost_acc: dict = {
+            "total_cost_usd": 0.0,
+            "total_tokens_used": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+        }
 
     def run(
         self,
@@ -1260,13 +1267,24 @@ class Orchestrator:
         finally:
             total_duration_ms = (time.monotonic_ns() - overall_start_ns) // 1_000_000
             total_tokens = self._cost_acc["total_tokens_used"] or None
+            input_tokens = self._cost_acc["total_input_tokens"] or None
+            output_tokens = self._cost_acc["total_output_tokens"] or None
             total_cost = Decimal(str(round(self._cost_acc["total_cost_usd"], 6))) if self._cost_acc["total_cost_usd"] else None
+            # 実行レコードにトークン・コストを書き込む（list_executions で参照可能にする）
+            try:
+                self.db.update_execution_tokens(
+                    execution_id, total_tokens, input_tokens, output_tokens, total_cost
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to write token data to execution record", exc_info=True)
             self._emitter.emit(
                 "execution_completed",
                 {
                     "status": final_status,
                     "total_duration_ms": total_duration_ms,
                     "total_tokens_used": total_tokens,
+                    "total_input_tokens": input_tokens,
+                    "total_output_tokens": output_tokens,
                     "total_cost_usd": total_cost,
                     "final_deliverable_url": notion_url,
                     "github_url": github_url,

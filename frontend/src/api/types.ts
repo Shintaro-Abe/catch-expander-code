@@ -51,6 +51,8 @@ export interface Execution {
   perspectives?: string[]
   deliverable_types?: string[]
   total_tokens_used?: number | null
+  total_input_tokens?: number | null
+  total_output_tokens?: number | null
   total_cost_usd?: number | null
 }
 
