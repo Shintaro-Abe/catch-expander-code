@@ -14,6 +14,16 @@ import {
 } from "@/components/ui/table"
 import { periodToRange, durationMs, fmtDuration, fmtRelative, fmtDatetime } from "@/lib/time"
 
+function fmtTokens(n: number | null | undefined): string {
+  if (n == null) return "—"
+  return n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(n)
+}
+
+function fmtCost(usd: number | null | undefined): string {
+  if (usd == null) return "—"
+  return `$${usd.toFixed(4)}`
+}
+
 /* ── constants ─────────────────────────────────────────────────────────── */
 
 const PAGE_SIZE = 20
@@ -129,6 +139,8 @@ export function ExecutionList() {
                       <TableHead className="text-xs text-muted-foreground w-[110px]">ID</TableHead>
                       <TableHead className="text-xs text-muted-foreground">トピック</TableHead>
                       <TableHead className="text-xs text-muted-foreground text-right w-[80px]">実行時間</TableHead>
+                      <TableHead className="text-xs text-muted-foreground text-right w-[80px]">トークン</TableHead>
+                      <TableHead className="text-xs text-muted-foreground text-right w-[80px]">コスト</TableHead>
                       <TableHead className="text-xs text-muted-foreground text-right w-[100px]">開始日時</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -177,7 +189,7 @@ function ExecutionRow({ ex }: { ex: Execution }) {
       </TableCell>
       <TableCell className="py-3 max-w-0">
         <span
-          className="block text-xs text-foreground truncate max-w-[420px]"
+          className="block text-xs text-foreground truncate max-w-[360px]"
           title={ex.topic}
         >
           {ex.topic}
@@ -185,6 +197,12 @@ function ExecutionRow({ ex }: { ex: Execution }) {
       </TableCell>
       <TableCell className="py-3 text-right text-xs tabular text-muted-foreground">
         {fmtDuration(dur)}
+      </TableCell>
+      <TableCell className="py-3 text-right text-xs tabular text-muted-foreground">
+        {fmtTokens(ex.total_tokens_used)}
+      </TableCell>
+      <TableCell className="py-3 text-right text-xs tabular text-muted-foreground">
+        {fmtCost(ex.total_cost_usd)}
       </TableCell>
       <TableCell className="py-3 text-right text-xs tabular text-muted-foreground">
         <span title={fmtDatetime(ex.created_at)}>{fmtRelative(ex.created_at)}</span>

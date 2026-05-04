@@ -50,6 +50,8 @@ export interface Execution {
   intent?: string
   perspectives?: string[]
   deliverable_types?: string[]
+  total_tokens_used?: number | null
+  total_cost_usd?: number | null
 }
 
 export interface ExecutionListResponse {

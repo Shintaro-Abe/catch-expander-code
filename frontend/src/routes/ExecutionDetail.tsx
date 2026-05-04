@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query"
 import {
   ChevronLeft, MessageSquare, GitBranch, CheckCircle2,
   Flag, Zap, AlertTriangle, ThumbsUp, Circle, ChevronDown,
-  ChevronUp, Clock, User, Hash,
+  ChevronUp, Clock, User, Hash, Cpu,
 } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 
@@ -31,6 +31,59 @@ const EVENT_CONFIG: Record<string, EventConfig> = {
 
 function getEventConfig(type: string): EventConfig {
   return EVENT_CONFIG[type] ?? { icon: Circle, label: type, color: "text-muted-foreground" }
+}
+
+/* ── token helpers ──────────────────────────────────────────────────────── */
+
+function fmtTokens(n: unknown): string {
+  if (n == null || typeof n !== "number") return "—"
+  return n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(n)
+}
+
+function fmtCost(usd: unknown): string {
+  if (usd == null || typeof usd !== "number") return "—"
+  return `$${usd.toFixed(4)}`
+}
+
+function TokenChip({ label, value, highlight = false }: { label: string; value: string; highlight?: boolean }) {
+  return (
+    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] ${
+      highlight ? "bg-indigo-900/40 text-indigo-300" : "bg-secondary text-muted-foreground"
+    }`}>
+      <span className="text-muted-foreground">{label}</span>
+      <span className="tabular font-mono">{value}</span>
+    </span>
+  )
+}
+
+function EventTokenSummary({ payload, eventType }: { payload: Record<string, unknown>; eventType: string }) {
+  if (eventType === "api_call_completed") {
+    const input = payload.input_tokens
+    const output = payload.output_tokens
+    const total = payload.total_tokens
+    if (total == null && input == null) return null
+    return (
+      <div className="flex items-center gap-1 flex-wrap mt-0.5">
+        <Cpu size={10} className="text-muted-foreground shrink-0" />
+        {input != null && <TokenChip label="in" value={fmtTokens(input)} />}
+        {output != null && <TokenChip label="out" value={fmtTokens(output)} />}
+        {total != null && <TokenChip label="total" value={fmtTokens(total)} highlight />}
+      </div>
+    )
+  }
+  if (eventType === "execution_completed") {
+    const tokens = payload.total_tokens_used
+    const cost = payload.total_cost_usd
+    if (tokens == null && cost == null) return null
+    return (
+      <div className="flex items-center gap-1 flex-wrap mt-0.5">
+        <Cpu size={10} className="text-muted-foreground shrink-0" />
+        {tokens != null && <TokenChip label="total" value={fmtTokens(tokens)} highlight />}
+        {cost != null && <TokenChip label="cost" value={fmtCost(cost)} />}
+      </div>
+    )
+  }
+  return null
 }
 
 /* ── component ─────────────────────────────────────────────────────────── */
@@ -246,6 +299,8 @@ function Timeline({
                     {ev.status_at_emit}
                   </span>
                 </div>
+
+                <EventTokenSummary payload={ev.payload ?? {}} eventType={ev.event_type} />
 
                 {hasPayload && (
                   <button

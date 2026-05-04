@@ -128,6 +128,9 @@ def emit_api_call_completed(
     duration_ms: int,
     response_status_code: int | None,
     endpoint_path: str,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    total_tokens: int | None = None,
 ) -> None:
     """外部 API 呼び出しの終了を `api_call_completed` イベントとして emit する (Tier 1.2)。
 
@@ -139,19 +142,26 @@ def emit_api_call_completed(
         duration_ms: API 呼び出し所要時間 (ms)。retry 含む全所要時間。
         response_status_code: 最終 HTTP status code。例外で取得不能なら None。
         endpoint_path: 呼び出した URL の path 部 (host + ?query は除く想定)。
+        input_tokens: この呼び出しの入力トークン数 (Anthropic 系のみ)。
+        output_tokens: この呼び出しの出力トークン数 (Anthropic 系のみ)。
+        total_tokens: input + output + cache の合計トークン数。
     """
     if emitter is None:
         return
-    emitter.emit(
-        "api_call_completed",
-        {
-            "subtype": subtype,
-            "success": success,
-            "duration_ms": duration_ms,
-            "response_status_code": response_status_code,
-            "endpoint_path": endpoint_path,
-        },
-    )
+    payload: dict = {
+        "subtype": subtype,
+        "success": success,
+        "duration_ms": duration_ms,
+        "response_status_code": response_status_code,
+        "endpoint_path": endpoint_path,
+    }
+    if input_tokens is not None:
+        payload["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        payload["output_tokens"] = output_tokens
+    if total_tokens is not None:
+        payload["total_tokens"] = total_tokens
+    emitter.emit("api_call_completed", payload)
 
 
 def emit_rate_limit_hit(

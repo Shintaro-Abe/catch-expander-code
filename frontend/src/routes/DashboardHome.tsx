@@ -129,9 +129,11 @@ export function DashboardHome() {
           loading={qSummary.isLoading}
         />
         <KpiCard
-          title="コスト"
-          value={cost ? fmtCost(cost.total_cost_usd) : null}
-          sub={cost ? `トークン: ${fmtTokens(cost.total_tokens_used)}` : undefined}
+          title="実行あたりコスト"
+          value={cost && cost.total_executions > 0
+            ? fmtCost(cost.total_cost_usd != null ? cost.total_cost_usd / cost.total_executions : null)
+            : cost ? "—" : null}
+          sub={cost ? `期間合計: ${fmtCost(cost.total_cost_usd)}` : undefined}
           loading={qCost.isLoading}
         />
       </div>
@@ -338,6 +340,8 @@ export function DashboardHome() {
                   <TableHead className="text-xs text-muted-foreground">ID</TableHead>
                   <TableHead className="text-xs text-muted-foreground">トピック</TableHead>
                   <TableHead className="text-xs text-muted-foreground text-right">実行時間</TableHead>
+                  <TableHead className="text-xs text-muted-foreground text-right">トークン</TableHead>
+                  <TableHead className="text-xs text-muted-foreground text-right">コスト</TableHead>
                   <TableHead className="text-xs text-muted-foreground text-right">開始日時</TableHead>
                 </TableRow>
               </TableHeader>
@@ -355,11 +359,17 @@ export function DashboardHome() {
                         {ex.execution_id.slice(0, 12)}…
                       </Link>
                     </TableCell>
-                    <TableCell className="py-2.5 max-w-[280px]">
+                    <TableCell className="py-2.5 max-w-[200px]">
                       <span className="text-xs text-foreground line-clamp-1">{ex.topic}</span>
                     </TableCell>
                     <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
                       {fmtDuration(durationMs(ex.created_at, ex.completed_at))}
+                    </TableCell>
+                    <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
+                      {fmtTokens(ex.total_tokens_used ?? null)}
+                    </TableCell>
+                    <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
+                      {fmtCost(ex.total_cost_usd ?? null)}
                     </TableCell>
                     <TableCell className="py-2.5 text-right text-xs tabular text-muted-foreground">
                       {fmtRelative(ex.created_at)}

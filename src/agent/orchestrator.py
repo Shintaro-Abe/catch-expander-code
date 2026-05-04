@@ -212,24 +212,27 @@ def _claude_stderr_indicates_rate_limit(stderr_text: str) -> bool:
     return "429" in lowered or "rate limit" in lowered or "rate_limit" in lowered
 
 
-def _accumulate_cost(raw_stdout: str, cost_acc: dict | None) -> None:
-    """CLI JSON 出力から cost と tokens を取得してアキュムレータに加算する。"""
-    if cost_acc is None:
-        return
+def _accumulate_cost(raw_stdout: str, cost_acc: dict | None) -> dict[str, int] | None:
+    """CLI JSON 出力から cost と tokens を取得してアキュムレータに加算する。
+
+    Returns:
+        {"input_tokens": int, "output_tokens": int, "total_tokens": int} or None on parse failure.
+    """
     try:
         data = json.loads(raw_stdout)
         cost = data.get("total_cost_usd") or 0.0
         usage = data.get("usage") or {}
-        tokens = (
-            (usage.get("input_tokens") or 0)
-            + (usage.get("output_tokens") or 0)
-            + (usage.get("cache_creation_input_tokens") or 0)
-            + (usage.get("cache_read_input_tokens") or 0)
-        )
-        cost_acc["total_cost_usd"] += float(cost)
-        cost_acc["total_tokens_used"] += int(tokens)
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        total_tokens = input_tokens + output_tokens + cache_creation + cache_read
+        if cost_acc is not None:
+            cost_acc["total_cost_usd"] += float(cost)
+            cost_acc["total_tokens_used"] += total_tokens
+        return {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens}
     except Exception:  # noqa: BLE001
-        pass
+        return None
 
 
 def call_claude(
@@ -263,6 +266,7 @@ def call_claude(
     success = False
     final_status: int | None = None
     endpoint_path = f"/claude/cli?model={model}"
+    call_toks: list[dict[str, int] | None] = [None]  # finally ブロックとトークン情報を共有
     try:
         last_error: subprocess.CalledProcessError | None = None
         for attempt in range(MAX_CLAUDE_RETRIES):
@@ -270,7 +274,7 @@ def call_claude(
                 result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
                 success = True
                 final_status = result.returncode
-                _accumulate_cost(result.stdout, cost_acc)
+                call_toks[0] = _accumulate_cost(result.stdout, cost_acc)
                 return result.stdout
             except subprocess.CalledProcessError as e:
                 last_error = e
@@ -308,7 +312,7 @@ def call_claude(
                 result = subprocess.run(advisor_cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
                 success = True
                 final_status = result.returncode
-                _accumulate_cost(result.stdout, cost_acc)
+                call_toks[0] = _accumulate_cost(result.stdout, cost_acc)
                 return result.stdout
             except subprocess.CalledProcessError:
                 pass
@@ -319,6 +323,7 @@ def call_claude(
         raise RuntimeError(msg)
     finally:
         duration_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+        tok = call_toks[0] or {}
         _emit_api_call_completed(
             emitter,
             subtype="anthropic",
@@ -326,6 +331,9 @@ def call_claude(
             duration_ms=duration_ms,
             response_status_code=final_status,
             endpoint_path=endpoint_path,
+            input_tokens=tok.get("input_tokens"),
+            output_tokens=tok.get("output_tokens"),
+            total_tokens=tok.get("total_tokens"),
         )
 
 
@@ -551,6 +559,7 @@ def call_claude_with_workspace(
     api_success = False
     api_final_status: int | None = None
     endpoint_path = f"/claude/cli?model={model}&mode=workspace&code_type={code_type}"
+    ws_call_toks: list[dict[str, int] | None] = [None]  # finally ブロックとトークン情報を共有
     try:
         cmd = [
             "claude",
@@ -578,7 +587,7 @@ def call_claude_with_workspace(
                 raw_stdout = result.stdout
                 api_success = True
                 api_final_status = result.returncode
-                _accumulate_cost(raw_stdout, cost_acc)
+                ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
                 break
             except subprocess.CalledProcessError as e:
                 last_error = e
@@ -624,7 +633,7 @@ def call_claude_with_workspace(
                     raw_stdout = result.stdout
                     api_success = True
                     api_final_status = result.returncode
-                    _accumulate_cost(raw_stdout, cost_acc)
+                    ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
                 except subprocess.CalledProcessError:
                     pass
 
@@ -639,6 +648,7 @@ def call_claude_with_workspace(
         return raw_stdout, files, outcome
     finally:
         api_duration_ms = (time.monotonic_ns() - api_start_ns) // 1_000_000
+        ws_tok = ws_call_toks[0] or {}
         _emit_api_call_completed(
             emitter,
             subtype="anthropic",
@@ -646,6 +656,9 @@ def call_claude_with_workspace(
             duration_ms=api_duration_ms,
             response_status_code=api_final_status,
             endpoint_path=endpoint_path,
+            input_tokens=ws_tok.get("input_tokens"),
+            output_tokens=ws_tok.get("output_tokens"),
+            total_tokens=ws_tok.get("total_tokens"),
         )
         shutil.rmtree(sandbox, ignore_errors=True)
 
