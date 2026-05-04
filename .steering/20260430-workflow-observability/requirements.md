@@ -385,10 +385,9 @@ UI で表示する内容を支えるため、以下のイベントが events テ
 - 一致したら state を **照合直後に DDB から削除** (一回限り)
 - 不一致または既に削除済みの state は 400 応答
 
-**[S4] AWS 課金 Budget アラート + 年 1 回の手動鍵ローテーション**
+**[S4] 年 1 回の手動鍵ローテーション**
 
-- AWS Budgets で **月額 $30 の警告アラート** を設定 (Slack 個人 channel に通知)
-- 運用手順 (`docs/development-guidelines.md` に追加) に以下を明記:
+- 運用手順に以下を明記:
   - **JWT 署名鍵** を年 1 回 (毎年 1 月) 手動ローテーション
   - **Slack OAuth client_secret** を年 1 回手動ローテーション
   - **Slack workspace の MFA を有効化** (アクセス防御の最大要素)
@@ -397,7 +396,7 @@ UI で表示する内容を支えるため、以下のイベントが events テ
 
 #### スキップする対策 (個人利用では過剰)
 
-- **API Gateway / Lambda Authorizer のレート制限**: 自分しか使わない / AWS Budget で課金爆発は別経路防御
+- **API Gateway / Lambda Authorizer のレート制限**: 自分しか使わない
 - **JWT blacklist (ログアウト時の token 即時失効)**: 自分のみ利用、24h セッション expire で受容
 - **CloudFront Origin Verify の自動ローテーション**: 静的値で十分
 - **PII フィルタリング**: topic は自分の入力なので不要

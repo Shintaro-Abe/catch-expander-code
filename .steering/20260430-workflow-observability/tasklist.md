@@ -70,7 +70,6 @@
 
 - [x] T3-1: production デプロイ (`sam deploy` + GitHub Actions)
 - [x] T3-2: 実機検証 (Slack 投入 → 全イベント発火 → ダッシュボードで観測確認)
-- [ ] T3-3: 1 週間のコストモニタリング
 - [ ] T3-4: ナレッジ化判断 (obsidian ノート作成 or 不要判断)
 - [ ] T3-5: ステアリングドキュメントの完了マーク + 末尾追記
 
@@ -745,16 +744,6 @@ PR2 の差分に対し独立 LLM レビューを連続で回す。
 
 ---
 
-### T3-3: 1 週間のコストモニタリング
-
-#### 完了条件
-
-- [ ] AWS Cost Explorer で `DashboardEventsTable` / `DashboardBucket` / `DashboardDistribution` / `DashboardApi` のコスト推移を 7 日後に確認
-- [ ] NFR-2 (月額 +$30 以内) を超える兆候があれば対応 (DDB アクセスパターン / Lambda メモリ / CloudFront キャッシュ調整)
-- [ ] 結果を本 tasklist 末尾に追記
-
----
-
 ### T3-4: ナレッジ化判断
 
 #### 完了条件
@@ -799,7 +788,7 @@ PR2 の差分に対し独立 LLM レビューを連続で回す。
 | S1: CSP / セキュリティヘッダー | T2-14 (CloudFront Response Headers Policy 追加) |
 | S2: IAM 最小権限 | T1-12 (各 Lambda の `*` 禁止 + ARN 限定) |
 | S3: OAuth state 単一回限り + フィンガープリント | T1-9b (auth_login / auth_callback 組み込み) |
-| S4: AWS Budget + 年次手動ローテーション | T2-14b (Budget アラート), T2-15 (運用手順) |
+| S4: 年次手動ローテーション | T2-15 (運用手順) |
 
 すべての T が完了 = すべての AC + S1〜S4 が満たされる、の整合を保つ。
 
@@ -812,7 +801,7 @@ PR2 の差分に対し独立 LLM レビューを連続で回す。
 | Phase 0 | 前提条件確認 (T0-1〜T0-7) | 1〜2 日 |
 | Phase 1 | バックエンド基盤 (T1-1〜T1-16) | 4〜6 日 |
 | Phase 2 | フロントエンド SPA (T2-1〜T2-18) | 5〜7 日 |
-| Phase 3 | 実機検証 + クロージング (T3-1〜T3-5) | 2 日 + 1 週間モニタ |
+| Phase 3 | 実機検証 + クロージング (T3-1〜T3-5) | 2 日 |
 | **合計** | | **2〜3 週間** |
 
 ---
@@ -825,7 +814,7 @@ PR2 の差分に対し独立 LLM レビューを連続で回す。
 | Slack OAuth クライアント作成が時間かかる | T0-1 を最優先、ブロッカーなら他タスクと並行 |
 | 既存 `_run_review_loop` への意図せぬ侵襲 | T1-2 で `memory/project_review_loop_recurring_patch_site.md` を必ず参照、Codex レビュー (T1-15) で侵襲チェック |
 | events 書き込みのパフォーマンス劣化 | T1-2 完了後にローカルで `pytest` を 1 回回し、orchestrator のテスト時間を計測。+5% 超なら batch_writer 化検討 |
-| コスト超過 | T3-3 で 1 週間モニタ、超過なら GSI 削減 / Lambda メモリ調整 |
+| コスト超過 | AWS Cost Explorer で随時確認、超過なら GSI 削減 / Lambda メモリ調整 |
 | handoff バンドルの品質ばらつき | T2-3〜T2-7 で各画面のコミット前に手作業レビュー必須 |
 | CloudFront → API GW のオリジン保護漏れ | T2-14 で `X-Origin-Verify` 検証ロジックを実装、Codex レビュー (T2-17) で確認 |
 

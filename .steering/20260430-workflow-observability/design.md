@@ -602,70 +602,29 @@ def lambda_handler(event, context):
 - state 一致 + fingerprint 一致 + 単一回限りの 3 段階で OAuth callback CSRF / replay を防御
 - IP が変わるモバイル利用では誤検知の可能性あり (公衆 Wi-Fi → 4G の切り替え等)。個人利用前提では受容
 
-#### 4.6.4 [S4] AWS Budget アラート + 年 1 回の手動鍵ローテーション
+#### 4.6.4 [S4] 年 1 回の手動鍵ローテーション
 
-**AWS Budget アラート** (SAM template に追加):
-
-```yaml
-DashboardBudgetAlert:
-  Type: AWS::Budgets::Budget
-  Properties:
-    Budget:
-      BudgetName: catch-expander-dashboard-monthly
-      BudgetLimit:
-        Amount: 30
-        Unit: USD
-      TimeUnit: MONTHLY
-      BudgetType: COST
-      CostFilters:
-        TagKeyValue:
-          - "user:Project$catch-expander-dashboard"
-    NotificationsWithSubscribers:
-      - Notification:
-          ComparisonOperator: GREATER_THAN
-          NotificationType: ACTUAL
-          Threshold: 80
-          ThresholdType: PERCENTAGE
-        Subscribers:
-          - SubscriptionType: SNS
-            Address: !Ref DashboardBudgetAlertTopic
-```
-
-- $30 の 80% (= $24) で警告通知。実害が出る前に検知
-- SNS Topic から Slack 個人 channel に Lambda 経由で通知 (既存 Slack 通知パスを再利用)
-- Budget アラートは無料 (AWS Budgets の最初の 2 つは無料枠)
-
-**年 1 回の手動ローテーション運用手順** (`docs/development-guidelines.md` に追加):
-
-```markdown
-## ダッシュボード運用手順
-
-### 年次セキュリティメンテナンス (毎年 1 月実施)
+**年 1 回の手動ローテーション運用手順**:
 
 1. **JWT 署名鍵のローテーション**
-   - AWS CLI: `aws secretsmanager rotate-secret --secret-id catch-expander/dashboard-jwt-key`
-     (or 手動で `update-secret` で新ランダム値を投入)
-   - 既存セッションは旧鍵で発行されているため、24h 以内にすべて自然 expire
-   - ローテーション後にダッシュボードへ再ログイン (再認証フロー実行)
+   - `aws secretsmanager update-secret` で新ランダム値を投入
+   - 既存セッションは 24h 以内に自然 expire
+   - ローテーション後にダッシュボードへ再ログイン
 
 2. **Slack OAuth client_secret のローテーション**
-   - Slack App 管理画面 (`https://api.slack.com/apps/<app_id>`) で client_secret を再生成
-   - AWS Secrets Manager の `catch-expander/dashboard-slack-oauth` の `client_secret` を更新
+   - Slack App 管理画面で client_secret を再生成
+   - `catch-expander/dashboard-slack-oauth` の `client_secret` を更新
 
 3. **Slack workspace の MFA 確認**
-   - Slack の設定で MFA が ON になっていることを確認 (Slack OAuth 経由のアクセス強度の最大要素)
-
-4. **AWS Budget アラート閾値の見直し**
-   - 過去 1 年の実績を踏まえて月額上限 ($30) を調整するか判断
+   - Slack の設定で MFA が ON になっていることを確認
 
 ### PC 紛失時の対処
 
-1. Slack 設定画面 (`Slack Workspace Settings → Account → Sessions`) からすべてのセッションを revoke
+1. Slack 設定画面からすべてのセッションを revoke
 2. JWT 署名鍵を即時ローテーション (上記手順 1)
-3. AWS CloudFront のアクセスログを確認し、紛失後の不正アクセスがないかチェック
-```
+3. CloudFront アクセスログで紛失後の不正アクセスを確認
 
-- ダッシュボード URL を **公開 GitHub リポジトリの README やソースコード** に書かない (難読化のため `.env` で管理)
+- ダッシュボード URL を **公開 GitHub リポジトリの README やソースコード** に書かない
 
 #### 4.6.5 スキップする対策の明示 (将来再評価候補)
 
