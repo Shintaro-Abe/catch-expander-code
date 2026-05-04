@@ -3,11 +3,12 @@ FROM node:22-slim
 # 非rootユーザー作成
 RUN groupadd -r appuser && useradd -r -g appuser -m appuser
 
-# Claude Code CLIのインストール
-RUN npm install -g @anthropic-ai/claude-code
+# Claude Code CLI と Codex CLI のインストール
+RUN npm install -g @anthropic-ai/claude-code @openai/codex@0.125.0 \
+    && codex --version
 
-# Python（ラッパースクリプト用）
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
+# Python（ラッパースクリプト用）と curl（レビュアープロンプトの出典URL検証用）
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip curl \
     && rm -rf /var/lib/apt/lists/*
 
 # アプリケーションコード
