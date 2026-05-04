@@ -7,6 +7,7 @@ import type {
   ExecutionDetailResponse,
   ExecutionEventsResponse,
   ExecutionListResponse,
+  FeedbackAggregationResponse,
   MetricsSummary,
   Period,
   ReviewQualityResponse,
@@ -50,4 +51,7 @@ export const endpoints = {
 
   executionEvents: (id: string) =>
     api.get<ExecutionEventsResponse>(`/api/v1/executions/${id}/events`),
+
+  feedbackAggregation: (period: Period) =>
+    api.get<FeedbackAggregationResponse>(`/api/v1/metrics/feedback?period=${period}`),
 }

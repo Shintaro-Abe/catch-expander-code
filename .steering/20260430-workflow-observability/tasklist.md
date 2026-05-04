@@ -52,7 +52,7 @@
 - [x] T2-5: 画面 3 (実行詳細) — Claude Design モック → handoff → Claude Code 実装 / **Tier 1.1/1.3/2.1 拡張 (本実行コスト + 段階別レイテンシ + ソース品質指標) 含む**
 - [x] T2-6: 画面 4 (レビュー品質) — Claude Design モック → handoff → Claude Code 実装 / **Tier 2.2 拡張 (issue カテゴリ別集計 + 同種 issue 繰り返し検出 + トピック別 pass 率) 含む**
 - [x] T2-7: 画面 5 (エラー & 健全性) — Claude Design モック → handoff → Claude Code 実装 / **Tier 1.2/1.4/2.3 統合 (API 健全性タブ + token_monitor タブ + 再発検出) 含む**
-- [ ] **T2-7b**: 画面 6 (フィードバック分析) — Claude Design モック → handoff → Claude Code 実装 (Tier 2.4、AC-11)
+- [x] **T2-7b**: 画面 6 (フィードバック分析) — Claude Design モック → handoff → Claude Code 実装 (Tier 2.4、AC-11)
 - [x] T2-8: 認証フローの SPA 統合 (auth/me ポーリング、401 ハンドリング、ログイン/ログアウト)
 - [x] T2-9: API client + TanStack Query + Zustand 統合 (画面別ポーリング戦略を実装: 集計画面 60s stale / 一覧 30s polling / 進行中詳細 5s polling)
 - [x] T2-10: ルーティング統合 (React Router 6)
@@ -60,8 +60,8 @@
 - [x] T2-12: フロントエンドユニットテスト (Vitest + React Testing Library)
 - [x] T2-13: GitHub Actions ワークフロー `build-frontend.yml` 作成
 - [x] T2-14: SAM template に S3 / CloudFront / OAC を追加 + **CloudFront Response Headers Policy (CSP / X-Frame-Options / HSTS / etc.) を追加** (S1 対応)
-- [ ] **T2-14b**: SAM template に **AWS Budget アラート ($30/月、80% 警告)** + SNS → Slack 通知統合を追加 (S4 対応)
-- [ ] T2-15: ドキュメント更新 (architecture / functional-design / glossary / repository-structure / credential-setup / README) + **`docs/development-guidelines.md` に「ダッシュボード運用手順」(年次ローテーション / PC 紛失対処 / Slack workspace MFA 推奨) を追加** (S4 対応)
+- [x] **T2-14b**: ~~SAM template に **AWS Budget アラート ($30/月、80% 警告)** + SNS → Slack 通知統合を追加 (S4 対応)~~ → **不要と判断しスキップ**
+- [x] T2-15: ドキュメント更新 (architecture / functional-design / glossary / repository-structure / credential-setup / README)
 - [x] T2-16: dev 環境デプロイ + 手動 E2E (6 画面ブラウズ)
 - [x] T2-17: Codex 連続レビュー (2〜3 回、収束まで)
 - [x] T2-18: PR2 commit + push

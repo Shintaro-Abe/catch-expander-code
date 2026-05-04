@@ -50,6 +50,30 @@ Catch-Expander/
 │   │   ├── handler.py                 # EventBridge定期トリガーで発火
 │   │   └── requirements.txt
 │   │
+│   ├── observability/                 # 観測イベント共通ヘルパー
+│   │   ├── __init__.py
+│   │   └── event_emitter.py           # DynamoDB events テーブルへのイベント書き込みユーティリティ
+│   │
+│   ├── dashboard_api/                 # ダッシュボード API Lambda 群
+│   │   ├── __init__.py
+│   │   ├── _common.py                 # 共通ユーティリティ（json_response / error_response / ts_range 等）
+│   │   ├── requirements.txt
+│   │   ├── authorizer/                # Lambda Authorizer（JWT cookie 検証）
+│   │   ├── auth_login/                # Slack OAuth 認可 URL 生成
+│   │   ├── auth_callback/             # Slack OAuth コールバック・JWT 発行
+│   │   ├── auth_logout/               # JWT cookie 削除
+│   │   ├── auth_me/                   # セッション確認
+│   │   ├── list_executions/           # 実行一覧
+│   │   ├── get_execution/             # 実行詳細
+│   │   ├── get_execution_events/      # イベントタイムライン
+│   │   ├── get_metrics_summary/       # メトリクス概要
+│   │   ├── get_cost_summary/          # コスト集計
+│   │   ├── get_api_health/            # 外部 API 健全性
+│   │   ├── get_token_monitor_health/  # OAuth トークン更新状況
+│   │   ├── get_review_quality/        # レビュー品質
+│   │   ├── get_errors/                # エラー一覧
+│   │   └── get_feedback_aggregation/  # フィードバック集計
+│   │
 │   └── agent/                         # ECS エージェントアプリケーション
 │       ├── __init__.py
 │       ├── Dockerfile                 # ECS Fargate 用コンテナ定義
@@ -148,6 +172,22 @@ Slackイベントを受信し、署名検証・ACK応答・ECSタスク起動を
 ### `src/token_monitor/` — トークンリフレッシャー Lambda
 
 EventBridge の定期スケジュールで 12 時間ごとに発火し、Secrets Manager に保管された Claude OAuth credentials の `expiresAt` を確認する。残り 1 時間以下または失効済みの場合、`refreshToken` を Anthropic OAuth エンドポイントに直接送信して新 access_token を取得し、Secrets Manager を上書きする。refresh が失敗した場合のみ Slack 通知で再認証を促す。
+
+### `src/observability/` — 観測イベント共通ヘルパー
+
+`event_emitter.py` が DynamoDB の `{prefix}-events` テーブルへのイベント書き込みユーティリティを提供する。エージェントコンテナ（ECS）と Lambda トリガー関数の両方からインポートされ、ワークフロー各フェーズのイベントを一元的に記録する。
+
+### `src/dashboard_api/` — ダッシュボード API Lambda 群
+
+Slack OAuth 認証・JWT cookie 管理・観測データ取得の API エンドポイントを実装する Lambda 関数群。SAM テンプレートから `AWS::Serverless::HttpApi` にルーティングされる。`_common.py` が全 Lambda 共通のレスポンスヘルパー・クエリユーティリティを提供する。
+
+| サブディレクトリ | 役割 |
+|----------------|------|
+| `authorizer/` | Lambda Authorizer。JWT cookie を検証し API Gateway を保護 |
+| `auth_login/` `auth_callback/` `auth_logout/` `auth_me/` | Slack OAuth フロー |
+| `list_executions/` `get_execution/` `get_execution_events/` | 実行データ取得 |
+| `get_metrics_summary/` `get_cost_summary/` `get_api_health/` `get_token_monitor_health/` `get_review_quality/` `get_feedback_aggregation/` | メトリクス・分析データ取得 |
+| `get_errors/` | エラーイベント取得 |
 
 ### `src/agent/` — ECS エージェントアプリケーション
 

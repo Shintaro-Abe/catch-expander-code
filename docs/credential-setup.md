@@ -12,6 +12,7 @@
 | 4 | GitHub Fine-grained PAT | Secrets Manager |
 | 5 | Claude Code MaxプランOAuth | Secrets Manager → タスク起動時に `~/.claude/` へ復元 |
 | 6 | Codex CLI ChatGPT OAuth | Secrets Manager → タスク起動時に `~/.codex/` へ復元 |
+| 7 | ダッシュボード Slack OAuth アプリ | Secrets Manager |
 
 ---
 
@@ -315,6 +316,60 @@ Lambda は Claude OAuth のみを対象とする。
 
 ---
 
+## 6. ダッシュボード Slack OAuth アプリ
+
+ダッシュボード SPA への管理者ログインは Slack OAuth（OIDC）で行う。ワークフロー用 Bot アプリ（#1）とは別に、ダッシュボード専用の Slack App を作成する。
+
+### 6.1 Slack App の作成
+
+1. https://api.slack.com/apps にアクセス
+2. 「Create New App」→「From scratch」を選択
+3. App Name: `Catch Expander Dashboard`、Workspace: 対象ワークスペースを選択
+4. 「Create App」をクリック
+
+### 6.2 OAuth & Permissions の設定
+
+「OAuth & Permissions」ページで以下を設定する。
+
+**User Token Scopes（Bot Token Scopes ではない）:**
+
+| スコープ | 用途 |
+|---------|------|
+| `openid` | OIDC 認証（必須） |
+| `profile` | ユーザー名・アイコン取得 |
+| `email` | メールアドレス取得 |
+
+**Redirect URLs:**
+
+```
+https://duf2tc37sx7rn.cloudfront.net/api/v1/auth/callback
+```
+
+ローカル開発時は追加で `http://localhost:5173/api/v1/auth/callback` を登録する（任意）。
+
+### 6.3 クレデンシャルの取得
+
+| クレデンシャル | 取得場所 |
+|--------------|---------|
+| Client ID | 「Basic Information」→ App Credentials → Client ID |
+| Client Secret | 「Basic Information」→ App Credentials → Client Secret |
+
+### 6.4 Secrets Manager への登録
+
+```bash
+aws secretsmanager create-secret \
+  --name "catch-expander/dashboard-slack-oauth" \
+  --secret-string '{
+    "client_id": "XXXXXXXXXX.XXXXXXXXXX",
+    "client_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "signing_secret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }'
+```
+
+`signing_secret` はイベント受信時の署名検証には使用しないが、将来的な拡張に備えて保管する。
+
+---
+
 ## 5. Secrets Manager のシークレット一覧（まとめ）
 
 | シークレット名 | 内容 |
@@ -325,6 +380,7 @@ Lambda は Claude OAuth のみを対象とする。
 | `catch-expander/github-token` | GitHub Fine-grained PAT（`github_pat_`） |
 | `catch-expander/claude-oauth` | Claude Code OAuth認証情報（`~/.claude/.credentials.json`） |
 | `catch-expander/codex-auth` | Codex CLI ChatGPT OAuth認証情報（`~/.codex/auth.json`） |
+| `catch-expander/dashboard-slack-oauth` | ダッシュボード Slack OAuth アプリの Client ID / Client Secret |
 
 すべてのシークレットは `catch-expander/` プレフィックスで統一する。IAMポリシーでこのプレフィックスに限定したアクセス制御が可能。
 

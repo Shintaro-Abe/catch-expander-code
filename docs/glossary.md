@@ -97,6 +97,13 @@
 | 完了通知 | Completion Notification | ワークフロー完了時にSlackへ送信するサマリーとリンク | `completion_notification` |
 | 進捗通知 | Progress Notification | ワークフロー実行中にSlackへ送信するステップ完了報告 | `progress_notification` |
 | 履歴コマンド | History Command | Slack で `履歴` または `history [keyword]` 投稿で過去の完了成果物を一覧表示する F9 機能（`src/trigger/app.py`） | `_handle_history_command` |
+| イベントテーブル | Events Table | 観測イベントログを格納する DynamoDB テーブル（`{prefix}-events`）。PK: `execution_id`、SK: タイムスタンプ+種別。TTL 90 日。ダッシュボード API のデータソース | `events` |
+| Lambda オーソライザー | Lambda Authorizer | API Gateway HTTP API の全エンドポイントを保護する Lambda 関数。リクエストに付与された JWT cookie を検証し、認証済みリクエストのみ通過させる（`src/dashboard_api/authorizer/`） | `authorizer` |
+| 実行ID | execution_id | ワークフロー実行インスタンスを一意に識別する文字列（例: `exec-20260404-001`）。DynamoDB 全テーブルの PK として使用される | `execution_id` |
+| フィードバック受信イベント | feedback_received | ユーザーが完了通知スレッドにフィードバックを投稿したことを記録するイベント種別。`{prefix}-events` テーブルに記録され、`get_feedback_aggregation` Lambda がダッシュボード表示用に集計する | `feedback_received` |
+| SPA | SPA（Single Page Application） | 初回ロード時に HTML / JS / CSS をまとめて取得し、以降はページ遷移なしで動作するウェブアプリケーション方式。本プロジェクトのダッシュボードは React + Vite 構成の SPA として S3 / CloudFront で配信される | - |
+| JWT | JWT（JSON Web Token） | ユーザー認証情報を JSON 形式で署名したトークン。Slack OAuth 認証成功後に `auth_callback` Lambda が発行し、HttpOnly cookie としてブラウザに保存される。Lambda Authorizer が API リクエストごとに検証する | `jwt` |
+| Slack OAuth | Slack OAuth | Slack のユーザー認証フロー（OAuth 2.0）。ダッシュボードはユーザーを Slack の認可エンドポイントへリダイレクトし、コールバックで得たコードでユーザー情報を取得・JWT を発行する | - |
 
 ## 4. ステータス
 

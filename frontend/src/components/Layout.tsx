@@ -1,13 +1,14 @@
 import { useState } from "react"
 import { NavLink, Outlet } from "react-router-dom"
-import { LayoutDashboard, List, Star, AlertTriangle, LogOut, User, Menu } from "lucide-react"
+import { LayoutDashboard, List, Star, AlertTriangle, MessageSquare, LogOut, User, Menu } from "lucide-react"
 import { useAuth } from "@/contexts/AuthContext"
 
 const NAV = [
-  { to: "/dashboard",      icon: LayoutDashboard, label: "ダッシュボード" },
-  { to: "/executions",     icon: List,             label: "実行一覧"       },
-  { to: "/review-quality", icon: Star,             label: "レビュー品質"   },
-  { to: "/errors",         icon: AlertTriangle,    label: "エラー"         },
+  { to: "/dashboard",      icon: LayoutDashboard, label: "ダッシュボード"    },
+  { to: "/executions",     icon: List,             label: "実行一覧"          },
+  { to: "/review-quality", icon: Star,             label: "レビュー品質"      },
+  { to: "/errors",         icon: AlertTriangle,    label: "エラー"            },
+  { to: "/feedback",       icon: MessageSquare,    label: "フィードバック分析" },
 ]
 
 export function Layout() {

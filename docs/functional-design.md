@@ -999,12 +999,70 @@ src/agent/feedback/
 | 実行詳細 | `/executions/:executionId` | 実行ステップ・イベントログ・成果物リンク |
 | レビュー品質 | `/review-quality` | レビュアーエージェントの合否・品質スコア推移 |
 | エラー一覧 | `/errors` | 実行エラーの一覧・原因分類 |
+| フィードバック分析 | `/feedback` | フィードバック受信数・preferences 更新状況 |
 
 ### 認証フロー
 
 ```
 ブラウザ → /api/v1/auth/login → Slack OAuth → /api/v1/auth/callback → JWT cookie 発行
 ブラウザ → /api/v1/auth/me（5分ごとにポーリング、AuthProvider）
+```
+
+### API エンドポイント一覧
+
+| グループ | エンドポイント | 説明 |
+|---------|--------------|------|
+| 認証 | `GET /api/v1/auth/login` | Slack OAuth 認可 URL へリダイレクト |
+| 認証 | `GET /api/v1/auth/callback` | Slack OAuth コールバック処理・JWT cookie 発行 |
+| 認証 | `POST /api/v1/auth/logout` | JWT cookie 削除 |
+| 認証 | `GET /api/v1/auth/me` | 現在のセッション情報取得 |
+| 実行 | `GET /api/v1/executions` | 実行一覧（`from`/`to`/`status`/`topic`/`limit` クエリパラメータ対応） |
+| 実行 | `GET /api/v1/executions/{id}` | 実行詳細 + 成果物リンク |
+| 実行 | `GET /api/v1/executions/{id}/events` | イベントタイムライン（ページネーション対応） |
+| メトリクス | `GET /api/v1/metrics/summary?period=` | 実行件数・ステータス分布・平均実行時間・レビュー合格率 |
+| メトリクス | `GET /api/v1/metrics/cost?period=` | トークン使用量・コスト集計 |
+| メトリクス | `GET /api/v1/metrics/api-health?period=` | 外部 API 呼び出し成功率・レイテンシ |
+| メトリクス | `GET /api/v1/metrics/token-monitor?period=` | OAuth トークン更新状況 |
+| メトリクス | `GET /api/v1/metrics/review-quality?days=` | レビュー合否・未修正コード指摘一覧 |
+| メトリクス | `GET /api/v1/metrics/feedback?period=` | フィードバック受信数・preferences 更新状況 |
+| エラー | `GET /api/v1/errors?days=` | エラーイベント一覧・タイプ別集計 |
+
+### データフロー
+
+```mermaid
+sequenceDiagram
+    actor A as 管理者（ブラウザ）
+    participant CF as CloudFront
+    participant S3 as S3（SPA）
+    participant APIGW as API Gateway<br/>HTTP API
+    participant Auth as Lambda Authorizer
+    participant DL as ダッシュボード Lambda
+    participant DB as DynamoDB
+
+    A->>CF: GET /（SPA）
+    CF->>S3: 静的ファイル取得
+    S3-->>CF: index.html / JS / CSS
+    CF-->>A: SPA 配信
+
+    A->>CF: GET /api/v1/auth/login
+    CF->>APIGW: プロキシ
+    APIGW->>DL: auth_login
+    DL-->>A: Slack OAuth URL へリダイレクト
+
+    Note over A: Slack OAuth 認証
+    A->>CF: GET /api/v1/auth/callback?code=...
+    CF->>APIGW: プロキシ
+    APIGW->>DL: auth_callback
+    DL-->>A: JWT cookie 発行 + /dashboard へリダイレクト
+
+    A->>CF: GET /api/v1/executions（Cookie 付き）
+    CF->>APIGW: プロキシ
+    APIGW->>Auth: JWT 検証
+    Auth-->>APIGW: 認証 OK
+    APIGW->>DL: list_executions
+    DL->>DB: workflow-executions クエリ
+    DB-->>DL: 実行レコード
+    DL-->>A: JSON レスポンス
 ```
 
 ### API プロキシ

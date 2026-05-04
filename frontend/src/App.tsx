@@ -5,6 +5,7 @@ import { ExecutionList } from "@/routes/ExecutionList"
 import { ExecutionDetail } from "@/routes/ExecutionDetail"
 import { ReviewQuality } from "@/routes/ReviewQuality"
 import { ErrorList } from "@/routes/ErrorList"
+import { FeedbackAnalysis } from "@/routes/FeedbackAnalysis"
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="executions/:executionId" element={<ExecutionDetail />} />
         <Route path="review-quality" element={<ReviewQuality />} />
         <Route path="errors" element={<ErrorList />} />
+        <Route path="feedback" element={<FeedbackAnalysis />} />
       </Route>
     </Routes>
   )

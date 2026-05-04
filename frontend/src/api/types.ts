@@ -132,3 +132,15 @@ export interface AuthMeResponse {
 }
 
 export type Period = "24h" | "7d" | "30d"
+
+export interface FeedbackAggregation {
+  period: string
+  total_feedback_count: number
+  preferences_updated_count: number
+  avg_new_preferences: number | null
+  latest_total_preferences: number | null
+}
+
+export interface FeedbackAggregationResponse {
+  data: FeedbackAggregation
+}
