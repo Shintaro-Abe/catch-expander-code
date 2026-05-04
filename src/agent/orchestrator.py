@@ -683,6 +683,7 @@ def call_codex(
         "codex", "exec",
         "--model", model,
         "--ephemeral",
+        "--skip-git-repo-check",
         "-c", 'sandbox_mode="danger-full-access"',
         "-o", output_file,
         "-",
