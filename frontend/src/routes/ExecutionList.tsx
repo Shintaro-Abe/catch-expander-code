@@ -21,10 +21,10 @@ import { periodToRange, durationMs, fmtDuration, fmtRelative, fmtDatetime } from
 const PAGE_SIZE = 20
 
 const STATUS_TABS = [
-  { value: "",        label: "すべて"   },
-  { value: "success", label: "成功"     },
-  { value: "failed",  label: "失敗"     },
-  { value: "running", label: "実行中"   },
+  { value: "",                                label: "すべて" },
+  { value: "completed",                       label: "成功"   },
+  { value: "failed",                          label: "失敗"   },
+  { value: "received,planning,in_progress",   label: "実行中" },
 ]
 
 /* ── component ─────────────────────────────────────────────────────────── */
