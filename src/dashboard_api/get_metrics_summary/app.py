@@ -1,31 +1,15 @@
 import logging
 import os
-from datetime import UTC, datetime, timedelta
 
 import boto3
 from boto3.dynamodb.conditions import Key
 
-from _common import error_response, json_response
+from _common import PERIOD_MAP, error_response, json_response, ts_range
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 _dynamodb = boto3.resource("dynamodb")
-
-_PERIOD_MAP = {
-    "24h": timedelta(hours=24),
-    "7d": timedelta(days=7),
-    "30d": timedelta(days=30),
-}
-
-
-def _ts_range(period: str) -> tuple[str, str]:
-    delta = _PERIOD_MAP.get(period, _PERIOD_MAP["7d"])
-    now = datetime.now(UTC)
-    from_ts = (now - delta).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    to_ts = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    return from_ts, to_ts
-
 
 def _query_all(table, index: str, pk_name: str, pk_val: str, from_ts: str, to_ts: str) -> list:
     kwargs: dict = {
@@ -45,10 +29,10 @@ def _query_all(table, index: str, pk_name: str, pk_val: str, from_ts: str, to_ts
 def lambda_handler(event: dict, context: object) -> dict:
     request_id = getattr(context, "aws_request_id", "")
     period = (event.get("queryStringParameters") or {}).get("period", "7d")
-    if period not in _PERIOD_MAP:
-        return error_response(400, "INVALID_PARAM", f"period must be one of {list(_PERIOD_MAP)}", request_id)
+    if period not in PERIOD_MAP:
+        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
 
-    from_ts, to_ts = _ts_range(period)
+    from_ts, to_ts = ts_range(period)
     table = _dynamodb.Table(os.environ["EVENTS_TABLE"])
 
     try:

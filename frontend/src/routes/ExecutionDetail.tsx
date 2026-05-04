@@ -13,6 +13,7 @@ import type { DashboardEvent, Deliverable } from "@/api/types"
 import { StatusBadge } from "@/components/StatusBadge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
+import { fmtCost, fmtTokens } from "@/lib/format"
 import { durationMs, fmtDuration, fmtRelative, fmtDatetime } from "@/lib/time"
 
 /* ── event type config ──────────────────────────────────────────────────── */
@@ -31,18 +32,6 @@ const EVENT_CONFIG: Record<string, EventConfig> = {
 
 function getEventConfig(type: string): EventConfig {
   return EVENT_CONFIG[type] ?? { icon: Circle, label: type, color: "text-muted-foreground" }
-}
-
-/* ── token helpers ──────────────────────────────────────────────────────── */
-
-function fmtTokens(n: unknown): string {
-  if (n == null || typeof n !== "number") return "—"
-  return n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(n)
-}
-
-function fmtCost(usd: unknown): string {
-  if (usd == null || typeof usd !== "number") return "—"
-  return `$${usd.toFixed(4)}`
 }
 
 function TokenChip({ label, value, highlight = false }: { label: string; value: string; highlight?: boolean }) {
@@ -65,9 +54,9 @@ function EventTokenSummary({ payload, eventType }: { payload: Record<string, unk
     return (
       <div className="flex items-center gap-1 flex-wrap mt-0.5">
         <Cpu size={10} className="text-muted-foreground shrink-0" />
-        {input != null && <TokenChip label="in" value={fmtTokens(input)} />}
-        {output != null && <TokenChip label="out" value={fmtTokens(output)} />}
-        {total != null && <TokenChip label="total" value={fmtTokens(total)} highlight />}
+        {input != null && <TokenChip label="in" value={fmtTokens(typeof input === "number" ? input : null)} />}
+        {output != null && <TokenChip label="out" value={fmtTokens(typeof output === "number" ? output : null)} />}
+        {total != null && <TokenChip label="total" value={fmtTokens(typeof total === "number" ? total : null)} highlight />}
       </div>
     )
   }
@@ -78,8 +67,8 @@ function EventTokenSummary({ payload, eventType }: { payload: Record<string, unk
     return (
       <div className="flex items-center gap-1 flex-wrap mt-0.5">
         <Cpu size={10} className="text-muted-foreground shrink-0" />
-        {tokens != null && <TokenChip label="total" value={fmtTokens(tokens)} highlight />}
-        {cost != null && <TokenChip label="cost" value={fmtCost(cost)} />}
+        {tokens != null && <TokenChip label="total" value={fmtTokens(typeof tokens === "number" ? tokens : null)} highlight />}
+        {cost != null && <TokenChip label="cost" value={fmtCost(typeof cost === "number" ? cost : null)} />}
       </div>
     )
   }

@@ -5,6 +5,7 @@ import { Search, ChevronLeft, ChevronRight } from "lucide-react"
 
 import { endpoints } from "@/api/endpoints"
 import type { Execution, Period } from "@/api/types"
+import { TokenCell } from "@/components/TokenCell"
 import { PeriodSelector } from "@/components/PeriodSelector"
 import { StatusBadge } from "@/components/StatusBadge"
 import { Card, CardContent } from "@/components/ui/card"
@@ -12,34 +13,8 @@ import { Skeleton } from "@/components/ui/skeleton"
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table"
+import { fmtCost } from "@/lib/format"
 import { periodToRange, durationMs, fmtDuration, fmtRelative, fmtDatetime } from "@/lib/time"
-
-function fmtTokens(n: number | null | undefined): string {
-  if (n == null) return "—"
-  return n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(n)
-}
-
-function fmtCost(usd: number | null | undefined): string {
-  if (usd == null) return "—"
-  return `$${usd.toFixed(4)}`
-}
-
-function TokenCell({ ex }: { ex: Execution }) {
-  const total = ex.total_tokens_used ?? null
-  const input = ex.total_input_tokens ?? null
-  const output = ex.total_output_tokens ?? null
-  if (total == null && input == null) return <span className="text-muted-foreground">—</span>
-  return (
-    <div className="text-right leading-tight">
-      <div className="tabular">{fmtTokens(total)}</div>
-      {(input != null || output != null) && (
-        <div className="text-[10px] text-muted-foreground/60 tabular">
-          in {fmtTokens(input)} / out {fmtTokens(output)}
-        </div>
-      )}
-    </div>
-  )
-}
 
 /* ── constants ─────────────────────────────────────────────────────────── */
 

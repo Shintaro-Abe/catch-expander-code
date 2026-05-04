@@ -3,9 +3,8 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import boto3
-from boto3.dynamodb.conditions import Key
 
-from _common import error_response, json_response
+from _common import error_response, json_response, query_event_type
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -29,19 +28,7 @@ def lambda_handler(event: dict, context: object) -> dict:
 
     table = _dynamodb.Table(os.environ["EVENTS_TABLE"])
     try:
-        kwargs: dict = {
-            "IndexName": "gsi_event_type_timestamp",
-            "KeyConditionExpression": (
-                Key("event_type").eq("review_completed") & Key("timestamp").between(from_ts, to_ts)
-            ),
-        }
-        items: list = []
-        while True:
-            result = table.query(**kwargs)
-            items.extend(result.get("Items", []))
-            if "LastEvaluatedKey" not in result:
-                break
-            kwargs["ExclusiveStartKey"] = result["LastEvaluatedKey"]
+        items = query_event_type(table, "review_completed", from_ts, to_ts)
     except Exception as e:
         logger.error("DDB query failed: %s", e)
         return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)

@@ -50,7 +50,7 @@ def _backfill_token_data(executions: list[dict], events_table: object) -> None:
             resp = events_table.query(
                 KeyConditionExpression=Key("execution_id").eq(eid),
                 FilterExpression=Attr("event_type").eq("execution_completed"),
-                Limit=1,
+                ScanIndexForward=False,
             )
             items = resp.get("Items", [])
             if not items:

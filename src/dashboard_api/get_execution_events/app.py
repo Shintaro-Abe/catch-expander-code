@@ -20,15 +20,21 @@ def lambda_handler(event: dict, context: object) -> dict:
 
     events_table = _dynamodb.Table(os.environ["EVENTS_TABLE"])
     try:
-        result = events_table.query(
-            KeyConditionExpression=Key("execution_id").eq(execution_id),
-            ScanIndexForward=True,  # SK 昇順 = 時系列順
-        )
+        kwargs: dict = {
+            "KeyConditionExpression": Key("execution_id").eq(execution_id),
+            "ScanIndexForward": True,  # SK 昇順 = 時系列順
+        }
+        items: list = []
+        while True:
+            result = events_table.query(**kwargs)
+            items.extend(result.get("Items", []))
+            if "LastEvaluatedKey" not in result:
+                break
+            kwargs["ExclusiveStartKey"] = result["LastEvaluatedKey"]
     except Exception as e:
         logger.error("DDB query failed: %s", e)
         return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
 
-    items = result.get("Items", [])
     return json_response(200, {
         "data": items,
         "meta": {"total": len(items)},

@@ -9,6 +9,8 @@ import { CheckCircle2, XCircle, Clock, RefreshCw } from "lucide-react"
 
 import { endpoints } from "@/api/endpoints"
 import type { Period } from "@/api/types"
+import { TokenCell } from "@/components/TokenCell"
+import { fmtCost, fmtRate } from "@/lib/format"
 import { durationMs, fmtDuration, fmtRelative } from "@/lib/time"
 import { KpiCard } from "@/components/KpiCard"
 import { PeriodSelector } from "@/components/PeriodSelector"
@@ -18,24 +20,6 @@ import { Skeleton } from "@/components/ui/skeleton"
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table"
-
-/* ── helpers ───────────────────────────────────────────────────────────── */
-
-function fmtCost(usd: number | null): string {
-  if (usd == null) return "—"
-  return `$${usd.toFixed(4)}`
-}
-
-function fmtTokens(n: number | null): string {
-  if (n == null) return "—"
-  return n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(n)
-}
-
-function fmtRate(r: number | null): string {
-  if (r == null) return "—"
-  return `${(r * 100).toFixed(1)}%`
-}
-
 
 const CHART_COLORS: Record<string, string> = {
   success: "#22c55e",
@@ -386,23 +370,6 @@ export function DashboardHome() {
 }
 
 /* ── sub-components ─────────────────────────────────────────────────────── */
-
-function TokenCell({ ex }: { ex: import("@/api/types").Execution }) {
-  const total = ex.total_tokens_used ?? null
-  const input = ex.total_input_tokens ?? null
-  const output = ex.total_output_tokens ?? null
-  if (total == null && input == null) return <span className="text-muted-foreground">—</span>
-  return (
-    <div className="text-right leading-tight">
-      <div className="tabular">{fmtTokens(total)}</div>
-      {(input != null || output != null) && (
-        <div className="text-[10px] text-muted-foreground/60 tabular">
-          in {fmtTokens(input)} / out {fmtTokens(output)}
-        </div>
-      )}
-    </div>
-  )
-}
 
 function EmptyState({ message }: { message: string }) {
   return (

@@ -63,7 +63,8 @@ graph TB
 ```
 マルチAIエージェント（ECS Container）
 ┌─────────────────────────────────────────────────────────┐
-│  Claude Code CLI + Claude Sonnet/Opus（Maxプラン）       │
+│  Claude Code CLI + Claude Sonnet（Maxプラン）            │
+│  Codex CLI + GPT-5.5（品質レビューのみ）                  │
 │                                                         │
 │  ┌───────────────────────────────────────────────┐      │
 │  │ オーケストレーターエージェント（司令塔）        │      │
@@ -90,7 +91,7 @@ graph TB
 | オーケストレーター | トピック解析、ワークフロー設計、全体制御、格納処理 | 計画立案・判断に特化 | Sonnet | - |
 | リサーチャー | Web検索による情報収集・要約・出典記録 | 調査・要約に特化 | Sonnet | 並列（ステップ数分） |
 | ジェネレーター | レポート・コード・設計書の生成・推敲 | 文書/コード生成に特化 | Sonnet | 直列 |
-| レビュアー | ソース検証・チェックリスト評価・品質メタデータ付与 | 品質検証・ファクトチェックに特化 | **Opus** | 直列 |
+| レビュアー | ソース検証・チェックリスト評価・品質メタデータ付与 | 品質検証・ファクトチェックに特化 | **GPT-5.5 (Codex CLI)** | 直列 |
 
 #### マルチエージェントの利点
 
@@ -112,7 +113,8 @@ graph TB
 | レビュアーエージェント | ソース検証・セルフレビュー・品質メタデータ付与 | ECS Container（Claude Code Agentツール） |
 | フィードバックプロセッサー | フィードバック解析・preferences 抽出・プロファイル更新（TASK_TYPE=feedback） | ECS Container（Claude Code CLI） |
 | プロファイルDB | ユーザープロファイルの永続化（learned_preferences 含む） | DynamoDB |
-| Claude Sonnet 4.6 / Opus 4.6 | 全エージェントの推論エンジン（Sonnet: 通常ステップ、Opus: 品質レビューのみ） | Maxプラン（Claude Code CLI経由） |
+| Claude Sonnet 4.6 | 全エージェントの推論エンジン（通常ステップ） | Maxプラン（Claude Code CLI経由） |
+| GPT-5.5（Codex CLI） | レビュアーエージェントの推論エンジン（品質レビューのみ） | ChatGPT OAuth（Codex CLI経由） |
 | Web検索 | インターネット情報の検索 | Claude Code組み込み（WebSearch/WebFetch） |
 | Notion API | 成果物ページの作成・更新 | 外部API |
 | GitHub API | コード成果物のpush | 外部API |
@@ -149,6 +151,10 @@ erDiagram
         json workflow_plan "ワークフロー計画"
         datetime created_at
         datetime completed_at
+        int total_tokens_used "累計トークン数（入力+出力+キャッシュ）"
+        int total_input_tokens "累計入力トークン数"
+        int total_output_tokens "累計出力トークン数"
+        decimal total_cost_usd "累計コスト（USD）"
     }
 
     WORKFLOW_STEP {
@@ -273,7 +279,7 @@ sequenceDiagram
     O->>S: 生成完了通知
 
     O->>RV: レビュー依頼（成果物 + 出典 + チェックリスト）
-    Note over RV: [Opus] ソース検証 + チェックリスト評価
+    Note over RV: [GPT-5.5 Codex] ソース検証 + チェックリスト評価
     RV-->>O: レビュー結果
 
     alt 不合格の場合
@@ -281,7 +287,7 @@ sequenceDiagram
         Note over G: [Sonnet] 修正
         G-->>O: 修正済み成果物
         O->>RV: 再レビュー依頼
-        Note over RV: [Opus] 再評価
+        Note over RV: [GPT-5.5 Codex] 再評価
         RV-->>O: レビュー結果
     end
 
@@ -342,7 +348,7 @@ orchestrator.py（Pythonプロセス）
   │      → Claude が Write ツールで sandbox にファイル書き出し
   │      → os.walk で収集 + ホワイトリスト + 安全性チェック
   │
-  ├── subprocess call_claude(レビュアープロンプト + 成果物, model="opus")
+  ├── call_codex(レビュアープロンプト + 成果物)  ← GPT-5.5（Codex CLI）
   │
   └── (不合格なら修正→再レビュー、最大2回)
 ```
@@ -485,11 +491,11 @@ finally:
   ↓
 [第1層: ソース検証]
 1. 出典URLにHTTPリクエストを送信し、実在を確認
-2. [Opus] 取得したページ内容と成果物の記述を照合
+2. [GPT-5.5 Codex] 取得したページ内容と成果物の記述を照合
 3. 未検証の事実主張を検出しマーク付与
   ↓
 [第2層: チェックリスト評価]
-4. [Opus] カテゴリ別チェックリストで各項目を評価
+4. [GPT-5.5 Codex] カテゴリ別チェックリストで各項目を評価
 5. 不合格項目に対して具体的な修正指示を生成
   ↓
 [第3層: 品質メタデータ生成]
@@ -498,7 +504,7 @@ finally:
   ↓
 出力: オーケストレーターへ返却
   （合否判定 + 修正指示 + 品質メタデータ）
-  ※ レビュアーのみ Claude Opus を使用（最高品質の独立検証のため）
+  ※ レビュアーのみ GPT-5.5（Codex CLI）を使用（Claude とは異なる独立した基盤モデルで品質検証するため）
 ```
 
 #### レビューループ
@@ -634,30 +640,36 @@ catch-expander-code/              # コード成果物専用リポジトリ（Pr
 - Fine-grained PATで `contents: write` 権限のみ付与
 - ブランチ: `main` に直接push（成果物リポジトリのためPR不要）
 
-### 4.4 Claudeモデル連携（Maxプラン + Claude Code CLI）
+### 4.4 エージェントモデル連携
 
 #### モデルとプラン
 
 | 項目 | 内容 |
 |------|------|
-| モデル（通常ステップ） | Claude Sonnet 4.6 |
-| モデル（品質レビュー） | Claude Opus 4.6 |
-| プラン | Maxプラン（月額固定） |
-| アクセス方式 | Claude Code CLI（Anthropic公式アプリケーション） |
-| 認証 | MaxプランOAuth（Claude Codeの想定された利用方法） |
-| 選定理由 | レビュアーは独立した高品質判断が必須なためOpusを使用。それ以外はSonnetで速度とコストを最適化。Maxプランで固定コスト化。 |
+| 通常ステップモデル | Claude Sonnet 4.6 |
+| 品質レビューモデル | GPT-5.5（Codex CLI経由） |
+| Claudeプラン | Maxプラン（月額固定） |
+| Claude アクセス方式 | Claude Code CLI（Anthropic公式アプリケーション） |
+| Claude 認証 | MaxプランOAuth（Claude Codeの想定された利用方法） |
+| Codex アクセス方式 | Codex CLI（OpenAI公式CLIツール） |
+| Codex 認証 | ChatGPT OAuth（`auth_mode: chatgpt`、`~/.codex/auth.json`） |
+| 選定理由 | レビュアーは Claude とは異なる独立した基盤モデルで検証することで生成時バイアスを排除。通常ステップは Claude Sonnet で速度とコストを最適化。 |
 
-#### Claude Code CLIの実行方法
+#### Claude Code CLIの実行方法（通常ステップ）
 
 ```bash
 # 通常ステップ（Sonnet）
 claude -p "プロンプト" --model sonnet --output-format json
 
-# 品質レビュー（Opus）
-claude -p "プロンプト" --model opus --output-format json
-
 # ツール制限（必要に応じて）
 claude -p "プロンプト" --model sonnet --allowedTools "WebSearch,WebFetch,Read,Write,Bash"
+```
+
+#### Codex CLIの実行方法（品質レビュー）
+
+```bash
+# 品質レビュー（GPT-5.5）
+codex exec --model gpt-5.5 "プロンプト"
 ```
 
 #### 呼び出し一覧（エージェント別）
@@ -669,9 +681,9 @@ claude -p "プロンプト" --model sonnet --allowedTools "WebSearch,WebFetch,Re
 | リサーチャー（×N） | 3 | 調査要約 | Sonnet | 検索結果テキスト | 要約テキスト + 出典リスト |
 | ジェネレーター | 4 | テキスト成果物生成（下書き→推敲） | Sonnet | 調査結果 + 計画 + プロファイル | `content_blocks` + `summary` |
 | ジェネレーター | 4b | コード成果物独立生成（成果物タイプごと） | Sonnet | 調査結果 + `code_type`（iac_code / program_code 各1回） | sandbox cwd へ Write ツール経由でファイル直接書き出し（Python 側で os.walk 収集 → `code_files = {"files": {...}, "readme_content": "..."}` を構築） |
-| レビュアー | 5 | ソース検証 + チェックリスト評価 | **Opus** | 成果物 + 出典 + チェックリスト | JSON（合否判定、修正指示） |
+| レビュアー | 5 | ソース検証 + チェックリスト評価 | **GPT-5.5 (Codex)** | 成果物 + 出典 + チェックリスト | JSON（合否判定、修正指示） |
 | ジェネレーター | 6 | 修正（0〜2回） | Sonnet | 成果物 + 修正指示 | 修正済み成果物 |
-| レビュアー | 7 | 再レビュー（0〜2回） | **Opus** | 修正済み成果物 + チェックリスト | JSON（合否判定） |
+| レビュアー | 7 | 再レビュー（0〜2回） | **GPT-5.5 (Codex)** | 修正済み成果物 + チェックリスト | JSON（合否判定） |
 
 #### 1回のトピック処理あたりの呼び出し数
 
@@ -680,7 +692,7 @@ claude -p "プロンプト" --model sonnet --allowedTools "WebSearch,WebFetch,Re
   オーケストレーター: 2（解析 + WF設計）      Sonnet
   リサーチャー×N:    N（並列実行だが呼び出し数は同じ） Sonnet
   ジェネレーター:    1（生成）                 Sonnet
-  レビュアー:       1（レビュー）              Opus
+  レビュアー:       1（レビュー）              GPT-5.5 (Codex)
   合計: N + 4
 
 標準（技術トピック・コード生成あり: iac_code のみ・レビュー合格）:
@@ -695,7 +707,7 @@ claude -p "プロンプト" --model sonnet --allowedTools "WebSearch,WebFetch,Re
   オーケストレーター: 2                        Sonnet
   リサーチャー×N:    N                         Sonnet
   ジェネレーター:    1 + 2 + 2（生成 + コード×2タイプ + 修正2回） Sonnet
-  レビュアー:       1 + 2（レビュー + 再レビュー2回）    Opus
+  レビュアー:       1 + 2（レビュー + 再レビュー2回）    GPT-5.5 (Codex)
   合計: N + 10
   ※ N = 調査ステップ数（通常3〜5）
 ```
@@ -950,7 +962,7 @@ src/agent/feedback/
 | エラー | 発生箇所 | 対応 |
 |--------|---------|------|
 | Slack署名検証失敗 | API Gateway | 403を返す。ログ記録 |
-| Opus呼び出し失敗 | Claude Code CLI | 最大3回リトライ。全失敗時はエラー通知 |
+| GPT-5.5 (Codex) 呼び出し失敗 | Codex CLI | 最大3回リトライ。全失敗時はエラー通知 |
 | Maxプラン利用上限到達 | Claude Code CLI | エラー通知＋次回利用可能時間を案内 |
 | Web検索失敗 | リサーチャー（WebSearch/WebFetch） | 該当ステップをスキップし、他のステップの結果で継続 |
 | Notion API失敗 | 格納処理 | 最大3回リトライ。全失敗時はSlackにエラー通知＋成果物テキストをSlackに直接投稿 |
@@ -1000,3 +1012,41 @@ src/agent/feedback/
 | パス | 実体 |
 |------|------|
 | `/api/v1/*` | CloudFront → API Gateway HTTP API → ダッシュボード Lambda 群 |
+
+### Lambda 関数一覧
+
+| 関数名 | パス | 概要 |
+|--------|------|------|
+| `list_executions` | `GET /api/v1/executions` | 実行一覧（`from`/`to`/`status`/`topic`/`limit`、トークンデータを `execution_completed` イベントから補完） |
+| `get_execution` | `GET /api/v1/executions/{id}` | 単一実行詳細 + 成果物 |
+| `get_execution_events` | `GET /api/v1/executions/{id}/events` | イベントタイムライン（PK クエリ、ページネーション対応） |
+| `get_metrics_summary` | `GET /api/v1/metrics/summary?period=` | 実行件数・ステータス分布・平均実行時間・レビュー合格率 |
+| `get_cost_summary` | `GET /api/v1/metrics/cost?period=` | トークン使用量・コスト集計 |
+| `get_api_health` | `GET /api/v1/metrics/api-health?period=` | 外部 API 呼び出し成功率・レイテンシ |
+| `get_token_monitor_health` | `GET /api/v1/metrics/token-monitor?period=` | OAuth トークン更新状況 |
+| `get_review_quality` | `GET /api/v1/metrics/review-quality?days=` | レビュー合否・未修正コード指摘一覧 |
+| `get_errors` | `GET /api/v1/errors?days=` | エラーイベント一覧・タイプ別集計 |
+| `get_feedback_aggregation` | `GET /api/v1/metrics/feedback?period=` | フィードバック受信数・preferences 更新状況 |
+
+### 共通ユーティリティ（`src/dashboard_api/_common.py`）
+
+| ユーティリティ | 用途 |
+|----------------|------|
+| `json_response(status, body)` | `Content-Type: application/json` レスポンス生成（`Decimal` → int/float 変換付き） |
+| `error_response(status, code, message, request_id)` | エラーレスポンス生成 |
+| `PERIOD_MAP` | `{"24h": timedelta(hours=24), "7d": ..., "30d": ...}` |
+| `ts_range(period)` | period → `(from_ts, to_ts)` ISO 8601 ミリ秒精度 UTC |
+| `query_event_type(table, event_type, from_ts, to_ts)` | `gsi_event_type_timestamp` を使ったページネーション付きクエリ |
+
+### per-execution トークン追跡
+
+各実行完了時、orchestrator の `run()` finally ブロックで `update_execution_tokens()` が `workflow-executions` テーブルに以下を書き込む：
+
+| フィールド | 内容 |
+|-----------|------|
+| `total_tokens_used` | 入力 + 出力 + cache_creation + cache_read の合計 |
+| `total_input_tokens` | 入力トークン数（キャッシュ除く） |
+| `total_output_tokens` | 出力トークン数 |
+| `total_cost_usd` | 累計コスト（Decimal） |
+
+`list_executions` は execution レコードにトークンデータがない場合（b09f011 以前の旧実行）、`execution_completed` イベントの payload からフォールバック補完する（`_backfill_token_data`）。

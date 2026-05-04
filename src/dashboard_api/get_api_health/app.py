@@ -1,11 +1,9 @@
 import logging
 import os
-from datetime import UTC, datetime, timedelta
 
 import boto3
-from boto3.dynamodb.conditions import Key
 
-from _common import error_response, json_response
+from _common import PERIOD_MAP, error_response, json_response, query_event_type, ts_range
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -20,50 +18,18 @@ _RATE_LIMIT_SUBTYPE_TO_SERVICE = {
     "slack_rate_limit": "slack",
 }
 
-_PERIOD_MAP = {
-    "24h": timedelta(hours=24),
-    "7d": timedelta(days=7),
-    "30d": timedelta(days=30),
-}
-
-
-def _ts_range(period: str) -> tuple[str, str]:
-    delta = _PERIOD_MAP[period]
-    now = datetime.now(UTC)
-    from_ts = (now - delta).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    to_ts = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    return from_ts, to_ts
-
-
-def _query_event_type(table, event_type: str, from_ts: str, to_ts: str) -> list:
-    kwargs: dict = {
-        "IndexName": "gsi_event_type_timestamp",
-        "KeyConditionExpression": (
-            Key("event_type").eq(event_type) & Key("timestamp").between(from_ts, to_ts)
-        ),
-    }
-    items: list = []
-    while True:
-        result = table.query(**kwargs)
-        items.extend(result.get("Items", []))
-        if "LastEvaluatedKey" not in result:
-            break
-        kwargs["ExclusiveStartKey"] = result["LastEvaluatedKey"]
-    return items
-
-
 def lambda_handler(event: dict, context: object) -> dict:
     request_id = getattr(context, "aws_request_id", "")
     period = (event.get("queryStringParameters") or {}).get("period", "7d")
-    if period not in _PERIOD_MAP:
-        return error_response(400, "INVALID_PARAM", f"period must be one of {list(_PERIOD_MAP)}", request_id)
+    if period not in PERIOD_MAP:
+        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
 
-    from_ts, to_ts = _ts_range(period)
+    from_ts, to_ts = ts_range(period)
     table = _dynamodb.Table(os.environ["EVENTS_TABLE"])
 
     try:
-        api_calls = _query_event_type(table, "api_call_completed", from_ts, to_ts)
-        rate_limits = _query_event_type(table, "rate_limit_hit", from_ts, to_ts)
+        api_calls = query_event_type(table, "api_call_completed", from_ts, to_ts)
+        rate_limits = query_event_type(table, "rate_limit_hit", from_ts, to_ts)
     except Exception as e:
         logger.error("DDB query failed: %s", e)
         return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
