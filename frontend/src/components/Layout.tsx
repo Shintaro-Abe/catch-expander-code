@@ -85,78 +85,72 @@ export function Layout() {
 
       {/* Sidebar (md and above) */}
       <aside
-        className={`hidden md:flex shrink-0 flex-col border-r border-sidebar-border bg-sidebar transition-[width] duration-200 ${
-          collapsed ? "w-12" : "w-[220px]"
+        className={`hidden md:flex shrink-0 flex-col border-r border-sidebar-border bg-sidebar overflow-hidden transition-[width] duration-200 ${
+          collapsed ? "w-0 border-r-0" : "w-[220px]"
         }`}
       >
-        {/* Header row */}
-        <div
-          className={`flex items-center border-b border-sidebar-border ${
-            collapsed ? "justify-center px-2 py-4" : "justify-between px-4 py-4"
-          }`}
-        >
-          {!collapsed && (
-            <span className="text-sm font-semibold text-sidebar-foreground leading-tight">
-              Catch-Expander
-              <span className="block text-[11px] font-normal text-muted-foreground">監視ダッシュボード</span>
-            </span>
-          )}
+        <div className="flex items-center justify-between px-4 py-4 border-b border-sidebar-border">
+          <span className="text-sm font-semibold text-sidebar-foreground leading-tight whitespace-nowrap">
+            Catch-Expander
+            <span className="block text-[11px] font-normal text-muted-foreground">監視ダッシュボード</span>
+          </span>
           <button
             type="button"
             onClick={toggleCollapsed}
-            className="text-muted-foreground hover:text-sidebar-foreground transition-colors"
-            aria-label={collapsed ? "サイドバーを開く" : "サイドバーを閉じる"}
+            className="ml-2 shrink-0 text-muted-foreground hover:text-sidebar-foreground transition-colors"
+            aria-label="サイドバーを閉じる"
           >
-            {collapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
+            <ChevronLeft size={15} />
           </button>
         </div>
-
-        {/* Nav links */}
         <nav className="flex-1 p-2 space-y-0.5">
           {NAV.map(({ to, icon: Icon, label }) => (
             <NavLink
               key={to}
               to={to}
-              title={collapsed ? label : undefined}
-              className={({ isActive }) => {
-                const layout = collapsed
-                  ? "flex items-center justify-center px-2 py-2 rounded-md text-sm transition-colors"
-                  : "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors"
-                const color = isActive
-                  ? "bg-sidebar-accent text-primary font-medium"
-                  : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
-                return `${layout} ${color}`
-              }}
+              className={({ isActive }) =>
+                `flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors ${
+                  isActive
+                    ? "bg-sidebar-accent text-primary font-medium"
+                    : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
+                }`
+              }
             >
               <Icon size={15} className="shrink-0" />
-              {!collapsed && label}
+              {label}
             </NavLink>
           ))}
         </nav>
-
-        {/* Footer: user + logout */}
-        <div className={`border-t border-sidebar-border space-y-2 ${collapsed ? "p-2" : "p-4"}`}>
-          {!collapsed && (
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <User size={12} className="shrink-0" />
-              <span className="truncate">{user_name}</span>
-            </div>
-          )}
+        <div className="p-4 border-t border-sidebar-border space-y-2">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <User size={12} className="shrink-0" />
+            <span className="truncate">{user_name}</span>
+          </div>
           <a
             href="/api/v1/auth/logout"
-            title={collapsed ? "ログアウト" : undefined}
-            className={`flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors ${
-              collapsed ? "justify-center" : ""
-            }`}
+            className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
           >
             <LogOut size={12} className="shrink-0" />
-            {!collapsed && "ログアウト"}
+            ログアウト
           </a>
         </div>
       </aside>
 
       {/* Main content */}
       <main id="main-content" className="flex-1 min-w-0 overflow-auto pt-[52px] md:pt-0">
+        {collapsed && (
+          <div className="hidden md:block px-3 pt-3">
+            <button
+              type="button"
+              onClick={toggleCollapsed}
+              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              aria-label="サイドバーを開く"
+            >
+              <ChevronRight size={14} />
+              メニュー
+            </button>
+          </div>
+        )}
         <div className="max-w-[1280px] mx-auto px-6 py-6">
           <Outlet />
         </div>
