@@ -782,13 +782,18 @@ Resources:
       CodeUri: src/dashboard_api/
       MemorySize: 128
       Timeout: 5
+      Environment:
+        Variables:
+          FRONTEND_DOMAIN: !Ref FrontendDomain
       Events:
         AuthLogout:
           Type: HttpApi
           Properties:
             ApiId: !Ref DashboardApi
             Path: /api/v1/auth/logout
-            Method: POST
+            Method: GET
+            Auth:
+              Authorizer: NONE
 
   DashboardAuthMeFunction:
     Type: AWS::Serverless::Function

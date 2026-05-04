@@ -1,6 +1,9 @@
 import { useState } from "react"
 import { NavLink, Outlet } from "react-router-dom"
-import { LayoutDashboard, List, Star, AlertTriangle, MessageSquare, LogOut, User, Menu } from "lucide-react"
+import {
+  LayoutDashboard, List, Star, AlertTriangle, MessageSquare,
+  LogOut, User, Menu, ChevronLeft, ChevronRight,
+} from "lucide-react"
 import { useAuth } from "@/contexts/AuthContext"
 
 const NAV = [
@@ -14,6 +17,17 @@ const NAV = [
 export function Layout() {
   const { user_name } = useAuth()
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [collapsed, setCollapsed] = useState(() =>
+    localStorage.getItem("sidebar-collapsed") === "true"
+  )
+
+  function toggleCollapsed() {
+    setCollapsed((v) => {
+      const next = !v
+      localStorage.setItem("sidebar-collapsed", String(next))
+      return next
+    })
+  }
 
   return (
     <div className="flex min-h-screen bg-background">
@@ -56,47 +70,87 @@ export function Layout() {
                 {label}
               </NavLink>
             ))}
+            <div className="pt-1 mt-1 border-t border-sidebar-border">
+              <a
+                href="/api/v1/auth/logout"
+                className="flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
+              >
+                <LogOut size={15} className="shrink-0" />
+                ログアウト
+              </a>
+            </div>
           </nav>
         )}
       </div>
 
       {/* Sidebar (md and above) */}
-      <aside className="hidden md:flex w-[220px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar">
-        <div className="px-4 py-4 border-b border-sidebar-border">
-          <span className="text-sm font-semibold text-sidebar-foreground leading-tight">
-            Catch-Expander
-            <span className="block text-[11px] font-normal text-muted-foreground">監視ダッシュボード</span>
-          </span>
+      <aside
+        className={`hidden md:flex shrink-0 flex-col border-r border-sidebar-border bg-sidebar transition-[width] duration-200 ${
+          collapsed ? "w-12" : "w-[220px]"
+        }`}
+      >
+        {/* Header row */}
+        <div
+          className={`flex items-center border-b border-sidebar-border ${
+            collapsed ? "justify-center px-2 py-4" : "justify-between px-4 py-4"
+          }`}
+        >
+          {!collapsed && (
+            <span className="text-sm font-semibold text-sidebar-foreground leading-tight">
+              Catch-Expander
+              <span className="block text-[11px] font-normal text-muted-foreground">監視ダッシュボード</span>
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            className="text-muted-foreground hover:text-sidebar-foreground transition-colors"
+            aria-label={collapsed ? "サイドバーを開く" : "サイドバーを閉じる"}
+          >
+            {collapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
+          </button>
         </div>
+
+        {/* Nav links */}
         <nav className="flex-1 p-2 space-y-0.5">
           {NAV.map(({ to, icon: Icon, label }) => (
             <NavLink
               key={to}
               to={to}
-              className={({ isActive }) =>
-                `flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors ${
-                  isActive
-                    ? "bg-sidebar-accent text-primary font-medium"
-                    : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
-                }`
-              }
+              title={collapsed ? label : undefined}
+              className={({ isActive }) => {
+                const layout = collapsed
+                  ? "flex items-center justify-center px-2 py-2 rounded-md text-sm transition-colors"
+                  : "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors"
+                const color = isActive
+                  ? "bg-sidebar-accent text-primary font-medium"
+                  : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
+                return `${layout} ${color}`
+              }}
             >
               <Icon size={15} className="shrink-0" />
-              {label}
+              {!collapsed && label}
             </NavLink>
           ))}
         </nav>
-        <div className="p-4 border-t border-sidebar-border space-y-2">
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <User size={12} className="shrink-0" />
-            <span className="truncate">{user_name}</span>
-          </div>
+
+        {/* Footer: user + logout */}
+        <div className={`border-t border-sidebar-border space-y-2 ${collapsed ? "p-2" : "p-4"}`}>
+          {!collapsed && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <User size={12} className="shrink-0" />
+              <span className="truncate">{user_name}</span>
+            </div>
+          )}
           <a
             href="/api/v1/auth/logout"
-            className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            title={collapsed ? "ログアウト" : undefined}
+            className={`flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors ${
+              collapsed ? "justify-center" : ""
+            }`}
           >
             <LogOut size={12} className="shrink-0" />
-            ログアウト
+            {!collapsed && "ログアウト"}
           </a>
         </div>
       </aside>
