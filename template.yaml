@@ -1106,6 +1106,26 @@ Resources:
   # Frontend Static Hosting (S3 + CloudFront + OAC)
   # ==============================================================
 
+  # CloudFront Function: SPA ルーティング用パス書き換え
+  # 拡張子なし・/api/* 以外のパスを /index.html にリライトする。
+  # これにより S3 が 403 を返す前にリクエストを書き換えられる。
+  SpaRoutingFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: catch-expander-spa-routing
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite SPA routes to index.html
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var uri = event.request.uri;
+          if (!uri.startsWith('/api/') && !uri.match(/\.[a-zA-Z0-9]+$/)) {
+            event.request.uri = '/index.html';
+          }
+          return event.request;
+        }
+
   FrontendBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -1152,6 +1172,9 @@ Resources:
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
           AllowedMethods: [GET, HEAD]
           CachedMethods: [GET, HEAD]
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRoutingFunction.FunctionARN
         CacheBehaviors:
           - PathPattern: /api/*
             TargetOriginId: ApiOrigin
