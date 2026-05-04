@@ -3,7 +3,7 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 
 from _common import error_response, json_response
 
@@ -29,6 +29,39 @@ def _now_iso() -> str:
 
 def _days_ago_iso(days: int) -> str:
     return (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+_TOKEN_FIELDS = ("total_tokens_used", "total_input_tokens", "total_output_tokens", "total_cost_usd")
+
+
+def _backfill_token_data(executions: list[dict], events_table: object) -> None:
+    """実行レコードにトークンデータがない場合、execution_completed イベントから補完する。
+
+    b09f011 以前の実行は workflow-executions テーブルにトークン情報がないため、
+    events テーブルの execution_completed ペイロードを fallback 参照する。
+    """
+    for ex in executions:
+        if any(ex.get(f) is not None for f in _TOKEN_FIELDS):
+            continue  # すでにデータあり
+        eid = ex.get("execution_id", "")
+        if not eid:
+            continue
+        try:
+            resp = events_table.query(
+                KeyConditionExpression=Key("execution_id").eq(eid),
+                FilterExpression=Attr("event_type").eq("execution_completed"),
+                Limit=1,
+            )
+            items = resp.get("Items", [])
+            if not items:
+                continue
+            payload = items[0].get("payload") or {}
+            for field in _TOKEN_FIELDS:
+                val = payload.get(field)
+                if val is not None:
+                    ex[field] = val
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to backfill token data for %s: %s", eid, e)
 
 
 def lambda_handler(event: dict, context: object) -> dict:
@@ -83,6 +116,9 @@ def lambda_handler(event: dict, context: object) -> dict:
             continue
         if "Item" in result:
             executions.append(result["Item"])
+
+    # トークンデータが実行レコードにない場合、イベントテーブルの execution_completed から補完
+    _backfill_token_data(executions, events_table)
 
     # アプリケーション側フィルタ
     if status_filter:
