@@ -18,6 +18,8 @@ samconfig.toml
 
 # Secrets / Credentials
 .env
+.env.local
+.env.*.local
 *.pem
 credentials.json
 

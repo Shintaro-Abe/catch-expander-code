@@ -98,6 +98,17 @@ from storage.notion_client import NotionClient
 |------|-----|
 | UPPER_SNAKE_CASE | `SLACK_BOT_TOKEN`, `NOTION_DATABASE_ID` |
 
+#### フロントエンド（Vite）の VITE_* ルール
+
+Vite の `VITE_` プレフィックスを付けた変数は **ビルド時に JS バンドルへ埋め込まれ、ブラウザから誰でも閲覧できる**。
+
+| 分類 | 扱い | 例 |
+|------|------|-----|
+| 公開してよい値 | `VITE_` プレフィックスを付けて OK | `VITE_API_BASE_URL` |
+| シークレット・API キー・パスワード | バックエンド（Lambda）の環境変数のみ。`VITE_` 禁止 | `SLACK_CLIENT_SECRET`, `ANTHROPIC_API_KEY` |
+
+利用可能な変数の一覧と設定方法は `frontend/.env.example` を参照。
+
 ## 3. エラーハンドリング規約
 
 ### 基本方針

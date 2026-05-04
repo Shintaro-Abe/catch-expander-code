@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import jwt
 import pytest
 
-_TEST_KEY = "test-jwt-signing-key-32-bytes-ok"
+_TEST_KEY = "test-jwt-signing-key-32-bytes-ok"  # gitleaks:allow
 _SLACK_CONFIG = {
     "client_id": "TEST_CLIENT_ID",
     "client_secret": "TEST_CLIENT_SECRET",

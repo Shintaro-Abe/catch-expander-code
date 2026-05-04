@@ -1,0 +1,2 @@
+# テストコード内のダミー JWT 署名キー（実際のシークレットではない）
+071058bba1e83c97a870f656fb3e9bd832fd2de8:tests/unit/dashboard_api/test_auth_callback.py:generic-api-key:22
