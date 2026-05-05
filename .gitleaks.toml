@@ -1,0 +1,15 @@
+title = "Catch-Expander gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  ".venv/",
+  "node_modules/",
+  ".aws-sam/",
+  "uv.lock",
+  "frontend/dist/",
+  "obsidian/",
+  "graphify-out/",
+]
