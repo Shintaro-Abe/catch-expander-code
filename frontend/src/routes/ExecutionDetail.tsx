@@ -373,13 +373,6 @@ function JsonCard({ title, value }: { title: string; value: Record<string, unkno
   )
 }
 
-const SUBAGENT_LABELS: Record<SubagentIORecord["subagent"], string> = {
-  researcher:    "リサーチャー",
-  generator:     "ジェネレーター",
-  reviewer_eval: "レビュアー（評価）",
-  reviewer_fix:  "レビュアー（修正試行）",
-}
-
 function IOExpandable({ label, content }: { label: string; content: string }) {
   const [open, setOpen] = useState(false)
   return (
