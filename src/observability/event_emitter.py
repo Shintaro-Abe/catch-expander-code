@@ -35,7 +35,7 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
-_TTL_DAYS = 90
+_TTL_DAYS = 1825  # 5年
 
 
 class EventEmitter:

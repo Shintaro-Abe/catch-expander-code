@@ -60,7 +60,7 @@ class TestEventEmitterWithTable:
         assert "#00001" in item["sk"]
 
     @patch("boto3.resource")
-    def test_ttl_is_90_days_in_future(self, mock_boto3, monkeypatch):
+    def test_ttl_is_5_years_in_future(self, mock_boto3, monkeypatch):
         monkeypatch.setenv("EVENTS_TABLE", "test-events")
         from src.observability.event_emitter import EventEmitter
 
@@ -74,8 +74,8 @@ class TestEventEmitterWithTable:
 
         item = mock_table.put_item.call_args.kwargs["Item"]
         ttl = item["ttl"]
-        # 90 日 = 90*86400 = 7,776,000 秒
-        assert before + 7_776_000 <= ttl <= after + 7_776_000
+        # 5年 = 1825*86400 = 157,680,000 秒
+        assert before + 157_680_000 <= ttl <= after + 157_680_000
 
     @patch("boto3.resource")
     def test_sequence_number_increments_monotonically(self, mock_boto3, monkeypatch):

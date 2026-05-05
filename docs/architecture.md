@@ -388,7 +388,7 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
 | 項目 | 設定 | 理由 |
 |------|------|------|
 | キャパシティモード | オンデマンド | 利用量が少なく予測が難しいため |
-| TTL | workflow-executions, workflow-steps, sources, events に90日のTTL | 古い実行ログの自動削除 |
+| TTL | workflow-executions, workflow-steps, sources, events に5年のTTL | 古い実行ログの自動削除 |
 
 ### GSI（グローバルセカンダリインデックス）
 

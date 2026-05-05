@@ -5,7 +5,7 @@ import boto3
 
 logger = logging.getLogger("catch-expander-agent")
 
-TTL_DAYS = 90
+TTL_DAYS = 1825  # 5年
 
 
 class DynamoDbClient:
