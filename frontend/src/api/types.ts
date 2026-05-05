@@ -133,12 +133,29 @@ export interface AuthMeResponse {
 
 export type Period = "24h" | "7d" | "30d"
 
+export interface FeedbackEvent {
+  execution_id: string
+  timestamp: string
+  subtype: string
+  reply_text_summary: string
+  learned_preferences_updated: boolean
+  new_preferences_count: number
+  total_preferences_count: number | null
+}
+
+export interface DailyCount {
+  date: string
+  count: number
+}
+
 export interface FeedbackAggregation {
   period: string
   total_feedback_count: number
   preferences_updated_count: number
   avg_new_preferences: number | null
   latest_total_preferences: number | null
+  daily_counts?: DailyCount[]
+  events?: FeedbackEvent[]
 }
 
 export interface FeedbackAggregationResponse {

@@ -1,6 +1,8 @@
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 # ---------------------------------------------------------------------------
 # _setup_claude_credentials
@@ -416,7 +418,6 @@ class TestNotifyTaskFailure:
         args = mock_slack.post_error.call_args
         assert args[0][0] == "C123"
         assert args[0][1] == "111.222"
-        assert "Claude OAuth" in args[0][2]
 
     def test_does_nothing_when_channel_missing(self, monkeypatch):
         monkeypatch.delenv("SLACK_CHANNEL", raising=False)
@@ -462,9 +463,10 @@ class TestNotifyTaskFailure:
         assert "exec-cf-1" in message
         assert "Claude OAuth" not in message
 
-    def test_generic_exception_sends_oauth_message(self, monkeypatch):
+    def test_generic_exception_sends_unknown_error_message(self, monkeypatch):
         monkeypatch.setenv("SLACK_CHANNEL", "C123")
         monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-gen-1")
         mock_slack = MagicMock()
 
         with patch("main.SlackClient", return_value=mock_slack):
@@ -474,8 +476,109 @@ class TestNotifyTaskFailure:
 
         mock_slack.post_error.assert_called_once()
         message = mock_slack.post_error.call_args[0][2]
-        assert "Claude OAuth" in message
+        assert "RuntimeError" in message
+        assert "exec-gen-1" in message
+        assert "Claude OAuth" not in message
         assert "Cloudflare" not in message
+
+    def test_rate_limit_error_sends_rate_limit_message(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-rl-1")
+        mock_slack = MagicMock()
+
+        exc = subprocess.CalledProcessError(1, ["claude", "-p", "-"], stderr="Error: rate limit exceeded")
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", exc)
+
+        message = mock_slack.post_error.call_args[0][2]
+        assert "レート制限" in message
+        assert "再投入" in message
+        assert "exec-rl-1" in message
+
+    def test_claude_cli_failure_sends_claude_message(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-cli-1")
+        mock_slack = MagicMock()
+
+        exc = subprocess.CalledProcessError(1, ["claude", "-p", "-"], stderr="some other error")
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", exc)
+
+        message = mock_slack.post_error.call_args[0][2]
+        assert "Claude CLI" in message
+        assert "exec-cli-1" in message
+        assert "レート制限" not in message
+
+    def test_codex_cli_failure_sends_codex_message(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-codex-1")
+        mock_slack = MagicMock()
+
+        exc = subprocess.CalledProcessError(1, ["codex", "exec", "--model", "gpt-5.5"], stderr="exit 1")
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", exc)
+
+        message = mock_slack.post_error.call_args[0][2]
+        assert "Codex CLI" in message
+        assert "exec-codex-1" in message
+
+    def test_research_failed_sends_research_message(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-research-1")
+        mock_slack = MagicMock()
+
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", RuntimeError("All research steps failed"))
+
+        message = mock_slack.post_error.call_args[0][2]
+        assert "リサーチ" in message
+        assert "exec-research-1" in message
+
+    def test_http_error_sends_api_error_message(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-http-1")
+        mock_slack = MagicMock()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        exc = requests.HTTPError(response=mock_response)
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", exc)
+
+        message = mock_slack.post_error.call_args[0][2]
+        assert "HTTP 400" in message
+        assert "exec-http-1" in message
+
+    def test_file_not_found_sends_missing_command_message(self, monkeypatch):
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-fnf-1")
+        mock_slack = MagicMock()
+
+        exc = FileNotFoundError(2, "No such file or directory", "codex")
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", exc)
+
+        message = mock_slack.post_error.call_args[0][2]
+        assert "codex" in message
+        assert "exec-fnf-1" in message
 
 
 # ---------------------------------------------------------------------------

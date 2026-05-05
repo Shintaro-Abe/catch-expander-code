@@ -356,3 +356,53 @@ class TestGetFeedbackAggregation:
             from src.dashboard_api.get_feedback_aggregation.app import lambda_handler
             result = lambda_handler({"queryStringParameters": {}}, None)
         assert result["statusCode"] == 500
+
+    def test_no_feedback_returns_empty_lists(self):
+        result = self._run([])
+        data = json.loads(result["body"])["data"]
+        assert data["events"] == []
+        assert data["daily_counts"] == []
+
+    def test_response_includes_events_list(self):
+        items = [
+            _make_event("feedback_received", payload={
+                "subtype": "mention_reply",
+                "reply_text_summary": "良かったです",
+                "learned_preferences_updated": True,
+                "new_preferences_count": 2,
+                "total_preferences_count": 5,
+            }),
+        ]
+        result = self._run(items)
+        data = json.loads(result["body"])["data"]
+        assert len(data["events"]) == 1
+        e = data["events"][0]
+        assert e["execution_id"] == "exec-001"
+        assert e["subtype"] == "mention_reply"
+        assert e["reply_text_summary"] == "良かったです"
+        assert e["learned_preferences_updated"] is True
+        assert e["new_preferences_count"] == 2
+        assert e["total_preferences_count"] == 5
+
+    def test_events_sorted_newest_first(self):
+        items = [
+            _make_event("feedback_received", "exec-old", ts="2026-05-01T08:00:00.000Z"),
+            _make_event("feedback_received", "exec-new", ts="2026-05-02T09:00:00.000Z"),
+        ]
+        result = self._run(items)
+        data = json.loads(result["body"])["data"]
+        assert data["events"][0]["execution_id"] == "exec-new"
+        assert data["events"][1]["execution_id"] == "exec-old"
+
+    def test_daily_counts_grouped_by_date(self):
+        items = [
+            _make_event("feedback_received", "exec-001", ts="2026-05-01T08:00:00.000Z"),
+            _make_event("feedback_received", "exec-002", ts="2026-05-01T20:00:00.000Z"),
+            _make_event("feedback_received", "exec-003", ts="2026-05-03T10:00:00.000Z"),
+        ]
+        result = self._run(items)
+        data = json.loads(result["body"])["data"]
+        counts = {d["date"]: d["count"] for d in data["daily_counts"]}
+        assert counts["2026-05-01"] == 2
+        assert counts["2026-05-03"] == 1
+        assert sorted(data["daily_counts"], key=lambda x: x["date"]) == data["daily_counts"]

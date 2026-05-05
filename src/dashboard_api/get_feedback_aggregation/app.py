@@ -1,5 +1,6 @@
 import logging
 import os
+from collections import defaultdict
 
 import boto3
 
@@ -44,6 +45,28 @@ def lambda_handler(event: dict, context: object) -> dict:
     if items:
         latest_total_prefs = (items[-1].get("payload") or {}).get("total_preferences_count")
 
+    # daily_counts: group by date (YYYY-MM-DD) ascending
+    daily: dict[str, int] = defaultdict(int)
+    for item in items:
+        date = (item.get("timestamp") or "")[:10]
+        if date:
+            daily[date] += 1
+    daily_counts = [{"date": d, "count": c} for d, c in sorted(daily.items())]
+
+    # events: individual feedback events newest-first
+    events = []
+    for item in reversed(items):
+        payload = item.get("payload") or {}
+        events.append({
+            "execution_id": item.get("execution_id"),
+            "timestamp": item.get("timestamp"),
+            "subtype": payload.get("subtype", "mention_reply"),
+            "reply_text_summary": payload.get("reply_text_summary", ""),
+            "learned_preferences_updated": bool(payload.get("learned_preferences_updated")),
+            "new_preferences_count": int(payload.get("new_preferences_count") or 0),
+            "total_preferences_count": payload.get("total_preferences_count"),
+        })
+
     return json_response(200, {
         "data": {
             "period": period,
@@ -51,5 +74,7 @@ def lambda_handler(event: dict, context: object) -> dict:
             "preferences_updated_count": preferences_updated,
             "avg_new_preferences": avg_new_prefs,
             "latest_total_preferences": latest_total_prefs,
+            "daily_counts": daily_counts,
+            "events": events,
         },
     })

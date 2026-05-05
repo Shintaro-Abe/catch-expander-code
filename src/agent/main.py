@@ -1,10 +1,12 @@
 import hashlib
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import boto3
+import requests
 from feedback.feedback_processor import FeedbackProcessor
 from notify.slack_client import SlackClient
 from orchestrator import Orchestrator
@@ -169,7 +171,7 @@ def _notify_task_failure(slack_token: str, exc: BaseException | None = None) -> 
 
     通知自体の失敗はログに留め、元の例外を隠さない。
     SLACK_CHANNEL / SLACK_THREAD_TS が未設定の場合は何もしない。
-    NotionCloudflareBlockError の場合はリトライ案内、それ以外は汎用（OAuth 切れ）文言を送る。
+    例外の種別に応じたメッセージを送る。
     """
     channel = os.environ.get("SLACK_CHANNEL", "")
     thread_ts = os.environ.get("SLACK_THREAD_TS", "")
@@ -177,18 +179,62 @@ def _notify_task_failure(slack_token: str, exc: BaseException | None = None) -> 
         logger.warning("SLACK_CHANNEL or SLACK_THREAD_TS not set, skipping failure notification")
         return
 
+    execution_id = os.environ.get("EXECUTION_ID", "<unknown>")
+    id_line = f"execution_id: `{execution_id}`"
+
     if isinstance(exc, NotionCloudflareBlockError):
-        execution_id = os.environ.get("EXECUTION_ID", "<unknown>")
         message = (
             "Notion 前段（Cloudflare）でリクエストが拒否されたため、保存に失敗しました。\n"
             "数分〜数十分ほど時間を空けて再投入をお試しください。\n"
             "繰り返し失敗する場合はログを確認しますのでお知らせください。\n"
-            f"execution_id: `{execution_id}`"
+            f"{id_line}"
+        )
+    elif isinstance(exc, subprocess.CalledProcessError):
+        stderr = (exc.stderr or "").lower()
+        cmd_str = " ".join(exc.cmd) if isinstance(exc.cmd, list) else str(exc.cmd)
+        if "429" in stderr or "rate limit" in stderr or "rate_limit" in stderr:
+            message = (
+                "APIレート制限に達したためタスクを完了できませんでした。\n"
+                "しばらく時間をおいてから再投入をお試しください。\n"
+                f"{id_line}"
+            )
+        elif "codex" in cmd_str:
+            message = (
+                "Codex CLI の実行に失敗しました。\n"
+                "ログを確認しますのでお知らせください。\n"
+                f"{id_line}"
+            )
+        else:
+            message = (
+                "Claude CLI の実行に失敗しました。\n"
+                "ログを確認しますのでお知らせください。\n"
+                f"{id_line}"
+            )
+    elif isinstance(exc, RuntimeError) and "All research steps failed" in str(exc):
+        message = (
+            "リサーチ処理がすべて失敗しました。\n"
+            "ログを確認しますのでお知らせください。\n"
+            f"{id_line}"
+        )
+    elif isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else "?"
+        message = (
+            f"外部 API エラーが発生しました（HTTP {status}）。\n"
+            "ログを確認しますのでお知らせください。\n"
+            f"{id_line}"
+        )
+    elif isinstance(exc, FileNotFoundError):
+        message = (
+            f"外部コマンドが見つかりません（{exc.filename}）。\n"
+            "インストール状況や設定を確認してください。\n"
+            f"{id_line}"
         )
     else:
+        exc_type = type(exc).__name__ if exc else "Unknown"
         message = (
-            "タスクの処理中にエラーが発生しました。\n"
-            "Claude OAuthトークンが期限切れの場合は、開発環境で `claude` コマンドを実行して再ログインしてください。"
+            f"タスクの処理中に予期しないエラーが発生しました（{exc_type}）。\n"
+            "ログを確認しますのでお知らせください。\n"
+            f"{id_line}"
         )
     try:
         SlackClient(slack_token).post_error(channel, thread_ts, message)
