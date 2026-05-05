@@ -462,6 +462,13 @@ Resources:
                 Resource:
                   - !GetAtt AgentLogGroup.Arn
                   - !Sub ${AgentLogGroup.Arn}:*
+        - PolicyName: PromptsS3WriteAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${PromptsBucket.Arn}/prompts/*
 
   AgentTaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -503,6 +510,8 @@ Resources:
               Value: !Ref CodexAuthSecretArn
             - Name: EVENTS_TABLE
               Value: !Ref DashboardEventsTable
+            - Name: PROMPTS_BUCKET
+              Value: !Ref PromptsBucket
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -908,6 +917,37 @@ Resources:
               Resource:
                 - !GetAtt DashboardEventsTable.Arn
 
+  DashboardGetSubagentIoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-subagent-io
+      Handler: get_subagent_io.app.lambda_handler
+      CodeUri: src/dashboard_api/
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          PROMPTS_BUCKET: !Ref PromptsBucket
+      Events:
+        GetSubagentIo:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/executions/{execution_id}/subagent-io
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt PromptsBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix: "prompts/*"
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub ${PromptsBucket.Arn}/prompts/*
+
   # ==============================================================
   # Dashboard: メトリクス系 Lambda
   # ==============================================================
@@ -1106,6 +1146,25 @@ Resources:
               Resource:
                 - !GetAtt DashboardEventsTable.Arn
                 - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
+
+  # ==============================================================
+  # Prompts Recording (S3)
+  # ==============================================================
+
+  PromptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub catch-expander-prompts-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-after-5-years
+            Status: Enabled
+            ExpirationInDays: 1825
 
   # ==============================================================
   # Frontend Static Hosting (S3 + CloudFront + OAC)

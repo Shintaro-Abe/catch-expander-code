@@ -11,6 +11,7 @@ import type {
   MetricsSummary,
   Period,
   ReviewQualityResponse,
+  SubagentIOResponse,
   TokenMonitorHealth,
 } from "./types"
 
@@ -54,4 +55,7 @@ export const endpoints = {
 
   feedbackAggregation: (period: Period) =>
     api.get<FeedbackAggregationResponse>(`/api/v1/metrics/feedback?period=${period}`),
+
+  subagentIO: (id: string) =>
+    api.get<SubagentIOResponse>(`/api/v1/executions/${id}/subagent-io`),
 }

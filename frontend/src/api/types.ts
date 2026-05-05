@@ -161,3 +161,18 @@ export interface FeedbackAggregation {
 export interface FeedbackAggregationResponse {
   data: FeedbackAggregation
 }
+
+export interface SubagentIORecord {
+  subagent: "researcher" | "generator" | "reviewer_eval" | "reviewer_fix"
+  index: string
+  prompt: string
+  output: string
+  recorded_at: string
+}
+
+export interface SubagentIOResponse {
+  data: {
+    execution_id: string
+    records: SubagentIORecord[]
+  }
+}

@@ -9,7 +9,7 @@ import {
 import type { LucideIcon } from "lucide-react"
 
 import { endpoints } from "@/api/endpoints"
-import type { DashboardEvent, Deliverable } from "@/api/types"
+import type { DashboardEvent, Deliverable, SubagentIORecord } from "@/api/types"
 import { StatusBadge } from "@/components/StatusBadge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -95,6 +95,13 @@ export function ExecutionDetail() {
     staleTime: 30_000,
   })
 
+  const ioQ = useQuery({
+    queryKey: ["subagentIO", executionId],
+    queryFn: () => endpoints.subagentIO(executionId!),
+    enabled: !!executionId,
+    staleTime: 60_000,
+  })
+
   const execution    = execQ.data?.data.execution
   const deliverables = execQ.data?.data.deliverables ?? []
   const events       = eventsQ.data?.data ?? []
@@ -151,7 +158,7 @@ export function ExecutionDetail() {
         </Card>
       ) : null}
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4" data-grid>
         {/* Event timeline */}
         <div className="lg:col-span-2 space-y-4">
           <Card className="bg-card border-border">
@@ -244,6 +251,9 @@ export function ExecutionDetail() {
           )}
         </div>
       </div>
+
+      {/* Subagent I/O — full width below grid */}
+      <SubagentIOSection records={ioQ.data?.data.records ?? []} isLoading={ioQ.isLoading} />
     </div>
   )
 }
@@ -359,6 +369,121 @@ function JsonCard({ title, value }: { title: string; value: Record<string, unkno
           </pre>
         </CardContent>
       )}
+    </Card>
+  )
+}
+
+const SUBAGENT_LABELS: Record<SubagentIORecord["subagent"], string> = {
+  researcher:    "リサーチャー",
+  generator:     "ジェネレーター",
+  reviewer_eval: "レビュアー（評価）",
+  reviewer_fix:  "レビュアー（修正試行）",
+}
+
+function IOExpandable({ label, content }: { label: string; content: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+      >
+        {open ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+        {label}
+      </button>
+      {open && (
+        <pre className="mt-1 text-[11px] font-mono bg-muted/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-words text-muted-foreground max-h-96 overflow-y-auto">
+          {content}
+        </pre>
+      )}
+    </div>
+  )
+}
+
+function SubagentIOSection({
+  records,
+  isLoading,
+}: {
+  records: SubagentIORecord[]
+  isLoading: boolean
+}) {
+  const researchers = records.filter((r) => r.subagent === "researcher")
+  const generators  = records.filter((r) => r.subagent === "generator")
+  const revEvals    = records.filter((r) => r.subagent === "reviewer_eval")
+  const revFixes    = records.filter((r) => r.subagent === "reviewer_fix")
+
+  return (
+    <Card className="bg-card border-border">
+      <CardHeader className="px-4 pt-4 pb-2">
+        <CardTitle className="text-sm font-semibold text-foreground">サブエージェント入出力</CardTitle>
+      </CardHeader>
+      <CardContent className="px-4 pb-4">
+        {isLoading ? (
+          <div className="space-y-2">
+            {[...Array(3)].map((_, i) => <Skeleton key={i} className="h-6 w-full" />)}
+          </div>
+        ) : records.length === 0 ? (
+          <p className="text-xs text-muted-foreground">記録データなし（この機能追加前の実行）</p>
+        ) : (
+          <div className="space-y-6">
+            {researchers.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-foreground mb-2">リサーチャー</p>
+                <div className="space-y-3">
+                  {researchers.map((r) => (
+                    <div key={r.index} className="pl-3 border-l border-border space-y-1">
+                      <p className="text-[11px] text-muted-foreground">ステップ: {r.index}</p>
+                      <IOExpandable label="プロンプトを表示" content={r.prompt} />
+                      <IOExpandable label="出力を表示" content={r.output} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {generators.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-foreground mb-2">ジェネレーター</p>
+                {generators.map((r) => (
+                  <div key={r.index} className="pl-3 border-l border-border space-y-1">
+                    <IOExpandable label="プロンプトを表示" content={r.prompt} />
+                    <IOExpandable label="出力を表示" content={r.output} />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {(revEvals.length > 0 || revFixes.length > 0) && (
+              <div>
+                <p className="text-xs font-medium text-foreground mb-2">レビュアー</p>
+                <div className="space-y-3">
+                  {revEvals.map((evalRec) => {
+                    const fixRec = revFixes.find((f) => f.index === evalRec.index)
+                    return (
+                      <div key={evalRec.index} className="pl-3 border-l border-border space-y-2">
+                        <p className="text-[11px] text-muted-foreground">ループ {Number(evalRec.index) + 1}</p>
+                        <div className="space-y-1">
+                          <p className="text-[10px] text-muted-foreground uppercase tracking-wide">評価</p>
+                          <IOExpandable label="プロンプトを表示" content={evalRec.prompt} />
+                          <IOExpandable label="出力を表示" content={evalRec.output} />
+                        </div>
+                        {fixRec && (
+                          <div className="space-y-1">
+                            <p className="text-[10px] text-muted-foreground uppercase tracking-wide">修正試行</p>
+                            <IOExpandable label="プロンプトを表示" content={fixRec.prompt} />
+                            <IOExpandable label="出力を表示" content={fixRec.output} />
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
     </Card>
   )
 }

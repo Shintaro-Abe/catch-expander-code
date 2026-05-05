@@ -32,8 +32,10 @@ try:
     from src.observability import (
         emit_rate_limit_hit as _emit_rate_limit_hit,
     )
+    from src.observability.prompt_recorder import PromptRecorder as _PromptRecorder
 except ImportError:  # pragma: no cover - 本番 ECS image でのみ発生
     _EventEmitter = None
+    _PromptRecorder = None
 
     def _emit_api_call_completed(emitter, **kwargs) -> None:  # type: ignore[no-redef]
         return None
@@ -801,9 +803,10 @@ class Orchestrator:
         self.db = db_client
         self.notion = NotionClient(notion_token, notion_database_id)
         self.github = GitHubClient(github_token, github_repo)
-        # run() で本物の EventEmitter に差し替え。run() を経由しないテスト/直接呼び出し
-        # では _NoOpEmitter のままなので副作用なし。
+        # run() で本物の EventEmitter / PromptRecorder に差し替え。
+        # run() を経由しないテスト/直接呼び出しでは no-op のままなので副作用なし。
         self._emitter: Any = _NoOpEmitter()
+        self._prompt_recorder: Any = None
         self._cost_acc: dict = {
             "total_cost_usd": 0.0,
             "total_tokens_used": 0,
@@ -837,6 +840,8 @@ class Orchestrator:
             self.notion._emitter = self._emitter
             self.github._emitter = self._emitter
             self.slack._emitter = self._emitter
+        if _PromptRecorder is not None:
+            self._prompt_recorder = _PromptRecorder(execution_id)
 
         overall_start_ns = time.monotonic_ns()
         final_status = "in_progress"
@@ -1013,6 +1018,8 @@ class Orchestrator:
             )
             try:
                 gen_raw = call_claude(gen_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
+                if self._prompt_recorder is not None:
+                    self._prompt_recorder.record("generator", "0", gen_prompt, gen_raw)
                 deliverables = _parse_claude_response(gen_raw)
             except Exception as e:
                 self._emitter.emit(
@@ -1053,6 +1060,8 @@ class Orchestrator:
                         raw_stdout, files, outcome = call_claude_with_workspace(
                             prompt, code_type, emitter=self._emitter, cost_acc=self._cost_acc
                         )
+                        if self._prompt_recorder is not None:
+                            self._prompt_recorder.record("generator", "0", prompt, raw_stdout)
                     except Exception as e:
                         self._emitter.emit(
                             "subagent_failed",
@@ -1333,6 +1342,8 @@ class Orchestrator:
                     f"検索ヒント: {json.dumps(step.get('search_hints', []), ensure_ascii=False)}"
                 )
                 raw = call_claude(prompt, allowed_tools=["WebSearch", "WebFetch"], emitter=self._emitter, cost_acc=self._cost_acc)
+                if self._prompt_recorder is not None:
+                    self._prompt_recorder.record("researcher", step_id, prompt, raw)
                 result = _parse_claude_response(raw)
                 _namespace_source_ids(result, step_id)
                 self.db.update_step_status(execution_id, step_id, "completed", result)
@@ -1413,6 +1424,8 @@ class Orchestrator:
                 f"出典リスト:\n```json\n{sources_text}\n```"
             )
             raw = call_codex(review_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
+            if self._prompt_recorder is not None:
+                self._prompt_recorder.record("reviewer_eval", str(loop), review_prompt, raw)
             review_result = _parse_claude_response(raw)
 
             # 各 iteration ごとの review_completed (T1-2): シグネチャ・戻り値・分岐ロジックは不変。
@@ -1474,6 +1487,8 @@ class Orchestrator:
                 f"現在の成果物:\n```json\n{json.dumps(current_deliverables, ensure_ascii=False)}\n```"
             )
             fix_raw = call_claude(fix_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
+            if self._prompt_recorder is not None:
+                self._prompt_recorder.record("reviewer_fix", str(loop), fix_prompt, fix_raw)
             parsed = _parse_claude_response(fix_raw)
             if parsed.get("parse_error"):
                 logger.warning(
