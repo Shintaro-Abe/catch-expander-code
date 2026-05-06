@@ -1166,6 +1166,24 @@ Resources:
             Status: Enabled
             ExpirationInDays: 1825
 
+  # サブエージェント記録は dashboard Lambda 経由でのみ閲覧可能とする。
+  # 直接 S3 URL（presigned URL を含む）での GetObject は明示的に Deny。
+  # 書き込み (s3:PutObject) は ECS task role の IAM policy で制御するため対象外。
+  PromptsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PromptsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyGetObjectExceptDashboardLambda
+            Effect: Deny
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub ${PromptsBucket.Arn}/*
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn: !GetAtt DashboardGetSubagentIoFunctionRole.Arn
+
   # ==============================================================
   # Frontend Static Hosting (S3 + CloudFront + OAC)
   # ==============================================================
@@ -1256,6 +1274,9 @@ Resources:
             ResponsePagePath: /index.html
             ErrorCachingMinTTL: 0
 
+  # フロントエンド配信は CloudFront 経由のみ許可。
+  # 直接 S3 URL（presigned URL を含む）での GetObject は明示的に Deny。
+  # デプロイ用 aws s3 sync は s3:PutObject / s3:DeleteObject / s3:ListBucket のみ使うため影響なし。
   FrontendBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -1270,6 +1291,14 @@ Resources:
             Resource: !Sub ${FrontendBucket.Arn}/*
             Condition:
               StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+          - Sid: DenyGetObjectExceptCloudFront
+            Effect: Deny
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringNotEquals:
                 AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
 
 Conditions:
