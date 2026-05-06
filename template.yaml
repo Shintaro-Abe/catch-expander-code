@@ -34,8 +34,12 @@ Parameters:
     Description: Prefix for DynamoDB table names
   AgentImageUri:
     Type: String
-    Description: ECR image URI for the agent container
-    Default: ""
+    Description: >-
+      ECR image URI for the agent container. Required.
+      Pass via `sam deploy --parameter-overrides AgentImageUri=...:<SHA>`
+      or use scripts/deploy-agent.sh which handles tagging and deploy together.
+    AllowedPattern: ".+"
+    ConstraintDescription: AgentImageUri must be set (no default)
   SlackNotificationChannelId:
     Type: String
     Description: Slack channel ID for operational notifications (e.g. Claude OAuth token expiry)
@@ -335,6 +339,9 @@ Resources:
     Type: AWS::ECR::Repository
     Properties:
       RepositoryName: catch-expander-agent
+      # IMMUTABLE: 既存タグへの上書き push を ECR API で拒否。サプライチェーン保護。
+      # デプロイは scripts/deploy-agent.sh が git SHA をタグとして push する運用。
+      ImageTagMutability: IMMUTABLE
       ImageScanningConfiguration:
         ScanOnPush: true
       LifecyclePolicy:
@@ -486,10 +493,9 @@ Resources:
       TaskRoleArn: !GetAtt AgentTaskRole.Arn
       ContainerDefinitions:
         - Name: agent
-          Image: !If
-            - HasAgentImageUri
-            - !Ref AgentImageUri
-            - !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentRepository}:latest
+          # AgentImageUri は必須パラメータ。:latest フォールバックは廃止
+          # （IMMUTABLE 化と整合させ、すべてのデプロイで明示的に SHA タグを指定する運用）
+          Image: !Ref AgentImageUri
           Essential: true
           Environment:
             - Name: NOTION_DATABASE_ID
@@ -1300,9 +1306,6 @@ Resources:
             Condition:
               StringNotEquals:
                 AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
-
-Conditions:
-  HasAgentImageUri: !Not [!Equals [!Ref AgentImageUri, ""]]
 
 Outputs:
   SlackApiUrl:
