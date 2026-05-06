@@ -491,13 +491,65 @@ Resources:
         OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt AgentTaskExecutionRole.Arn
       TaskRoleArn: !GetAtt AgentTaskRole.Arn
+      # ReadonlyRootFilesystem 化に伴い、書き込みが必要な /tmp と /home/appuser を
+      # ephemeral scratch volume として提供する。Fargate は tmpfs 非対応のため、
+      # Volumes に Name のみ指定して task の ephemeral storage を割り当てる。
+      Volumes:
+        - Name: tmp-scratch
+        - Name: home-scratch
       ContainerDefinitions:
+        # init container: 同じ image を root で起動して fresh ephemeral volume の
+        # ownership を appuser に変更してから exit する。Fargate の scratch volume は
+        # 初回マウント時 root 所有で作成されるため、appuser で書き込めるよう事前準備が必要。
+        # Essential: false かつ main 側 dependsOn で SUCCESS を待たせる。
+        - Name: init-perms
+          Image: !Ref AgentImageUri
+          Essential: false
+          User: "0"  # root
+          EntryPoint: ["/bin/bash"]
+          Command:
+            - "-c"
+            - "chown -R appuser:appuser /home/appuser /tmp && echo 'init-perms: ownership fixed'"
+          MountPoints:
+            - SourceVolume: tmp-scratch
+              ContainerPath: /tmp
+              ReadOnly: false
+            - SourceVolume: home-scratch
+              ContainerPath: /home/appuser
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AgentLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: init-perms
+
         - Name: agent
           # AgentImageUri は必須パラメータ。:latest フォールバックは廃止
           # （IMMUTABLE 化と整合させ、すべてのデプロイで明示的に SHA タグを指定する運用）
           Image: !Ref AgentImageUri
           Essential: true
+          # ECS.20: Dockerfile の USER appuser を Task Definition でも明示。
+          # image の USER directive が抜けても TaskDef 側で非 root を強制する。
+          User: appuser
+          # ECS.5: コンテナ root filesystem を read-only にする。
+          # 書き込みが必要な /tmp と /home/appuser は MountPoints で scratch volume を当てる。
+          ReadonlyRootFilesystem: true
+          # init-perms が volume の ownership を直してから起動
+          DependsOn:
+            - ContainerName: init-perms
+              Condition: SUCCESS
+          MountPoints:
+            - SourceVolume: tmp-scratch
+              ContainerPath: /tmp
+              ReadOnly: false
+            - SourceVolume: home-scratch
+              ContainerPath: /home/appuser
+              ReadOnly: false
           Environment:
+            # readonly root では Python の .pyc 書き込みが失敗してログノイズになるため抑止
+            - Name: PYTHONDONTWRITEBYTECODE
+              Value: "1"
             - Name: NOTION_DATABASE_ID
               Value: !Ref NotionDatabaseId
             - Name: GITHUB_REPO
