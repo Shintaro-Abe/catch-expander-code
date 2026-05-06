@@ -1298,6 +1298,30 @@ Resources:
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
 
+  # CloudFront standard logs (legacy) 配信先。
+  # CloudFront.5 (Security Hub) は legacy logging のみを評価するためこの方式。
+  # legacy 方式は S3 ACL ベースで delivery されるため ObjectOwnership を
+  # BucketOwnerPreferred にして ACL を有効化。BPA の BlockPublicAcls は AllUsers/
+  # AuthenticatedUsers 向け ACL のみブロックし、CloudFront log delivery 用の
+  # canonical user 向け ACL は通すため、両者は両立する。
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub catch-expander-cloudfront-logs-${AWS::AccountId}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-after-90-days
+            Status: Enabled
+            ExpirationInDays: 90
+
   FrontendOAC:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
@@ -1315,6 +1339,12 @@ Resources:
         DefaultRootObject: index.html
         HttpVersion: http2and3
         PriceClass: PriceClass_100
+        # CloudFront.5 対応: standard access log を S3 に配信。
+        # IncludeCookies=false で JWT cookie 値が log に書き出されないように。
+        Logging:
+          Bucket: !GetAtt CloudFrontLogsBucket.RegionalDomainName
+          Prefix: cloudfront/
+          IncludeCookies: false
         Origins:
           - Id: S3Origin
             DomainName: !GetAtt FrontendBucket.RegionalDomainName
