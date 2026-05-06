@@ -131,11 +131,11 @@ export function DashboardHome() {
           </CardHeader>
           <CardContent>
             {qSummary.isLoading ? (
-              <Skeleton className="h-[180px] w-full" />
+              <Skeleton className="h-[360px] w-full" />
             ) : statusData.length === 0 ? (
               <EmptyState message="この期間のデータなし" />
             ) : (
-              <ResponsiveContainer width="100%" height={180}>
+              <ResponsiveContainer width="100%" height={360}>
                 <BarChart data={statusData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                   <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#888" }} axisLine={false} tickLine={false} />
@@ -161,9 +161,9 @@ export function DashboardHome() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">レビュー通過率</CardTitle>
           </CardHeader>
-          <CardContent className="flex items-center justify-center h-[180px]">
+          <CardContent className="flex items-center justify-center h-[360px]">
             {qSummary.isLoading ? (
-              <Skeleton className="h-24 w-24 rounded-full" />
+              <Skeleton className="h-48 w-48 rounded-full" />
             ) : summary?.review_pass_rate == null ? (
               <EmptyState message="レビューデータなし" />
             ) : (
@@ -177,8 +177,8 @@ export function DashboardHome() {
                       ]}
                       cx="50%"
                       cy="50%"
-                      innerRadius={45}
-                      outerRadius={62}
+                      innerRadius={90}
+                      outerRadius={124}
                       startAngle={90}
                       endAngle={-270}
                       paddingAngle={2}
@@ -194,7 +194,7 @@ export function DashboardHome() {
                   </PieChart>
                 </ResponsiveContainer>
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                  <span className="text-xl font-semibold tabular text-foreground">
+                  <span className="text-4xl font-semibold tabular text-foreground">
                     {fmtRate(summary.review_pass_rate)}
                   </span>
                 </div>
