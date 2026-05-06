@@ -160,6 +160,10 @@ Resources:
       KeySchema:
         - AttributeName: user_id
           KeyType: HASH
+      # DynamoDB.2 / DynamoDB.6 対応: 誤削除と誤操作からのデータ保護
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
 
   WorkflowExecutionsTable:
     Type: AWS::DynamoDB::Table
@@ -188,6 +192,9 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
 
   WorkflowStepsTable:
     Type: AWS::DynamoDB::Table
@@ -207,6 +214,9 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
 
   DeliverablesTable:
     Type: AWS::DynamoDB::Table
@@ -223,6 +233,9 @@ Resources:
           KeyType: HASH
         - AttributeName: deliverable_id
           KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
 
   SourcesTable:
     Type: AWS::DynamoDB::Table
@@ -242,6 +255,9 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
 
   DashboardEventsTable:
     Type: AWS::DynamoDB::Table
@@ -294,6 +310,9 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
 
   DashboardOAuthStateTable:
     Type: AWS::DynamoDB::Table
@@ -309,6 +328,9 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: true
 
   # ==============================================================
   # Secrets Manager (Dashboard)
