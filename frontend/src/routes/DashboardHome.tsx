@@ -161,14 +161,14 @@ export function DashboardHome() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">レビュー通過率</CardTitle>
           </CardHeader>
-          <CardContent className="flex flex-col items-center justify-center h-[180px]">
+          <CardContent className="flex items-center justify-center h-[180px]">
             {qSummary.isLoading ? (
               <Skeleton className="h-24 w-24 rounded-full" />
             ) : summary?.review_pass_rate == null ? (
               <EmptyState message="レビューデータなし" />
             ) : (
-              <>
-                <ResponsiveContainer width="100%" height={140}>
+              <div className="relative w-full h-full">
+                <ResponsiveContainer width="100%" height="100%">
                   <PieChart>
                     <Pie
                       data={[
@@ -193,10 +193,12 @@ export function DashboardHome() {
                     />
                   </PieChart>
                 </ResponsiveContainer>
-                <div className="text-2xl font-semibold tabular -mt-12">
-                  {fmtRate(summary.review_pass_rate)}
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <span className="text-xl font-semibold tabular text-foreground">
+                    {fmtRate(summary.review_pass_rate)}
+                  </span>
                 </div>
-              </>
+              </div>
             )}
           </CardContent>
         </Card>
