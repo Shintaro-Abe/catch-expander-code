@@ -34,82 +34,9 @@ sequenceDiagram
 | F8 | フィードバック学習 | 完了スレッドへの自由テキスト返信から好みを抽出し次回以降に反映 |
 | F9 | 成果物履歴管理 | Slack `履歴` / `history [keyword]` コマンドで過去成果物を再参照 |
 
-## アーキテクチャ
-
-```mermaid
-graph TB
-    User[ユーザー Slack]
-    Browser[ブラウザ 管理者]
-
-    subgraph AWS["AWS ap-northeast-1"]
-        APIGW[API Gateway REST<br/>POST /slack/events]
-        Lambda[Lambda トリガー]
-        TokenMon[Lambda token_monitor<br/>EventBridge 12h]
-
-        subgraph ECS["ECS Fargate"]
-            Container[Claude Code CLI<br/>+ オーケストレーター]
-        end
-
-        CF[CloudFront + S3 SPA]
-        DashAPI[API Gateway HTTP<br/>/api/v1/*]
-        DashLambda[Lambda<br/>ダッシュボード API 群]
-
-        DDB[(DynamoDB)]
-        Secrets[Secrets Manager]
-        ECR[ECR]
-    end
-
-    Notion[Notion API]
-    GitHub[GitHub API]
-    Claude[Claude Sonnet 4.6<br/>Maxプラン]
-    Codex[GPT-5.5 Codex CLI]
-
-    User -->|メッセージ| APIGW
-    APIGW --> Lambda
-    Lambda -->|RunTask| Container
-    Lambda -->|ACK| User
-    TokenMon -->|refresh| Secrets
-
-    Container --> DDB
-    Container --> Secrets
-    Container -->|通知| User
-    Container -->|レポート / 設計書| Notion
-    Container -->|コード成果物| GitHub
-    Container -->|通常ステップ| Claude
-    Container -->|品質レビュー| Codex
-
-    Browser -->|SPA| CF
-    Browser -->|/api/*| CF
-    CF -->|プロキシ| DashAPI
-    DashAPI --> DashLambda
-    DashLambda --> DDB
-```
-
-詳細は [`docs/architecture.md`](docs/architecture.md) を参照。
-
-### テクノロジースタック（抜粋）
-
-| レイヤー | 技術 |
-|---------|------|
-| エージェント実行 | ECS Fargate（ARM64, 1vCPU/2GB）+ Claude Code CLI |
-| LLM | Claude Sonnet 4.6（通常ステップ）/ GPT-5.5 via Codex CLI（品質レビュー） |
-| トリガー / API | AWS Lambda（Python 3.13）+ API Gateway（REST / HTTP） |
-| データストア | DynamoDB（オンデマンド, PITR + 削除保護有効） |
-| シークレット | AWS Secrets Manager |
-| フロントエンド | Vite 8 + React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui + Recharts |
-| データフェッチ | TanStack Query v5 |
-| 配信 | CloudFront + S3（SPA）+ OAC + 標準アクセスログ |
-| IaC | AWS SAM |
-
 ## ダッシュボード
 
-ワークフロー実行状況をブラウザで確認できるオブザービリティダッシュボード。
-
-| 項目 | 内容 |
-|------|------|
-| URL | https://duf2tc37sx7rn.cloudfront.net |
-| アクセス方法 | Slack ワークスペース OAuth ログイン |
-| 認証 | JWT Cookie + Lambda Authorizer |
+ワークフロー実行状況をブラウザで確認できるオブザービリティダッシュボード。Slack ワークスペースの OAuth ログインで認証し、JWT Cookie + Lambda Authorizer 経由で API へアクセスする。
 
 ### 画面一覧
 
@@ -121,8 +48,6 @@ graph TB
 | レビュー品質 | 第1〜3層の検証結果集計 |
 | エラー一覧 | 失敗実行の絞り込み・原因表示 |
 | フィードバック分析 | F8 で蓄積された learned_preferences の可視化 |
-
-Slack ワークスペースのメンバーのみログイン可能。ブラウザで URL を開き「Slack でログイン」ボタンをクリックすると、Slack OAuth 認証後にダッシュボードへ遷移する。
 
 ## リポジトリ構成
 
