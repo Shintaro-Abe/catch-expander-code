@@ -60,3 +60,6 @@ coverage.xml
 
 # graphify (knowledge graph generator output — environment-specific paths, multi-MB HTML/JSON)
 graphify-out/
+
+# Local design assets (not part of repo deliverables)
+aws-architecture.drawio
