@@ -101,25 +101,6 @@ curl -sL --max-time 15 "<URL>" | head -200
 - `"unknown"` / `"continuously-updated"` などの非日付値は集計から**除外**する
 - 日付情報を持つ出典が1件もない場合は両フィールドに `null` を設定する
 
-## issue カテゴリ分類
-
-各 issue には `issue_category` フィールドを必ず付与してください。値域は以下の 5 つに固定です。
-
-| カテゴリ値 | 該当する指摘 |
-|---|---|
-| `terraform_schema` | Terraform 構文・provider 引数・resource プロパティの誤り、存在しない属性参照、duplicate block 等 |
-| `iam_action` | 存在しない IAM アクション (例: `s3:GeneratePresignedUrl`)、ロール権限不備、リソース ARN ミスマッチ等 |
-| `syntax` | 一般的なコード構文エラー (Python/JS/Go/Rust 等)、型不整合、未定義変数、lint 違反 |
-| `api_version` | 古い API バージョン参照、廃止された SDK / メソッド、provider バージョン不一致 |
-| `other` | 上記いずれにも該当しない指摘（事実誤認、出典不整合、レビュー観点の指摘など） |
-
-判定が曖昧な場合の優先順位:
-
-1. Terraform 関連で iam_action か terraform_schema か迷う場合 → IAM アクション名・権限の指摘なら `iam_action`、それ以外の TF 構文なら `terraform_schema`
-2. コード構文と API バージョンで迷う場合 → 「現在も有効だが古い」なら `api_version`、「そもそも書き方が間違っている」なら `syntax`
-3. Terraform provider のバージョン境界 → provider version 制約そのものの指摘 (`required_providers` の version 等) は `api_version`、その結果として存在しない引数・属性が使われている指摘は `terraform_schema`
-4. ソース検証や事実誤認の指摘 → 必ず `other`
-
 ## 出力形式
 
 以下のJSON形式で出力してください。
@@ -133,7 +114,6 @@ curl -sL --max-time 15 "<URL>" | head -200
     {
       "item": "チェック項目名",
       "severity": "error | warning",
-      "issue_category": "terraform_schema | iam_action | syntax | api_version | other",
       "description": "問題の詳細",
       "fix_instruction": "具体的な修正指示"
     }
@@ -163,4 +143,3 @@ curl -sL --max-time 15 "<URL>" | head -200
 - ジェネレーターの出力を「正しい」と仮定しない。独立して検証する
 - 出典URLの実在確認には `curl -sL --max-time 15 "<URL>"` を使用する
 - 修正指示は具体的に記述する（「確認してください」ではなく「セクション3の"市場規模$100億"を出典[3]の"$85億"に修正」のように）
-- `issue_category` は必ず `terraform_schema` / `iam_action` / `syntax` / `api_version` / `other` の 5 値のいずれかから選ぶ。空文字列・null・カスタム値は禁止

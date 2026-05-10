@@ -28,18 +28,9 @@
 {"type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": "本文テキスト"}}]}}
 {"type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": "リスト項目"}}]}}
 {"type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": "コード"}}], "language": "terraform"}}
-{"type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": "graph TD\n  A --> B"}}], "language": "mermaid"}}
 {"type": "table", "table": {"table_width": 3, "has_column_header": true, "children": [...]}}
 {"type": "divider", "divider": {}}
 ```
-
-### Mermaid 図の生成ルール
-
-設計書に含まれる図表（アーキテクチャ図・ER 図・シーケンス図・フロー図など）は **必ず** `code` ブロックの `language: "mermaid"` で出力してください。Notion API は `language: "mermaid"` の code ブロックを実際の図としてレンダリングします。
-
-- プレーンテキスト（ASCII アート）や表で図表を代替しない
-- 図の直前に Markdown の見出し（`heading_2` または `heading_3`）で図のタイトルを付ける
-- Mermaid 構文（`graph TD`, `erDiagram`, `sequenceDiagram` など）はそのまま `content` に記述する
 
 ### 共通構成
 

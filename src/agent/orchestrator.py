@@ -54,33 +54,6 @@ CLAUDE_ADVISOR_MODEL = "claude-opus-4-7"
 
 _CODE_RELATED_UNFIXED_PATTERN = re.compile(r"コード関連指摘\s*(\d+)\s*件は本ループ未修正")
 
-_VALID_ISSUE_CATEGORIES = frozenset(
-    {"terraform_schema", "iam_action", "syntax", "api_version", "other"}
-)
-
-
-def _aggregate_issue_categories(raw_issues: object) -> dict[str, int]:
-    """LLM が返した issues 配列から issue_category 別の件数を集計する。
-
-    malformed 入力に対する型ガード:
-    - issues が list でない → 空集計
-    - 個々の issue が dict でない → スキップ
-    - issue_category が文字列でない / 値域外 → "other" にフォールバック
-
-    関連: memory/project_review_loop_recurring_patch_site.md / obsidian/2026-04-29
-    """
-    counts: dict[str, int] = {}
-    if not isinstance(raw_issues, list):
-        return counts
-    for issue in raw_issues:
-        if not isinstance(issue, dict):
-            continue
-        cat = issue.get("issue_category")
-        if not isinstance(cat, str) or cat not in _VALID_ISSUE_CATEGORIES:
-            cat = "other"
-        counts[cat] = counts.get(cat, 0) + 1
-    return counts
-
 
 class _NoOpEmitter:
     """EventEmitter が import できない / Orchestrator が __init__ 直後にメソッド単体で
@@ -1453,23 +1426,7 @@ class Orchestrator:
             raw = call_codex(review_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             if self._prompt_recorder is not None:
                 self._prompt_recorder.record("reviewer_eval", str(loop), review_prompt, raw)
-            parsed_review = _parse_claude_response(raw)
-
-            # T1-2b: _parse_claude_response は非 dict (None / list / scalar) を返し得るため、
-            # ここで dict 化を確定させる。malformed 応答は「不合格」として扱う。
-            # (Codex 1 回目 P1: review_result.get(...) が AttributeError で落ちる経路を塞ぐ)
-            if not isinstance(parsed_review, dict):
-                logger.warning(
-                    "Reviewer returned malformed (non-dict) response; falling back",
-                    extra={"loop": loop, "raw_type": type(parsed_review).__name__},
-                )
-                review_result: dict = {
-                    "passed": False,
-                    "issues": [],
-                    "quality_metadata": {"notes": ["Reviewer returned malformed response"]},
-                }
-            else:
-                review_result = parsed_review
+            review_result = _parse_claude_response(raw)
 
             # 各 iteration ごとの review_completed (T1-2): シグネチャ・戻り値・分岐ロジックは不変。
             # accumulated_fixer_notes は本 iteration 開始時点までの累積で集計する
@@ -1486,7 +1443,6 @@ class Orchestrator:
                     "fixer_notes_count": len(accumulated_fixer_notes),
                     "code_related_unfixed_count": _extract_code_related_unfixed_count(accumulated_fixer_notes),
                     "issues_summary": _summarize_issues(review_issues_for_emit),
-                    "issue_categories": _aggregate_issue_categories(review_issues_for_emit),
                 },
             )
 
@@ -1496,10 +1452,7 @@ class Orchestrator:
                 logger.info("Review passed", extra={"loop": loop})
                 return review_result, current_deliverables
 
-            # T1-2b: review_issues_for_emit は line 1480-1482 で list 正規化済み。
-            # 非 dict 要素は除外して severity アクセス時の AttributeError を防ぐ
-            # (Codex 1 回目 P1: issues=["x"] のような malformed list でクラッシュする経路を塞ぐ)
-            errors = [i for i in review_issues_for_emit if isinstance(i, dict) and i.get("severity") == "error"]
+            errors = [i for i in review_result.get("issues", []) if i.get("severity") == "error"]
             if not errors or loop >= MAX_REVIEW_LOOPS:
                 # 上限到達: 残りの指摘事項を品質メタデータのnotesに記載
                 if errors:
