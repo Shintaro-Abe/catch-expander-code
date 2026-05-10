@@ -1,0 +1,29 @@
+## P1 (必修正)
+- なし
+
+## P2 (推奨修正)
+- なし
+
+## P3 (情報提供)
+- 指定された `memory/2026-04-29_codex-iterative-review-finds-multilayer-misses.md` は現ワークツリーでは見つかりませんでした。実装 docstring では `obsidian/2026-04-29...` を参照しており、レビューは実コードとテスト差分ベースで実施しました。
+- この環境では `pytest` / `python3 -m pytest` が利用できず、9 件 PASS は再実行できませんでした。静的確認では分岐・ログ契約に破綻は見つかっていません。
+
+## 2 回目指摘の解消状況
+- P1 (parse_error 分岐 B 網羅): 解消 ✅  
+  [tests/unit/agent/test_orchestrator.py:1123](/workspaces/Catch-Expander/tests/unit/agent/test_orchestrator.py:1123) は `call_codex` / `call_claude` の両方を patch し、`_parse_claude_response` が `parse_error=True` dict を返す経路を独立に通しています。
+- P2 (info ログ contract assert): 解消 ✅  
+  valid / fallback 発動 / fallback 諦めの 3 系統で `content_blocks_fallback_reason` と `content_blocks_fallback_applied` が lock されています。
+
+## 多層ミス検出
+- 新規層の指摘なし
+- 内訳:
+  - テスト独立性: 新規 fix_loop 系は各テストで mock を閉じており、`caplog` も fixture スコープ内の絞り込みなので干渉リスクは低いです。
+  - pre-existing failure 切り分け: 既存 `test_run_review_loop_keeps_previous_on_parse_error` は `call_codex` 未 patch の別問題として放置する判断は妥当です。今回の構造保護の網羅根拠は新規テスト側で完結しています。
+  - bool 厳密性: [src/agent/orchestrator.py:1554](/workspaces/Catch-Expander/src/agent/orchestrator.py:1554) の `fallback_applied` は各項が boolean を返すため、`is True` / `is False` assert で問題ありません。
+  - info ログ過剰検証: `"Deliverables updated by review fix"` は成功した fixer 適用ごとに 1 回だけ出る位置にあり、今回の 1 fix attempt テストでは `len == 1` が安定します。review pass 直前の `"Review passed"` とは重複しません。
+
+## 結論
+- 収束判定: 収束 (新規 P1/P2 ゼロ)
+- マージ可否: 可
+
+AC-1〜AC-3 の「fixer が `content_blocks` を欠落・null・空・非 list にした場合、旧版 non-empty list を保持する」要件は、実装とテストの両面で構造的に保護されています。4 回目レビューは不要です。

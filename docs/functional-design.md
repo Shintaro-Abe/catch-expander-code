@@ -526,6 +526,8 @@ finally:
 
 **Fixer notes の出力経路保護**: 修正再生成でジェネレーターが `quality_metadata.notes` に「コード関連指摘 N 件は本ループ未修正」と記録しても、後続のレビュアーが `passed: True` を返した場合、最終的に Notion / DynamoDB に出力されるのはレビュアーの `quality_metadata` であり、ジェネレーター側の note は捨てられる経路がある。さらに修正再生成は最大 2 回まで実行され、2 回目で `current_deliverables` が新応答に置換されると 1 回目の fixer notes も失われる。`_run_review_loop` は (1) 各 fix attempt 直後に `_accumulate_fixer_notes` で notes を accumulator に退避し、(2) 各 return 直前に `_apply_accumulated_fixer_notes` で `review_result.quality_metadata.notes` へ重複なくマージする。これにより全周回の fixer notes が決定論的に最終出力へ届くことを保証する。
 
+**fix loop での content_blocks 構造的保護**: fix loop の deliverables 置換時、fixer LLM 応答が `content_blocks` を omit / null / 空 list / 非 list で返した場合、直前の non-empty list を自動で引き継ぐ条件付き fallback を実装している。`_classify_content_blocks_fallback_reason` で 4 つの無効値パターンを判定し、旧版が valid な non-empty list のときだけ fallback を適用する。fixer が valid な non-empty list を返した場合は通常通り fixer の修正版が採用される。本保護は plain Python の決定論的処理で、プロンプト指示への依存はない。発動時は `logger.warning` で `loop` / `reason` / `previous_blocks_count` を記録し、`logger.info` の `Deliverables updated by review fix` 側にも `content_blocks_fallback_reason` (判定結果) と `content_blocks_fallback_applied` (実適用) の両方を記録することで、CloudWatch Logs Insights で「fallback 発動」「旧版も無効で諦め」「正常完了」の 3 系統を分けて集計可能にする。`parsed` が dict でない（JSON array/scalar）経路は `isinstance(parsed, dict)` ガードで `parsed.get(...)` の AttributeError を防止し、warning を出した上で旧版を保持する。2026-05-09 の Notion 本文消失インシデントを契機にプロンプト変更耐性を高めるための構造変更（パイプライン層）。
+
 ## 4. 外部連携設計
 
 ### 4.1 Slack連携

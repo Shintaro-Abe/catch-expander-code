@@ -125,6 +125,37 @@ def _extract_source_domains(sources: list[dict]) -> list[str]:
 _PRESERVED_DELIVERABLE_FIELDS = ("code_files",)
 
 
+def _classify_content_blocks_fallback_reason(parsed: dict) -> str | None:
+    """fixer 応答の content_blocks が fallback すべき無効値か判定する。
+
+    fixer LLM が content_blocks を omit / null / 空 list / 非 list で返した場合、
+    Notion 成果物の本文が消失するインシデント (2026-05-09 観測) を構造的に防ぐため、
+    fix loop の deliverables 置換ブロックで本判定を使う。プロンプト指示への依存ゼロ
+    の決定論的処理として実装する。
+
+    本タスクのスコープは「完全消失防止」に限定しており、要素レベルの検証
+    (例: 各要素が Notion block dict として valid か) は行わない。要素 malformed
+    (`[None, None]` 等) の検証は別タスクで扱う想定。
+
+    Returns:
+        - "missing_key": parsed に content_blocks キーが存在しない
+        - "none_value": parsed["content_blocks"] が None
+        - "non_list": parsed["content_blocks"] が list 型ではない
+        - "empty_list": parsed["content_blocks"] が空 list
+        - None: parsed["content_blocks"] が non-empty list (要素値は検証しない)
+    """
+    if "content_blocks" not in parsed:
+        return "missing_key"
+    value = parsed["content_blocks"]
+    if value is None:
+        return "none_value"
+    if not isinstance(value, list):
+        return "non_list"
+    if len(value) == 0:
+        return "empty_list"
+    return None
+
+
 def _load_prompt(name: str) -> str:
     """プロンプトファイルを読み込む"""
     return (PROMPTS_DIR / f"{name}.md").read_text()
@@ -1490,12 +1521,27 @@ class Orchestrator:
             if self._prompt_recorder is not None:
                 self._prompt_recorder.record("reviewer_fix", str(loop), fix_prompt, fix_raw)
             parsed = _parse_claude_response(fix_raw)
-            if parsed.get("parse_error"):
+            # parse_error 経路 / parsed が dict でない経路 (JSON array/scalar) はいずれも
+            # current_deliverables を据え置き、旧版を保持する。
+            # `_parse_claude_response` は非 str text や JSON array/scalar を parse_error なしで
+            # そのまま返す経路があり、parsed.get(...) で AttributeError を起こすため明示ガードする。
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    "Fix attempt produced non-dict response, keeping previous deliverables",
+                    extra={"loop": loop, "issues_count": len(errors), "parsed_type": type(parsed).__name__},
+                )
+            elif parsed.get("parse_error"):
                 logger.warning(
                     "Fix attempt produced unparseable response, keeping previous deliverables",
                     extra={"loop": loop, "issues_count": len(errors)},
                 )
             else:
+                # content_blocks 構造的保護: deliverables 置換前に旧版をスナップショット。
+                # fixer が content_blocks を omit / null / 空 list / 非 list で返した場合、
+                # 旧版 (non-empty list) を引き継ぐことで Notion 本文消失を防ぐ。
+                # 注: 旧版 list の要素が malformed (例: [None, None]) かどうかは本タスクでは検証しない
+                #     (スコープ「完全消失防止」)。要素レベル検証は別タスク扱い。
+                prev_content_blocks = current_deliverables.get("content_blocks")
                 preserved = {
                     k: current_deliverables[k] for k in _PRESERVED_DELIVERABLE_FIELDS if k in current_deliverables
                 }
@@ -1503,12 +1549,35 @@ class Orchestrator:
                 _accumulate_fixer_notes(accumulated_fixer_notes, parsed)
                 current_deliverables = parsed
                 current_deliverables.update(preserved)
+
+                fallback_reason = _classify_content_blocks_fallback_reason(parsed)
+                fallback_applied = (
+                    fallback_reason is not None
+                    and isinstance(prev_content_blocks, list)
+                    and bool(prev_content_blocks)
+                )
+                if fallback_applied:
+                    logger.warning(
+                        "Fix loop fixer omitted/invalid content_blocks; falling back to previous version",
+                        extra={
+                            "loop": loop,
+                            "reason": fallback_reason,
+                            "previous_blocks_count": len(prev_content_blocks),
+                        },
+                    )
+                    current_deliverables["content_blocks"] = prev_content_blocks
+
                 logger.info(
                     "Deliverables updated by review fix",
                     extra={
                         "loop": loop,
                         "issues_count": len(errors),
                         "preserved_fields": list(preserved.keys()),
+                        # 判定結果 (fixer 応答が無効値だったか) と実適用の有無を分けて記録する。
+                        # CloudWatch Logs Insights で集計時、fallback_reason だけ見ると
+                        # 「旧版自身も無効で fallback されなかったケース」が誤集計されるため。
+                        "content_blocks_fallback_reason": fallback_reason,
+                        "content_blocks_fallback_applied": fallback_applied,
                     },
                 )
 

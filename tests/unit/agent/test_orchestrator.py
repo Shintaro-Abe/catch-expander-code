@@ -893,6 +893,320 @@ class TestReviewLoop:
 
         assert result["passed"] is True
 
+    # ========================================================================
+    # fix loop での content_blocks 構造的保護
+    # 2026-05-09 インシデント (Notion 本文消失) を防ぐため、fixer 応答が
+    # content_blocks を omit / null / 空 list / 非 list で返した場合に
+    # 旧版を引き継ぐ条件付き fallback の動作を検証する。
+    #
+    # 既存 TestReviewLoop の他テストは call_codex を patch しておらず実 CLI が
+    # 呼ばれて parse_error になる pre-existing failure があるため、新規テストは
+    # call_codex (reviewer) と call_claude (fixer) の両方を patch する。
+    # call_codex は生 JSON 文字列を返し、call_claude は {"result": "..."} 形式を返す。
+    # ========================================================================
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_preserves_content_blocks_when_fixer_omits_key(self, mock_codex, mock_claude):
+        """fixer 応答に content_blocks キー自体が存在しない場合、旧版が維持される"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        # reviewer (call_codex): 1回目 fail → 2回目 pass
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        # fixer (call_claude): content_blocks キーを omit
+        mock_claude.return_value = json.dumps({"result": json.dumps({"summary": "fixed summary only"})})
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original-1"}, {"t": "original-2"}], "summary": "初版"}
+        _, final = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert final["content_blocks"] == [{"t": "original-1"}, {"t": "original-2"}]
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_preserves_content_blocks_when_fixer_returns_none(self, mock_codex, mock_claude):
+        """fixer 応答の content_blocks が None の場合、旧版が維持される"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        mock_claude.return_value = json.dumps(
+            {"result": json.dumps({"content_blocks": None, "summary": "fixed"})}
+        )
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+        _, final = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert final["content_blocks"] == [{"t": "original"}]
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_preserves_content_blocks_when_fixer_returns_empty_list(self, mock_codex, mock_claude):
+        """fixer 応答の content_blocks が空 list の場合、旧版が維持される"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        mock_claude.return_value = json.dumps(
+            {"result": json.dumps({"content_blocks": [], "summary": "fixed"})}
+        )
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+        _, final = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert final["content_blocks"] == [{"t": "original"}]
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_preserves_content_blocks_when_fixer_returns_non_list(self, mock_codex, mock_claude):
+        """fixer 応答の content_blocks が非 list (string) の場合、旧版が維持される"""
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        mock_claude.return_value = json.dumps(
+            {"result": json.dumps({"content_blocks": "not a list", "summary": "fixed"})}
+        )
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+        _, final = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        assert final["content_blocks"] == [{"t": "original"}]
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_uses_fixer_content_blocks_when_valid(self, mock_codex, mock_claude, caplog):
+        """fixer 応答の content_blocks が valid な non-empty list の場合、fixer 版が採用される (regression 防止)"""
+        import logging
+
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        mock_claude.return_value = json.dumps(
+            {"result": json.dumps({"content_blocks": [{"t": "fixer-version"}], "summary": "fixed"})}
+        )
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+
+        with caplog.at_level(logging.INFO, logger="catch-expander-agent"):
+            _, final = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        # fix loop 本来の機能: fixer の修正版が採用される
+        assert final["content_blocks"] == [{"t": "fixer-version"}]
+        # info ログ contract: valid fixer ケースは reason=None / applied=False
+        info_records = [
+            r for r in caplog.records if "Deliverables updated by review fix" in r.getMessage()
+        ]
+        assert len(info_records) == 1
+        assert info_records[0].content_blocks_fallback_reason is None
+        assert info_records[0].content_blocks_fallback_applied is False
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_logs_warning_on_fallback(self, mock_codex, mock_claude, caplog):
+        """fallback 発動時に warning ログが loop / reason / previous_blocks_count を含めて記録される"""
+        import logging
+
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        # fixer が content_blocks=None で fallback 発動
+        mock_claude.return_value = json.dumps(
+            {"result": json.dumps({"content_blocks": None, "summary": "fixed"})}
+        )
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original-a"}, {"t": "original-b"}], "summary": "初版"}
+
+        with caplog.at_level(logging.INFO, logger="catch-expander-agent"):
+            orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        fallback_records = [
+            r for r in caplog.records
+            if "Fix loop fixer omitted/invalid content_blocks" in r.getMessage()
+        ]
+        assert len(fallback_records) == 1
+        rec = fallback_records[0]
+        assert rec.levelno == logging.WARNING
+        assert rec.reason == "none_value"
+        assert rec.previous_blocks_count == 2
+        assert rec.loop == 0
+
+        # info ログ contract: fallback 発動ケースは reason="none_value" / applied=True
+        info_records = [
+            r for r in caplog.records if "Deliverables updated by review fix" in r.getMessage()
+        ]
+        assert len(info_records) == 1
+        assert info_records[0].content_blocks_fallback_reason == "none_value"
+        assert info_records[0].content_blocks_fallback_applied is True
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_keeps_previous_when_fixer_returns_non_dict(self, mock_codex, mock_claude, caplog):
+        """fixer 応答が JSON array/scalar (非 dict) の場合、AttributeError を起こさず旧版を保持する。
+
+        `_parse_claude_response` は valid JSON でも `[]`, `"text"`, `123` 等を parse_error なしで
+        そのまま返す経路があり、`parsed.get(...)` で AttributeError になる pre-existing リスク。
+        Codex レビュー (1 回目, P1) の指摘に対する構造保護。
+        """
+        import logging
+
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        # fixer が JSON array を返す (非 dict)。`_parse_claude_response` は `[]` をそのまま返す。
+        mock_claude.return_value = json.dumps({"result": "[]"})
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+
+        with caplog.at_level(logging.WARNING, logger="catch-expander-agent"):
+            # AttributeError を起こさず loop が完走すること
+            result, final = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        # 旧版 deliverables が維持されること
+        assert final["content_blocks"] == [{"t": "original"}]
+        assert final["summary"] == "初版"
+        # 適切な warning が出ていること
+        non_dict_records = [
+            r for r in caplog.records
+            if "Fix attempt produced non-dict response" in r.getMessage()
+        ]
+        assert len(non_dict_records) == 1
+        assert non_dict_records[0].parsed_type == "list"
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_keeps_previous_on_parse_error_branch(self, mock_codex, mock_claude, caplog):
+        """fixer 応答が parse_error の場合、旧版 deliverables が保持される (3 分岐の B 分岐網羅)。
+
+        既存 test_run_review_loop_keeps_previous_on_parse_error は call_codex の patch 忘れで
+        pre-existing failure になっているため、本 steering で分岐 B 専用の網羅テストを新規追加する。
+        Codex レビュー (2 回目, P1) の指摘に対する構造保護。
+        """
+        import logging
+
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        # fixer が parse_error になる応答 (raw_text に変換される)
+        mock_claude.return_value = json.dumps({"result": "this is not valid json at all"})
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
+
+        with caplog.at_level(logging.WARNING, logger="catch-expander-agent"):
+            _, final = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        # 旧版 deliverables が維持される
+        assert final["content_blocks"] == [{"t": "original"}]
+        assert final["summary"] == "初版"
+        # parse_error 専用 warning が出る (非 dict warning ではない)
+        parse_err_records = [
+            r for r in caplog.records
+            if "Fix attempt produced unparseable response" in r.getMessage()
+        ]
+        assert len(parse_err_records) == 1
+
+    @patch("orchestrator.call_claude")
+    @patch("orchestrator.call_codex")
+    def test_fix_loop_does_not_apply_fallback_when_previous_also_invalid(
+        self, mock_codex, mock_claude, caplog
+    ):
+        """旧版 content_blocks 自体が無効な場合、fallback は実施されない (info ログで applied=False)。
+
+        fix loop の最初の iteration で generator 応答時点で既に content_blocks が空だった場合、
+        fixer も content_blocks を omit すると、fallback 発動条件
+        `isinstance(prev, list) and bool(prev)` が False で fallback されない。
+        Codex レビュー (2 回目, P2) の info ログ contract 検証。
+        """
+        import logging
+
+        from orchestrator import Orchestrator
+
+        issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps(
+                {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
+            ),
+        ]
+        # fixer が content_blocks=None で fallback の判定対象だが、旧版も無効なため fallback 発動せず
+        mock_claude.return_value = json.dumps(
+            {"result": json.dumps({"content_blocks": None, "summary": "fixed"})}
+        )
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        # 旧版自身が無効値 (空 list)
+        original = {"content_blocks": [], "summary": "初版"}
+
+        with caplog.at_level(logging.INFO, logger="catch-expander-agent"):
+            orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
+
+        # warning ログは出ない (fallback 発動条件を満たさないため)
+        fallback_records = [
+            r for r in caplog.records
+            if "Fix loop fixer omitted/invalid content_blocks" in r.getMessage()
+        ]
+        assert len(fallback_records) == 0
+
+        # info ログ contract: reason="none_value" だが applied=False で「諦め」を表現
+        info_records = [
+            r for r in caplog.records if "Deliverables updated by review fix" in r.getMessage()
+        ]
+        assert len(info_records) == 1
+        assert info_records[0].content_blocks_fallback_reason == "none_value"
+        assert info_records[0].content_blocks_fallback_applied is False
+
 
 class TestCodeGeneration:
     """コード成果物のタイプ別独立生成テスト（M3）"""

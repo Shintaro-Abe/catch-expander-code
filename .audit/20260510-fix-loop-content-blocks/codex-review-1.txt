@@ -1,0 +1,42 @@
+## P1 (必修正)
+- [非 dict fixer 応答で review loop が落ちる] valid JSON だが dict ではない fixer 応答が `parse_error` 経路に入らず、`parsed.get(...)` で `AttributeError` になります (該当箇所: `src/agent/orchestrator.py:1519`)
+  詳細: `_parse_claude_response` は `[]`, `"text"`, `123` などを `parse_error` なしで返し得ます。現状は直後に `parsed.get("parse_error")` を呼ぶため、fixer 応答が JSON array/scalar に崩れた場合、旧 deliverables を保持できず loop 自体が abort します。
+  根拠: `src/agent/orchestrator.py:386-409` で `text` 非 str や `json.loads(text.strip())` の戻りを型検査せず返しています。
+  推奨修正: `parsed = _parse_claude_response(fix_raw)` の直後に `if not isinstance(parsed, dict):` ガードを追加し、warning を出して previous deliverables を維持してください。あわせて JSON array/scalar のテストを 1 ケース追加するのが妥当です。
+
+## P2 (推奨修正)
+- [content_blocks の “valid” 判定が実装より強く書かれている] `[None, None]` や `["x"]` が valid 扱いになります (該当箇所: `src/agent/orchestrator.py:141`, `src/agent/orchestrator.py:148-152`)
+  詳細: docstring は “valid な non-empty list” としていますが、実装は “non-empty list” だけを見ています。Notion block として malformed な list が fixer から返ると、旧本文を捨てて malformed な本文へ置換されます。
+  根拠: `notion_client.create_page` は `content_blocks` を children として渡すため、要素が Notion block dict でない場合はページ作成失敗または本文破損につながり得ます。
+  推奨修正: 今回のスコープを「完全消失防止」に限定するなら docstring を “non-empty list” に下げる。構造保護をもう一段強めるなら、少なくとも `all(isinstance(block, dict) and isinstance(block.get("type"), str) for block in value)` 程度を invalid 扱いにする。
+
+- [観測フィールド名が fallback 実施有無と理由を混同している] `content_blocks_fallback` が「fallback 未適用でも reason」を持ち得ます (該当箇所: `src/agent/orchestrator.py:1538-1560`)
+  詳細: `prev_content_blocks` が空または invalid の場合、`fallback_reason` は非 None でも fallback は実施されません。それでも info ログでは `content_blocks_fallback: "empty_list"` のように出ます。
+  推奨修正: `content_blocks_fallback_reason` と `content_blocks_fallback_applied` を分けると CloudWatch Logs Insights で誤集計しにくくなります。
+
+- [テストに non-dict parsed ケースがない] 今回の構造保護目的に対して、LLM 応答崩れの代表ケースが未カバーです (該当箇所: `tests/unit/agent/test_orchestrator.py:908-1059`)
+  詳細: omit/null/empty/non-list property は網羅されていますが、fixer 応答全体が JSON array/scalar のケースがありません。
+  推奨修正: `{"result": "[]"}` または `{"result": "\"oops\""}` を返し、旧 deliverables が維持され warning が出ることを検証してください。
+
+## P3 (情報提供)
+- 旧 `content_blocks` のスナップショットタイミングは正しいです (該当箇所: `src/agent/orchestrator.py:1529`)
+  `current_deliverables = parsed` の前に取得しており、fallback 元を失いません。
+
+- `code_files` preserve 契約は壊れていません (該当箇所: `src/agent/orchestrator.py:1530-1536`)
+  `current_deliverables.update(preserved)` の順序も従来どおりで、fixer が `code_files` を返しても旧版が優先されます。
+
+- valid non-empty list を fixer 版として採用する regression 防止は押さえられています (該当箇所: `tests/unit/agent/test_orchestrator.py:1002-1022`)
+
+- warning ログの `loop / reason / previous_blocks_count` は集計に十分です (該当箇所: `src/agent/orchestrator.py:1544-1551`)
+  ただし P2 のとおり、info 側は applied/reason を分けるとさらに明確です。
+
+- 手元では `pytest` が環境に存在せず実行確認できませんでした: `/bin/bash: pytest: command not found`
+
+## 総合評価
+- 構造保護ロジックの正当性: ⚠️
+- fix loop 本来機能保持: ✅
+- テストカバレッジ: ⚠️
+- 対症療法アンチパターン回避: ✅
+
+## 結論
+- マージ可否: 条件付き可 (P1 対応後)

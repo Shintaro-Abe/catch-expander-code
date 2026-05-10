@@ -1,0 +1,31 @@
+## P1 (必修正)
+- [tests/unit/agent/test_orchestrator.py:438](/workspaces/Catch-Expander/tests/unit/agent/test_orchestrator.py:438) の既存 `test_run_review_loop_keeps_previous_on_parse_error` が現在の `_run_review_loop` 実装に追従しておらず、分岐 B (`parsed.get("parse_error")`) の網羅になっていません。`_run_review_loop` は reviewer 側で `call_codex` を呼ぶため、このテストは `call_claude` だけを patch しても reviewer 応答を制御できません。実際に `.venv/bin/pytest tests/unit/agent/test_orchestrator.py::TestReviewLoop -k "fix_loop_ or keeps_previous_on_parse_error" -q` を実行すると、7 passed / 1 failed でこのテストが `KeyError: 'passed'` になります。
+  - 修正案: `@patch("orchestrator.call_codex")` を追加し、`mock_codex.side_effect = [failing_review, passing_review]`、`mock_claude.return_value = {"result": "this is not valid json at all"}` の形に分離してください。これで 3 分岐の B が実際に固定できます。
+
+## P2 (推奨修正)
+- [tests/unit/agent/test_orchestrator.py:1026](/workspaces/Catch-Expander/tests/unit/agent/test_orchestrator.py:1026) の fallback ログ検証は warning 側のみで、今回追加した `content_blocks_fallback_reason` / `content_blocks_fallback_applied` を出す info ログを assert していません。CloudWatch 集計の契約を守る目的なら、`Deliverables updated by review fix` の record に対して少なくとも以下を確認した方がよいです。
+  - fallback 発動: `reason == "none_value"` / `applied is True`
+  - valid fixer: `reason is None` / `applied is False`
+  - 旧版も無効で諦めるケース: `reason != None` / `applied is False`
+
+## P3 (情報提供)
+- P1 の非 dict ガード自体は `if not isinstance(parsed, dict)` で適切です。`[]`, `"text"`, `123` はすべて AttributeError を避けて旧版保持に落ちます。
+- `bool(prev_content_blocks)` は意図に合っています。`isinstance(prev_content_blocks, list)` と組み合わせているため、「旧版が non-empty list のときだけ fallback 適用」という契約が明確です。
+- docstring は「完全消失防止」にスコープを下げており、`[None, None]` 等の malformed 要素を対象外にする説明も十分です。具体例を足す余地はありますが、必須ではありません。
+- `content_blocks_fallback_reason` / `content_blocks_fallback_applied` の命名は CloudWatch Logs Insights で集計しやすいです。`applied=true`、`reason != null and applied=false`、`reason = null` の 3 系統を分けられます。
+- 3 commit ルールについては、コード上も「プロンプト依存ではなく fix loop の deliverables 置換ブロックで決定論的に守る」形になっており、同一層の対症療法というよりパイプライン境界の構造保護として説明可能です。
+
+## 1 回目指摘の解消状況
+- P1 (非 dict ガード): 解消 ✅
+- P2-1 (docstring 整合): 解消 ✅
+- P2-2 (フィールド分割): 解消 ✅
+- P2-3 (テスト追加): 部分解消 ⚠️
+
+## 多層ミス検出
+- 新規層の指摘あり
+- 内訳: 実装分岐は概ね妥当ですが、分岐 B の既存テストが `call_codex` 移行後の呼び出し構造に追従しておらず、3 分岐網羅の根拠が崩れています。加えて、新規観測フィールドの info ログ契約が未 assert です。
+
+## 結論
+- 収束判定: 3 回目要 (新規指摘あり)
+- マージ可否: 不可  
+  少なくとも parse_error 分岐テストの修正と再実行が必要です。
