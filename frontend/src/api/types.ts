@@ -162,11 +162,23 @@ export interface FeedbackAggregationResponse {
   data: FeedbackAggregation
 }
 
+// 2026-05-13: text generator workspace 化に伴い subagent literal を拡張
+// (.steering/20260512-parse-claude-response-dict-contract/)
+// - "generator_text": 新方式 (Write tool で deliverable.json に書く)
+// - "generator_code": 新方式 (code 成果物別パス)
+// - "generator": 後方互換 (旧 record / feature flag false 時)
 export interface SubagentIORecord {
-  subagent: "researcher" | "generator" | "reviewer_eval" | "reviewer_fix"
+  subagent:
+    | "researcher"
+    | "generator"
+    | "generator_text"
+    | "generator_code"
+    | "reviewer_eval"
+    | "reviewer_fix"
   index: string
   prompt: string
   output: string
+  output_files?: Record<string, string>
   recorded_at: string
 }
 

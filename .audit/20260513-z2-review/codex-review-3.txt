@@ -1,0 +1,41 @@
+## P1 (必修正)
+- なし
+
+## P2 (推奨修正)
+- なし
+
+## P3 (情報提供)
+- [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:1012): oversized preview はコメント上「300 bytes」ですが、実装は `fh.read(300)` なので「300 文字」です。メモリ/S3 抑制としては十分小さいためブロッカーではありませんが、表現は揃えるとよいです。
+- [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:1313): `workflow_planned.payload.planned_subagents` はまだ `["researcher", "generator", "reviewer"]` です。Dashboard は JSON 表示のみなので壊れませんが、taxonomy を完全に寄せるなら別 steering で `generator_text` / `generator_code` 表現を検討できます。
+- `ExecutionDetail.tsx` の Vitest 表示分岐テストは未追加です。今回の差分は型と build で最低限担保でき、ロジックも単純な filter/render なので、本 steering の P2 にはしません。Dashboard UI 回帰テスト整備として別 steering 扱いが妥当です。
+
+## 2 回目指摘の解消状況
+- P2-1 補強 (read/record 上限): 解消 ✅  
+  [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:1006) で `stat()` 先行、超過時は full read せず preview のみ。検証層も [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:221) で `oversize` 先勝ち、[src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:228) で default 引数評価問題を回避しています。
+- P2-2 (Dashboard 追従): 解消 ✅  
+  型 literal、filter、種別表示、`output_files` 展開、Lambda ordering とも追従済み。旧 `generator` record も保持されています。
+- P3-1 / P3-2 (run() 統合テスト判断): 妥当  
+  `run()` は mock 面が広く、現段階では helper 単体 + T-17 実機検証に寄せる判断で十分です。
+- P3-3 (コメント整合): 解消 ✅
+
+## 多層ミス検出
+- 新規層の指摘あり: P3 のみ
+- 内訳: frontend Vitest 未追加、preview の byte/char 表現差、`planned_subagents` の旧 taxonomy 残り。いずれも merge 判断を止める P1/P2 ではありません。
+- `subagent_completed` の Dashboard 集計クエリ破壊は確認できませんでした。`get_execution_events` は execution_id 時系列 query のみで、`subagent=generator` 固定条件はありません。
+
+## ステアリング遵守 (AC + 確定事項)
+- すべて反映 ✅
+- AC-5 Dashboard frontend 改修も T-12/T-13 として完了扱いでよいです。
+
+## 終結策としての論証
+- コードレベルで支えられている ✅
+- text generator は workspace 経路で `deliverable.json` を読み、検証層 + retry に入る構造になっています。旧 stdout JSON parse 経路は `WORKSPACE_TEXT_GEN=false` の切り戻し時のみです。
+- oversized / invalid JSON / schema 不備も retry 対象として検出でき、Part 分割応答対策としての境界変更は成立しています。
+
+## 結論
+- 収束判定: 収束 (新規 P1/P2 ゼロ)
+- マージ可否: 可
+
+確認コマンド:
+- `uv run pytest tests/unit/agent/test_orchestrator.py::TestTextGeneratorWorkspace tests/unit/observability/test_prompt_recorder.py -q` → 27 passed
+- `npm run build` → 成功。Vite の chunk size warning は既存系の警告で、この差分のブロッカーではありません。

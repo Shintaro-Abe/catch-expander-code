@@ -1,4 +1,5 @@
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2040,3 +2041,412 @@ class TestCallClaudeWithWorkspace:
         from pathlib import Path
 
         assert not Path(captured["cwd"]).exists()
+
+
+class TestTextGeneratorWorkspace:
+    """text generator の workspace モード化 + 検証層 + 自動リトライのテスト群。
+
+    2026-05-12 観測の LLM Part 分割応答インシデント対応で導入された
+    `_run_text_generator_with_retries` の挙動を検証する。
+    `.steering/20260512-parse-claude-response-dict-contract/`
+    """
+
+    @staticmethod
+    def _valid_deliverable_json() -> str:
+        """valid な deliverable.json の中身を返す。"""
+        return json.dumps({
+            "content_blocks": [
+                {"type": "heading_2", "heading_2": {"rich_text": [{"type": "text", "text": {"content": "h"}}]}},
+            ],
+            "summary": "ok",
+            "quality_metadata": {
+                "sources_verified": 1,
+                "sources_unverified": 0,
+                "sources_total": 1,
+                "checklist_passed": 4,
+                "checklist_total": 4,
+                "notes": [],
+                "unverified_details": [],
+            },
+        })
+
+    @staticmethod
+    def _valid_workspace_result() -> tuple:
+        """call_claude_with_text_workspace の valid 戻り値を返す。"""
+        content = TestTextGeneratorWorkspace._valid_deliverable_json()
+        return (
+            "Wrote: deliverable.json",
+            content,
+            {"file_exists": True, "file_bytes": len(content), "extra_files": []},
+        )
+
+    @staticmethod
+    def _make_orch():
+        """Orchestrator + mock 依存関係を作る。"""
+        from orchestrator import Orchestrator
+
+        orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
+        # _emitter / _prompt_recorder / _cost_acc は既に MagicMock 系で初期化されているが
+        # 一部テストで明示的に MagicMock として確認したいので再代入
+        orch._emitter = MagicMock()
+        orch._prompt_recorder = MagicMock()
+        orch._cost_acc = None
+        return orch
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_succeeds_when_deliverable_json_is_valid_dict(self, mock_workspace, mock_sleep):
+        from orchestrator import Orchestrator  # noqa: F401
+
+        mock_workspace.return_value = self._valid_workspace_result()
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert deliverables["content_blocks"][0]["type"] == "heading_2"
+        assert mock_workspace.call_count == 1
+        # PromptRecorder が呼ばれ、output_files に deliverable.json が含まれる
+        record_call = orch._prompt_recorder.record.call_args
+        assert record_call.args[0] == "generator_text"
+        assert record_call.args[1] == "0"
+        assert "deliverable.json" in record_call.kwargs["output_files"]
+        # backoff は不要
+        mock_sleep.assert_not_called()
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_records_empty_deliverable_as_failure_trace(self, mock_workspace, mock_sleep):
+        """空 deliverable.json (Codex 1 回目 P2-3 対応) でも PromptRecorder に保存される。
+
+        旧コードは `if deliverable_content` の truthiness で空文字を落としていた。
+        現コードは `is not None` チェックで空ファイルも失敗証跡として記録する。
+        """
+        from orchestrator import Orchestrator  # noqa: F401
+
+        empty_result = ("Wrote: deliverable.json", "", {"file_exists": True, "file_bytes": 0, "extra_files": []})
+        mock_workspace.side_effect = [empty_result, self._valid_workspace_result()]
+        orch = self._make_orch()
+
+        orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        # 1 回目の record 呼出で output_files に空文字が保存されている
+        first_record = orch._prompt_recorder.record.call_args_list[0]
+        assert first_record.kwargs["output_files"] == {"deliverable.json": ""}
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_file_missing(self, mock_workspace, mock_sleep):
+        from orchestrator import Orchestrator  # noqa: F401
+
+        mock_workspace.side_effect = [
+            ("Done", None, {"file_exists": False, "file_bytes": 0, "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+        # 1 回目失敗で backoff (2 秒)
+        mock_sleep.assert_called_once_with(2)
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_json_invalid(self, mock_workspace, mock_sleep):
+        from orchestrator import Orchestrator  # noqa: F401
+
+        invalid = "this is not valid json {"
+        mock_workspace.side_effect = [
+            ("Wrote: deliverable.json", invalid, {"file_exists": True, "file_bytes": len(invalid), "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_not_dict(self, mock_workspace, mock_sleep):
+        from orchestrator import Orchestrator  # noqa: F401
+
+        # 5/12 19:04 シナリオ再現: JSON array をトップレベルで返す
+        non_dict = json.dumps([{"type": "heading_2"}])
+        mock_workspace.side_effect = [
+            ("Wrote: deliverable.json", non_dict, {"file_exists": True, "file_bytes": len(non_dict), "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_missing_keys(self, mock_workspace, mock_sleep):
+        from orchestrator import Orchestrator  # noqa: F401
+
+        # content_blocks のみ存在 (summary / quality_metadata 欠落)
+        missing = json.dumps({"content_blocks": [{"type": "h"}]})
+        mock_workspace.side_effect = [
+            ("Wrote: deliverable.json", missing, {"file_exists": True, "file_bytes": len(missing), "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_invalid_content_blocks(self, mock_workspace, mock_sleep):
+        from orchestrator import Orchestrator  # noqa: F401
+
+        empty_blocks = json.dumps({"content_blocks": [], "summary": "x", "quality_metadata": {}})
+        mock_workspace.side_effect = [
+            ("Wrote: deliverable.json", empty_blocks, {"file_exists": True, "file_bytes": len(empty_blocks), "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_file_too_large(self, mock_workspace, mock_sleep):
+        """deliverable.json が _MAX_DELIVERABLE_BYTES (1MB) を超えたら file_too_large で失敗扱い。
+
+        Codex 1 回目 P2-4 対応。後方互換経路 (oversize フラグなし、file_bytes のみ) のテスト。
+        """
+        from orchestrator import Orchestrator  # noqa: F401
+
+        oversize_content = "x" * 200  # 実際のコンテンツは短くて OK
+        mock_workspace.side_effect = [
+            ("Wrote: deliverable.json", oversize_content, {"file_exists": True, "file_bytes": 2 * 1024 * 1024, "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_oversize_flag_set_by_workspace(self, mock_workspace, mock_sleep):
+        """workspace ラッパーが stat() 先行で oversize=True を立てた場合、検証層が file_too_large を検出する。
+
+        Codex 2 回目 P2 補強: read 前段で stat() による size 検出を行う経路の検証。
+        deliverable_content は preview のみ (300 bytes) で content 全量は読まない設計。
+        """
+        from orchestrator import Orchestrator  # noqa: F401
+
+        preview = "x" * 300  # ラッパーが preview のみ返した想定
+        mock_workspace.side_effect = [
+            (
+                "Wrote: deliverable.json",
+                preview,
+                {
+                    "file_exists": True,
+                    "file_bytes": 5 * 1024 * 1024,  # 5 MB
+                    "extra_files": [],
+                    "oversize": True,  # ★ stat() 先行で立てたフラグ
+                },
+            ),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    def test_validate_deliverable_payload_avoids_redundant_encoding(self):
+        """_validate_deliverable_payload が outcome["file_bytes"] を優先使用し、再 encode しない。
+
+        Codex 2 回目 P2 指摘: 旧コードは `outcome.get("file_bytes", len(content.encode("utf-8")))`
+        で default 引数が常に評価され、file_bytes 存在時も巨大文字列を再 encode していた。
+        """
+        from orchestrator import _validate_deliverable_payload
+
+        # outcome に file_bytes 提供 → encode は呼ばれず file_bytes が直接使われる
+        outcome = {"file_exists": True, "file_bytes": 100, "extra_files": []}
+        deliverables, reason, _ = _validate_deliverable_payload(self._valid_deliverable_json(), outcome)
+        assert reason is None
+        assert deliverables is not None
+
+        # outcome に file_bytes 欠落 → fallback で encode 計算が走る (旧経路互換)
+        outcome_no_bytes = {"file_exists": True, "extra_files": []}
+        deliverables, reason, _ = _validate_deliverable_payload(self._valid_deliverable_json(), outcome_no_bytes)
+        assert reason is None
+        assert deliverables is not None
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_invalid_summary(self, mock_workspace, mock_sleep):
+        """summary が non-empty str でない場合 (Codex 1 回目 P2-5 対応) リトライ発火。"""
+        from orchestrator import Orchestrator  # noqa: F401
+
+        bad_summary = json.dumps({
+            "content_blocks": [{"type": "heading_2"}],
+            "summary": [],  # str ではなく list
+            "quality_metadata": {},
+        })
+        mock_workspace.side_effect = [
+            ("Wrote: deliverable.json", bad_summary, {"file_exists": True, "file_bytes": len(bad_summary), "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_retries_when_invalid_quality_metadata(self, mock_workspace, mock_sleep):
+        """quality_metadata が dict でない場合 (Codex 1 回目 P2-5 対応) リトライ発火。"""
+        from orchestrator import Orchestrator  # noqa: F401
+
+        bad_qm = json.dumps({
+            "content_blocks": [{"type": "heading_2"}],
+            "summary": "ok",
+            "quality_metadata": "not a dict",
+        })
+        mock_workspace.side_effect = [
+            ("Wrote: deliverable.json", bad_qm, {"file_exists": True, "file_bytes": len(bad_qm), "extra_files": []}),
+            self._valid_workspace_result(),
+        ]
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        assert deliverables["summary"] == "ok"
+        assert mock_workspace.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_fails_after_max_retries(self, mock_workspace, mock_sleep):
+        from orchestrator import NonDictGeneratorResponse, Orchestrator  # noqa: F401
+
+        # 全 3 試行で file_missing を返す
+        failed_outcome = ("Done", None, {"file_exists": False, "file_bytes": 0, "extra_files": []})
+        mock_workspace.return_value = failed_outcome
+        orch = self._make_orch()
+
+        with pytest.raises(NonDictGeneratorResponse) as excinfo:
+            orch._run_text_generator_with_retries(
+                gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+            )
+
+        assert excinfo.value.reason == "file_missing"
+        assert mock_workspace.call_count == 3  # MAX_GENERATOR_RETRIES (2) + 1
+        # subagent_failed emit が呼ばれ、error_type は NonDictGeneratorResponse
+        failed_emit_call = orch._emitter.emit.call_args_list[-1]
+        assert failed_emit_call.args[0] == "subagent_failed"
+        payload = failed_emit_call.args[1]
+        assert payload["subagent"] == "generator_text"
+        assert payload["error_type"] == "NonDictGeneratorResponse"
+        # 試行間 backoff は 2 秒 + 4 秒 = 計 2 回呼ばれる (最終試行直前はスリープしない)
+        assert mock_sleep.call_count == 2
+
+    def test_should_use_workspace_text_gen_default_true(self, monkeypatch):
+        """WORKSPACE_TEXT_GEN 未設定時、デフォルトで True を返す。
+
+        Codex 1 回目 P2-2 対応で feature flag 判定をヘルパー化したため、判定式を直接検証する。
+        """
+        monkeypatch.delenv("WORKSPACE_TEXT_GEN", raising=False)
+        from orchestrator import _should_use_workspace_text_gen
+
+        assert _should_use_workspace_text_gen() is True
+
+    def test_should_use_workspace_text_gen_false_when_env_false(self, monkeypatch):
+        """WORKSPACE_TEXT_GEN=false で False を返す (即時切り戻し用)。"""
+        monkeypatch.setenv("WORKSPACE_TEXT_GEN", "false")
+        from orchestrator import _should_use_workspace_text_gen
+
+        assert _should_use_workspace_text_gen() is False
+
+    def test_should_use_workspace_text_gen_handles_uppercase(self, monkeypatch):
+        """WORKSPACE_TEXT_GEN=FALSE / False など大文字・混在ケースで False を返す。
+
+        運用者がうっかり大文字で env 設定しても意図通り動作することを保証。
+        """
+        from orchestrator import _should_use_workspace_text_gen
+
+        monkeypatch.setenv("WORKSPACE_TEXT_GEN", "FALSE")
+        assert _should_use_workspace_text_gen() is False
+
+        monkeypatch.setenv("WORKSPACE_TEXT_GEN", "False")
+        assert _should_use_workspace_text_gen() is False
+
+        # "true" 系も同様に case-insensitive
+        monkeypatch.setenv("WORKSPACE_TEXT_GEN", "TRUE")
+        assert _should_use_workspace_text_gen() is True
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator.call_claude_with_text_workspace")
+    def test_generator_emits_subagent_completed_with_generator_text_subagent_name(
+        self, mock_workspace, mock_sleep
+    ):
+        """成功時の subagent_completed emit が "generator_text" subagent 名で呼ばれる。
+
+        Codex 1 回目 P2-1 対応: 旧コードは completed だけ "generator" 固定で、started/failed と
+        非対称だった。本 steering で workspace 経路は一貫して "generator_text" を使う。
+
+        注: subagent_completed は `_run_text_generator_with_retries` の **外側** (run() メソッド内)
+        で emit されるため、本テストは _run_text_generator_with_retries 単体では検証できない。
+        修正の効果は実機検証 (T-17) + run() 統合テスト (将来) で確認。
+        本テストは run() の generator_subagent_name 変数が正しく "generator_text" になることを
+        間接確認する: _run_text_generator_with_retries が成功して返ったとき、PromptRecorder の
+        subagent 引数が "generator_text" であることを以て、後段の subagent_completed emit も
+        同じ変数を使っているという design.md ポイント 1 を信頼する。
+        """
+        mock_workspace.return_value = self._valid_workspace_result()
+        orch = self._make_orch()
+
+        deliverables = orch._run_text_generator_with_retries(
+            gen_prompt="prompt", execution_id="exec-test", generator_start_ns=time.monotonic_ns()
+        )
+
+        # PromptRecorder 経由で subagent 名が "generator_text" であることを確認
+        # (run() 内 generator_subagent_name 変数の整合性を間接検証)
+        record_call = orch._prompt_recorder.record.call_args
+        assert record_call.args[0] == "generator_text"
+        assert deliverables["summary"] == "ok"

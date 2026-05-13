@@ -1,6 +1,7 @@
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -49,6 +50,27 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 MAX_REVIEW_LOOPS = 2
 MAX_CLAUDE_RETRIES = 3
 MAX_CODEX_RETRIES = 3
+# 2026-05-12 観測の text generator Part 分割応答対策。CLI 単体の MAX_CLAUDE_RETRIES とは別レイヤで、
+# 「LLM 応答が valid な deliverable.json にならなかった時の再生成」を最大 2 回まで試みる
+# (合計 3 試行)。`.steering/20260512-parse-claude-response-dict-contract/` の AC-3 参照。
+MAX_GENERATOR_RETRIES = 2
+
+
+def _should_use_workspace_text_gen() -> bool:
+    """text generator の workspace モードが有効かを判定する。
+
+    2026-05-13: feature flag `WORKSPACE_TEXT_GEN` の解釈を一元化 (Codex 1 回目 P2-2 対応)。
+    `run()` 内のインライン判定だと flag 無視が実装側で起きてもテストが検出できないため、
+    本ヘルパーに抽出してユニットテストで判定式自体を直接検証できるようにする。
+
+    Returns:
+        True: workspace モード (Z-2 経路)
+        False: 旧 stdout 経路 (即時切り戻し用)
+
+    デフォルトは `True` (Z-2 が本番でも直ぐ有効)。`WORKSPACE_TEXT_GEN=false` で旧経路に
+    切り戻す。大文字/小文字は区別しない。
+    """
+    return os.environ.get("WORKSPACE_TEXT_GEN", "true").lower() == "true"
 CODEX_REVIEW_MODEL = "gpt-5.5"
 CLAUDE_ADVISOR_MODEL = "claude-opus-4-7"
 
@@ -123,6 +145,143 @@ def _extract_source_domains(sources: list[dict]) -> list[str]:
 # current_deliverables に代入すると iac_code/program_code 由来の code_files が失われる。
 # 修正適用後に明示的に引き継ぐ独立生成フィールドの一覧。
 _PRESERVED_DELIVERABLE_FIELDS = ("code_files",)
+
+
+class NonDictGeneratorResponse(RuntimeError):
+    """text generator が workspace モードで valid な ``deliverable.json`` を生成しなかった場合の例外。
+
+    2026-05-12 19:04 観測の TypeError (``list.pop("code_files", None)``) を構造的に防ぐため、
+    text generator workspace モード化と合わせて導入。生成失敗を **確定的に検出**し、
+    リトライまたは fail-fast の判断材料として ``reason`` / ``extras`` を保持する。
+
+    reason の値 (`` _validate_deliverable_payload`` と整合):
+
+    - ``"file_missing"``: ``deliverable.json`` が sandbox に存在しない
+    - ``"file_too_large"``: ``deliverable.json`` が ``_MAX_DELIVERABLE_BYTES`` を超過
+      (Codex 1 回目 P2-4 対応)
+    - ``"invalid_json"``: ファイル存在するが ``json.loads()`` で ``JSONDecodeError``
+    - ``"not_dict"``: JSON load 結果が dict でない (list / scalar / None)
+    - ``"missing_keys"``: 必須キー (content_blocks / summary / quality_metadata) のいずれかが欠落
+    - ``"invalid_content_blocks"``: ``content_blocks`` が空 list / 非 list
+    - ``"invalid_summary"``: ``summary`` が non-empty str でない (Codex 1 回目 P2-5 対応)
+    - ``"invalid_quality_metadata"``: ``quality_metadata`` が dict でない (Codex 1 回目 P2-5 対応)
+    - ``"exception"``: ``call_claude_with_text_workspace`` が予期せぬ例外を発生
+    """
+
+    def __init__(self, reason: str, **extras: Any) -> None:
+        self.reason = reason
+        self.extras = extras
+        msg = f"Text generator validation failed: reason={reason}, extras={extras}"
+        super().__init__(msg)
+
+
+# generator の deliverable.json で必須となるトップレベルキー。
+# `quality_metadata` の詳細スキーマはレビュアーが上書きするが、初期値の dict 存在は必須。
+_REQUIRED_DELIVERABLE_KEYS = ("content_blocks", "summary", "quality_metadata")
+
+
+def _validate_deliverable_payload(
+    deliverable_content: str | None,
+    outcome: dict,
+) -> tuple[dict | None, str | None, dict]:
+    """``deliverable.json`` の中身を検証し、 ``(deliverables, reason, extras)`` を返す。
+
+    検証順序:
+
+    A. ファイル不在 → ``"file_missing"``
+    F. ファイル過大 → ``"file_too_large"`` (Codex 1 回目 P2-4 対応)
+    B. JSON 不正 → ``"invalid_json"``
+    C. dict でない → ``"not_dict"`` + ``actual_type``
+    D. 必須キー欠落 → ``"missing_keys"`` + ``missing`` list
+    E. ``content_blocks`` が無効 (非 list / 空 list) → ``"invalid_content_blocks"``
+    G. ``summary`` が non-empty str でない → ``"invalid_summary"`` (Codex 1 回目 P2-5 対応)
+    H. ``quality_metadata`` が dict でない → ``"invalid_quality_metadata"`` (Codex 1 回目 P2-5 対応)
+
+    Returns:
+        ``(deliverables, reason, extras)`` のタプル。
+
+        - ``reason=None`` なら検証成功で ``deliverables`` は valid dict
+        - ``reason`` が非 None なら検証失敗で ``deliverables`` は ``None``、 ``extras`` に追加情報
+
+    Note:
+        本関数は直前 steering (20260510-fix-loop-content-blocks-preservation) の
+        ``_classify_content_blocks_fallback_reason`` と content_blocks 部分の判定ロジックが
+        重複している。将来共通化候補として記録 (新 steering メモリで明示)。
+    """
+    # A: ファイル不在
+    if not outcome.get("file_exists") or deliverable_content is None:
+        return None, "file_missing", {
+            "extra_files": outcome.get("extra_files", []),
+        }
+    # F: ファイル過大 (Codex 1 回目 P2-4 / 2 回目 P2 補強)。
+    # `call_claude_with_text_workspace` が stat() で先行検出し outcome["oversize"]=True を
+    # 立てているため、read/record 前段で既にメモリ膨張は防がれている。検証層は
+    # 観測情報を payload に含めて確実に fail-fast する。
+    # default 引数が常に評価される問題を避けるため `in` で先に存在確認する。
+    if outcome.get("oversize"):
+        file_bytes = outcome.get("file_bytes", 0)
+        return None, "file_too_large", {
+            "file_bytes": file_bytes,
+            "limit_bytes": _MAX_DELIVERABLE_BYTES,
+        }
+    # 後方互換: outcome に oversize / file_bytes 両方欠落のケースでも検査する
+    if "file_bytes" in outcome:
+        file_bytes = outcome["file_bytes"]
+    else:
+        file_bytes = len(deliverable_content.encode("utf-8"))
+    if file_bytes > _MAX_DELIVERABLE_BYTES:
+        return None, "file_too_large", {
+            "file_bytes": file_bytes,
+            "limit_bytes": _MAX_DELIVERABLE_BYTES,
+        }
+    # B: JSON load
+    try:
+        parsed = json.loads(deliverable_content)
+    except json.JSONDecodeError as e:
+        return None, "invalid_json", {
+            "json_error": str(e)[:200],
+            "content_preview": deliverable_content[:300],
+        }
+    # C: dict でない
+    if not isinstance(parsed, dict):
+        return None, "not_dict", {
+            "actual_type": type(parsed).__name__,
+            "content_preview": str(parsed)[:300],
+        }
+    # D: 必須キー欠落
+    missing = [k for k in _REQUIRED_DELIVERABLE_KEYS if k not in parsed]
+    if missing:
+        return None, "missing_keys", {
+            "missing": missing,
+            "present_keys": list(parsed.keys())[:20],
+        }
+    # E: content_blocks が無効
+    cb = parsed["content_blocks"]
+    if not isinstance(cb, list):
+        return None, "invalid_content_blocks", {
+            "actual_type": type(cb).__name__,
+        }
+    if len(cb) == 0:
+        return None, "invalid_content_blocks", {
+            "actual_type": "empty_list",
+        }
+    # G: summary が non-empty str でない (Codex 1 回目 P2-5 対応)。
+    # Slack 完了通知に流れるため、空 / list / int 等の不正値を検出して再生成する。
+    summary = parsed["summary"]
+    if not isinstance(summary, str) or not summary.strip():
+        return None, "invalid_summary", {
+            "actual_type": type(summary).__name__,
+            "is_empty": isinstance(summary, str) and not summary.strip(),
+        }
+    # H: quality_metadata が dict でない (Codex 1 回目 P2-5 対応)。
+    # reviewer が後段で上書きするが、generator 初期値として dict 型は必須。
+    qm = parsed["quality_metadata"]
+    if not isinstance(qm, dict):
+        return None, "invalid_quality_metadata", {
+            "actual_type": type(qm).__name__,
+        }
+    # 全 pass
+    return parsed, None, {}
 
 
 def _classify_content_blocks_fallback_reason(parsed: dict) -> str | None:
@@ -445,6 +604,13 @@ _CODE_TYPE_LABELS = {
 # 詳細: .steering/20260425-code-gen-redesign-filesystem/
 _MAX_FILE_BYTES = 100 * 1024
 _WORKSPACE_STDOUT_PREVIEW_LIMIT = 500
+# 2026-05-13: text generator の deliverable.json 上限 (Codex 1 回目 P2-4 / 2 回目 P2 対応)。
+# Notion 100 ブロック上限 + 1 ブロック平均 1-2KB を勘案して 1MB に設定。
+# 超過時は `_run_text_generator_with_retries` の汎用 retry 経路で扱われ、他の validation
+# failure (missing_keys 等) と同じく exp backoff 付きで最大 MAX_GENERATOR_RETRIES 回まで
+# 再生成される。LLM が再生成で valid サイズを返す確率的成功も期待できるため、特別扱い
+# (no-retry) はしない。
+_MAX_DELIVERABLE_BYTES = 1024 * 1024  # 1 MB
 
 _FILE_EXTENSIONS = {
     ".tf",
@@ -579,8 +745,9 @@ def call_claude_with_workspace(
     """Claude CLI に Write ツールを許可して sandbox にファイルを書かせ、収集結果を返す。
 
     旧 JSON 文字列値方式（call_claude + _parse_claude_response）が大規模コードの
-    エスケープミスで失敗するため、コード成果物のみこの経路を使う。テキスト成果物の
-    パスは call_claude のままで変更しない。
+    エスケープミスで失敗するため、コード成果物はこの経路を使う。
+    テキスト成果物 (deliverable.json) は ``call_claude_with_text_workspace`` を使う
+    (2026-05-13 改修、Part 分割応答対策、`.steering/20260512-parse-claude-response-dict-contract/`)。
 
     Args:
         emitter: T1-2b 追加。EventEmitter (None なら observability emit は no-op)。
@@ -681,6 +848,197 @@ def call_claude_with_workspace(
         files, rejected = _collect_workspace_files(sandbox)
         outcome = _classify_workspace_outcome(files, rejected)
         return raw_stdout, files, outcome
+    finally:
+        api_duration_ms = (time.monotonic_ns() - api_start_ns) // 1_000_000
+        ws_tok = ws_call_toks[0] or {}
+        _emit_api_call_completed(
+            emitter,
+            subtype="anthropic",
+            success=api_success,
+            duration_ms=api_duration_ms,
+            response_status_code=api_final_status,
+            endpoint_path=endpoint_path,
+            input_tokens=ws_tok.get("input_tokens"),
+            output_tokens=ws_tok.get("output_tokens"),
+            total_tokens=ws_tok.get("total_tokens"),
+        )
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def call_claude_with_text_workspace(
+    prompt: str,
+    *,
+    expected_filename: str = "deliverable.json",
+    model: str = "sonnet",
+    emitter: Any = None,
+    cost_acc: dict | None = None,
+) -> tuple[str, str | None, dict]:
+    """Claude CLI に Write ツールを許可して sandbox に deliverable.json を書かせ、内容を返す。
+
+    text 成果物用の workspace モード。code 成果物用 ``call_claude_with_workspace`` とは責務を分離する
+    (拡張子 whitelist 不要、単一ファイル想定、JSON 構造前提)。
+
+    2026-05-12 観測の LLM「Part 分割応答」(大規模トピックで stdout 巨大 JSON を返そうとして
+    確率的に Part 1/Part 2 分割を選び破綻するパターン) を構造的に回避するため、stdout JSON
+    方式から本方式に移行 (`.steering/20260512-parse-claude-response-dict-contract/`)。
+
+    Note (努力目標):
+        本関数は LLM が `expected_filename` に valid な JSON dict を書くことを **努力目標**
+        としてプロンプトで指示する。LLM 確率挙動依存のため、達成は保証されない。失敗ケース
+        (ファイル不在 / 不正 JSON 等) は呼び出し側で `_validate_deliverable_payload` を介して
+        検出し、リトライまたは fail-fast する責務がある。
+
+    Args:
+        prompt: ジェネレータープロンプト。`deliverable.json` への書き出し指示を含む想定。
+        expected_filename: LLM に書かせる期待ファイル名。デフォルト ``deliverable.json``。
+        model: 使用するモデル名 (Sonnet → 失敗時 Opus advisor へエスカレーション)。
+        emitter: T1-2b 追加。EventEmitter (None なら observability emit は no-op)。
+        cost_acc: コスト集計用辞書 (None なら集計しない)。
+
+    Returns:
+        ``(raw_stdout, deliverable_content, outcome)`` のタプル。
+
+        - ``raw_stdout``: Claude CLI の stdout 全文 (``Wrote: deliverable.json`` 等の Write 履歴)
+        - ``deliverable_content``: ``expected_filename`` の中身 (UTF-8 文字列)。書かれなかった
+          場合は ``None``
+        - ``outcome``: ``{"file_exists": bool, "file_bytes": int, "extra_files": list[str]}``。
+          ``extra_files`` は ``expected_filename`` 以外に書かれたファイル名のリスト (LLM の
+          指示違反検知用)。
+    """
+    sandbox = Path(tempfile.mkdtemp(prefix="agent-output-text-"))
+    api_start_ns = time.monotonic_ns()
+    api_success = False
+    api_final_status: int | None = None
+    endpoint_path = f"/claude/cli?model={model}&mode=workspace&kind=text"
+    ws_call_toks: list[dict[str, int] | None] = [None]
+    try:
+        cmd = [
+            "claude",
+            "-p",
+            "-",
+            "--model",
+            model,
+            "--allowedTools",
+            "Write,Edit",
+            "--output-format",
+            "json",
+        ]
+        last_error: subprocess.CalledProcessError | None = None
+        raw_stdout = ""
+        for attempt in range(MAX_CLAUDE_RETRIES):
+            try:
+                result = subprocess.run(  # noqa: S603
+                    cmd,
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    cwd=str(sandbox),
+                )
+                raw_stdout = result.stdout
+                api_success = True
+                api_final_status = result.returncode
+                ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
+                break
+            except subprocess.CalledProcessError as e:
+                last_error = e
+                api_final_status = e.returncode
+                wait = 2 ** (attempt + 1)
+                if _claude_stderr_indicates_rate_limit(e.stderr or ""):
+                    _emit_rate_limit_hit(
+                        emitter,
+                        subtype="anthropic_429",
+                        endpoint_path=endpoint_path,
+                        detail=f"stderr_snippet={(e.stderr or '')[:200]}",
+                    )
+                logger.warning(
+                    "Claude CLI error (text workspace mode), retrying | rc=%s | stderr=%s",
+                    e.returncode,
+                    (e.stderr or "")[:500],
+                    extra={"attempt": attempt + 1, "wait_seconds": wait},
+                )
+                time.sleep(wait)
+        else:
+            if last_error and model == "sonnet" and not _claude_stderr_indicates_rate_limit(last_error.stderr or ""):
+                advisor_cmd = [
+                    "claude", "-p", "-",
+                    "--model", CLAUDE_ADVISOR_MODEL,
+                    "--output-format", "json",
+                    "--allowedTools", "Write,Edit,Read",
+                ]
+                logger.warning(
+                    "Sonnet retries exhausted (text workspace mode), escalating to advisor model %s",
+                    CLAUDE_ADVISOR_MODEL,
+                    extra={"original_error": str(last_error)[:200]},
+                )
+                try:
+                    result = subprocess.run(  # noqa: S603
+                        advisor_cmd,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        cwd=str(sandbox),
+                    )
+                    raw_stdout = result.stdout
+                    api_success = True
+                    api_final_status = result.returncode
+                    ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
+                except subprocess.CalledProcessError:
+                    pass
+
+            if not api_success:
+                if last_error:
+                    raise last_error
+                msg = "Unexpected: no error and no response (text workspace mode)"
+                raise RuntimeError(msg)
+
+        expected_path = sandbox / expected_filename
+        file_exists = expected_path.is_file()
+        deliverable_content: str | None = None
+        file_bytes = 0
+        oversize = False
+        if file_exists:
+            try:
+                # 2026-05-13 Codex 2 回目 P2 補強: stat() を先に実行し、
+                # `_MAX_DELIVERABLE_BYTES` を超えるファイルは read せず preview のみ返す
+                # (read / PromptRecorder record の前段でメモリ / S3 容量増を防ぐ)。
+                file_bytes = expected_path.stat().st_size
+                if file_bytes > _MAX_DELIVERABLE_BYTES:
+                    oversize = True
+                    # 検証層が file_too_large を検出できるよう、短い preview のみ読む。
+                    # 検証層は outcome.oversize を優先的に見て fail 判定するため、
+                    # content は debug 情報として 300 文字 preview を保持する
+                    # (Codex 3 回目 P3-1: bytes ではなく文字数表記に揃える)。
+                    with expected_path.open("r", encoding="utf-8", errors="replace") as fh:
+                        deliverable_content = fh.read(300)
+                    logger.warning(
+                        "deliverable.json exceeds size limit; reading preview only",
+                        extra={"file_bytes": file_bytes, "limit_bytes": _MAX_DELIVERABLE_BYTES},
+                    )
+                else:
+                    deliverable_content = expected_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                logger.warning(
+                    "Failed to read deliverable.json from text workspace",
+                    extra={"error_type": type(e).__name__, "error_message": str(e)[:200]},
+                )
+                deliverable_content = None
+                file_exists = False
+                file_bytes = 0
+
+        extra_files: list[str] = []
+        for entry in sandbox.iterdir():
+            if entry.is_file() and entry.name != expected_filename:
+                extra_files.append(entry.name)
+
+        outcome = {
+            "file_exists": file_exists,
+            "file_bytes": file_bytes,
+            "extra_files": extra_files,
+            "oversize": oversize,
+        }
+        return raw_stdout, deliverable_content, outcome
     finally:
         api_duration_ms = (time.monotonic_ns() - api_start_ns) // 1_000_000
         ws_tok = ws_call_toks[0] or {}
@@ -1043,29 +1401,43 @@ class Orchestrator:
                 f"ユーザープロファイル:\n{profile_text}"
             )
             generator_start_ns = time.monotonic_ns()
+            # 2026-05-13 改修: text generator は workspace モードに移行 (LLM の Part 分割応答対策)。
+            # feature flag `WORKSPACE_TEXT_GEN=false` で旧 stdout JSON 経路に切り戻し可能。
+            # 詳細: .steering/20260512-parse-claude-response-dict-contract/
+            workspace_text_gen = _should_use_workspace_text_gen()
+            generator_subagent_name = "generator_text" if workspace_text_gen else "generator"
             self._emitter.emit(
                 "subagent_started",
-                {"subagent": "generator", "input_summary": f"category={category}"},
+                {"subagent": generator_subagent_name, "input_summary": f"category={category}"},
             )
-            try:
-                gen_raw = call_claude(gen_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
-                if self._prompt_recorder is not None:
-                    self._prompt_recorder.record("generator", "0", gen_prompt, gen_raw)
-                deliverables = _parse_claude_response(gen_raw)
-            except Exception as e:
-                self._emitter.emit(
-                    "subagent_failed",
-                    {
-                        "subagent": "generator",
-                        "stage": "text_generation",
-                        "duration_ms": (time.monotonic_ns() - generator_start_ns) // 1_000_000,
-                        "error_type": type(e).__name__,
-                        "error_message": str(e)[:500],
-                    },
-                    status_at_emit="failed",
+            if workspace_text_gen:
+                deliverables = self._run_text_generator_with_retries(
+                    gen_prompt=gen_prompt,
+                    execution_id=execution_id,
+                    generator_start_ns=generator_start_ns,
                 )
-                raise
+            else:
+                # 旧経路 (feature flag false 時の即時切り戻し用)
+                try:
+                    gen_raw = call_claude(gen_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
+                    if self._prompt_recorder is not None:
+                        self._prompt_recorder.record("generator", "0", gen_prompt, gen_raw)
+                    deliverables = _parse_claude_response(gen_raw)
+                except Exception as e:
+                    self._emitter.emit(
+                        "subagent_failed",
+                        {
+                            "subagent": "generator",
+                            "stage": "text_generation",
+                            "duration_ms": (time.monotonic_ns() - generator_start_ns) // 1_000_000,
+                            "error_type": type(e).__name__,
+                            "error_message": str(e)[:500],
+                        },
+                        status_at_emit="failed",
+                    )
+                    raise
             # ジェネレーターは text 成果物のみを返す。code_files は常に独立生成する
+            # (Z-2 後の deliverable.json スキーマには code_files は無いが、旧経路との互換のため pop は維持)
             deliverables.pop("code_files", None)
 
             # 5b. コード成果物のタイプ別独立生成（ファイル書き込み方式）
@@ -1092,7 +1464,13 @@ class Orchestrator:
                             prompt, code_type, emitter=self._emitter, cost_acc=self._cost_acc
                         )
                         if self._prompt_recorder is not None:
-                            self._prompt_recorder.record("generator", "0", prompt, raw_stdout)
+                            # 2026-05-13 改修 (派生 2 統合): 旧 record("generator", "0", ...) は
+                            # text generator と同じキーで上書きするバグがあった。code は
+                            # `generator_code/{code_type}` で分離する。
+                            self._prompt_recorder.record(
+                                "generator_code", code_type, prompt, raw_stdout,
+                                output_files=files if files else None,
+                            )
                     except Exception as e:
                         self._emitter.emit(
                             "subagent_failed",
@@ -1155,10 +1533,12 @@ class Orchestrator:
 
             generator_duration_ms = (time.monotonic_ns() - generator_start_ns) // 1_000_000
             code_files_for_emit = deliverables.get("code_files")
+            # 2026-05-13: subagent_started/failed と整合させる (Codex 1 回目 P2-1 対応)。
+            # workspace 経路では "generator_text"、旧経路では "generator" で emit する。
             self._emitter.emit(
                 "subagent_completed",
                 {
-                    "subagent": "generator",
+                    "subagent": generator_subagent_name,
                     "duration_ms": generator_duration_ms,
                     "tokens_used": None,
                     "output_summary": (
@@ -1411,6 +1791,120 @@ class Orchestrator:
             )
 
         return results
+
+    def _run_text_generator_with_retries(
+        self,
+        gen_prompt: str,
+        execution_id: str,
+        generator_start_ns: int,
+    ) -> dict:
+        """text generator を workspace モードで実行し、検証 + リトライを行う。
+
+        2026-05-12 観測の LLM「Part 分割応答」パターン (大規模トピックで stdout 巨大 JSON を返そう
+        として確率的に Part 1/Part 2 分割を選び破綻) を構造的に回避するため導入。
+        `.steering/20260512-parse-claude-response-dict-contract/`
+
+        Note (努力目標):
+            本メソッドは LLM が ``deliverable.json`` に valid な dict を書くことを **努力目標**
+            としてプロンプトで指示する。LLM 確率挙動依存のため、達成は保証されない。失敗ケース
+            (ファイル不在 / 不正 JSON / 必須キー欠落) は ``_validate_deliverable_payload`` で
+            確定的に検出し、最大 ``MAX_GENERATOR_RETRIES`` 回まで再生成を試みる。全試行失敗で
+            ``NonDictGeneratorResponse`` を raise する。
+
+            真の構造保証 (Anthropic API + Tool Use) は本 steering では採用しない (コスト不採用)。
+            本メソッドは「努力目標 + 検証層 + リトライ」の三身一体で実効的安定性を提供する。
+
+        Returns:
+            検証 pass 済みの valid な dict (必須キー ``content_blocks`` / ``summary``
+            / ``quality_metadata`` が存在し、 ``content_blocks`` は non-empty list)
+
+        Raises:
+            NonDictGeneratorResponse: 全 ``MAX_GENERATOR_RETRIES + 1`` 試行で検証失敗。
+                ``subagent_failed`` event 経由で dashboard / Slack 失敗通知に流れる。
+        """
+        last_reason: str | None = None
+        last_extras: dict = {}
+        for attempt in range(MAX_GENERATOR_RETRIES + 1):
+            try:
+                raw_stdout, deliverable_content, outcome = call_claude_with_text_workspace(
+                    gen_prompt, emitter=self._emitter, cost_acc=self._cost_acc
+                )
+                if self._prompt_recorder is not None:
+                    # 派生 2 統合: text generator は generator_text/0、code generator は generator_code/{type}
+                    # でキー分離 (orchestrator.py:1053 と 1095 が同キー "generator/0" で上書きする
+                    # pre-existing バグを解消)。
+                    # Codex 1 回目 P2-3 対応: 空ファイル ("") も失敗証跡として記録する
+                    # (truthiness `if deliverable_content` だと空文字が落ちる)
+                    self._prompt_recorder.record(
+                        "generator_text",
+                        "0",
+                        gen_prompt,
+                        raw_stdout,
+                        output_files=(
+                            {"deliverable.json": deliverable_content}
+                            if deliverable_content is not None
+                            else None
+                        ),
+                    )
+                deliverables, reason, extras = _validate_deliverable_payload(
+                    deliverable_content, outcome
+                )
+                if reason is None:
+                    logger.info(
+                        "Text generator succeeded",
+                        extra={
+                            "execution_id": execution_id,
+                            "attempt": attempt + 1,
+                            "file_bytes": outcome.get("file_bytes", 0),
+                        },
+                    )
+                    return deliverables  # type: ignore[return-value]
+                last_reason, last_extras = reason, extras
+                logger.warning(
+                    "Text generator validation failed",
+                    extra={
+                        "execution_id": execution_id,
+                        "attempt": attempt + 1,
+                        "reason": reason,
+                        **extras,
+                    },
+                )
+            except Exception as e:  # noqa: BLE001
+                last_reason = "exception"
+                last_extras = {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e)[:500],
+                }
+                logger.warning(
+                    "Text generator raised during workspace call",
+                    extra={
+                        "execution_id": execution_id,
+                        "attempt": attempt + 1,
+                        **last_extras,
+                    },
+                )
+
+            # exponential backoff (最終試行直前ではスリープしない)
+            if attempt < MAX_GENERATOR_RETRIES:
+                wait_seconds = 2 ** (attempt + 1)
+                time.sleep(wait_seconds)
+
+        # 全試行失敗
+        self._emitter.emit(
+            "subagent_failed",
+            {
+                "subagent": "generator_text",
+                "stage": "text_generation",
+                "duration_ms": (time.monotonic_ns() - generator_start_ns) // 1_000_000,
+                "error_type": "NonDictGeneratorResponse",
+                "error_message": (
+                    f"All {MAX_GENERATOR_RETRIES + 1} attempts failed: "
+                    f"reason={last_reason}, extras={last_extras}"
+                ),
+            },
+            status_at_emit="failed",
+        )
+        raise NonDictGeneratorResponse(reason=last_reason or "unknown", **last_extras)
 
     def _run_review_loop(
         self,

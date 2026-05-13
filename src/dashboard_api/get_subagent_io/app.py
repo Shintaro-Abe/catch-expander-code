@@ -10,7 +10,17 @@ from _common import error_response, json_response
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-_SUBAGENT_ORDER = {"researcher": 0, "generator": 1, "reviewer_eval": 2, "reviewer_fix": 3}
+# 2026-05-13: text generator workspace 化に伴い generator は text/code に分離
+# (.steering/20260512-parse-claude-response-dict-contract/)。
+# 旧 "generator" は後方互換のため同じ順序 (1) を共有する。
+_SUBAGENT_ORDER = {
+    "researcher": 0,
+    "generator_text": 1,
+    "generator": 1,  # 後方互換 (旧 record / feature flag false 時)
+    "generator_code": 2,
+    "reviewer_eval": 3,
+    "reviewer_fix": 4,
+}
 
 _s3 = boto3.client("s3")
 

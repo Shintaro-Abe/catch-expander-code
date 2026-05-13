@@ -592,6 +592,11 @@ Resources:
               Value: !Ref DashboardEventsTable
             - Name: PROMPTS_BUCKET
               Value: !Ref PromptsBucket
+            # 2026-05-13: text generator の workspace モード切替フラグ
+            # true (デフォルト): deliverable.json への Write tool 書き込み方式 (Z-2)
+            # false: 旧 stdout JSON 方式 (即時切り戻し用)
+            - Name: WORKSPACE_TEXT_GEN
+              Value: "true"
           LogConfiguration:
             LogDriver: awslogs
             Options:

@@ -45,16 +45,26 @@ class PromptRecorder:
         index: str,
         prompt: str,
         output: str,
+        *,
+        output_files: dict[str, str] | None = None,
     ) -> None:
         """サブエージェントのプロンプトと出力を S3 に書き込む (best-effort)。
 
         Args:
             subagent: サブエージェント種別。
-                "researcher" / "generator" / "reviewer_eval" / "reviewer_fix"
+                "researcher" / "generator_text" / "generator_code" / "reviewer_eval"
+                / "reviewer_fix" / "generator" (旧 record の後方互換キー、2026-05-13 改修前)。
+                2026-05-13 から text/code generator は ``generator_text`` / ``generator_code``
+                に分離 (旧 ``generator`` は同キー上書きバグの原因だったため廃止予定)。
             index: レコードの識別子。
-                researcher: step_id, generator: "0", reviewer_*: ループ番号文字列
+                researcher: step_id, generator_text: "0", generator_code: code_type,
+                reviewer_*: ループ番号文字列
             prompt: サブエージェントに渡したプロンプト全文。
             output: サブエージェントの出力全文（Claude CLI の stdout）。
+                workspace モードでは "Wrote: deliverable.json" 等の Write 履歴のみの場合あり。
+            output_files: 2026-05-13 改修で追加。workspace モード時に LLM が生成したファイル群
+                ({filename: content} の dict)。stdout モードでは ``None``。
+                Dashboard frontend で「ファイル一覧」表示に使う。
 
         Returns:
             None。書き込み成功/失敗は呼出元には伝えない (best-effort)。
@@ -70,6 +80,9 @@ class PromptRecorder:
             "output": output,
             "recorded_at": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         }
+        # output_files は workspace モード時のみ含める (None 時は省略、旧 record との後方互換維持)
+        if output_files:
+            body["output_files"] = output_files
         try:
             self._s3.put_object(
                 Bucket=self._bucket,

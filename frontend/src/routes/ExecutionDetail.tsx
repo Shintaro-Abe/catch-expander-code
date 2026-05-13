@@ -402,7 +402,11 @@ function SubagentIOSection({
   isLoading: boolean
 }) {
   const researchers = records.filter((r) => r.subagent === "researcher")
-  const generators  = records.filter((r) => r.subagent === "generator")
+  // 2026-05-13: text generator workspace 化に伴い generator は 3 種類 (text/code/旧) を一括表示
+  // (.steering/20260512-parse-claude-response-dict-contract/)
+  const generators  = records.filter(
+    (r) => r.subagent === "generator" || r.subagent === "generator_text" || r.subagent === "generator_code",
+  )
   const revEvals    = records.filter((r) => r.subagent === "reviewer_eval")
   const revFixes    = records.filter((r) => r.subagent === "reviewer_fix")
 
@@ -438,12 +442,39 @@ function SubagentIOSection({
             {generators.length > 0 && (
               <div>
                 <p className="text-xs font-medium text-foreground mb-2">ジェネレーター</p>
-                {generators.map((r) => (
-                  <div key={r.index} className="pl-3 border-l border-border space-y-1">
-                    <IOExpandable label="プロンプトを表示" content={r.prompt} />
-                    <IOExpandable label="出力を表示" content={r.output} />
-                  </div>
-                ))}
+                <div className="space-y-3">
+                  {generators.map((r) => {
+                    // 2026-05-13: workspace モードでは output_files に deliverable.json 等の
+                    // 生成ファイル中身が含まれる。stdout (output) は "Wrote: ..." 履歴のみ。
+                    // 旧 record (subagent="generator") は output_files なし、output に LLM 応答全文。
+                    const labelByType: Record<string, string> = {
+                      generator_text: "テキスト",
+                      generator_code: "コード",
+                      generator: "汎用 (旧形式)",
+                    }
+                    const heading = labelByType[r.subagent] ?? r.subagent
+                    return (
+                      <div key={`${r.subagent}_${r.index}`} className="pl-3 border-l border-border space-y-1">
+                        <p className="text-[11px] text-muted-foreground">
+                          種別: {heading}{r.index && r.index !== "0" ? ` / ${r.index}` : ""}
+                        </p>
+                        <IOExpandable label="プロンプトを表示" content={r.prompt} />
+                        <IOExpandable
+                          label={r.output_files ? "stdout を表示 (Write 履歴)" : "出力を表示"}
+                          content={r.output}
+                        />
+                        {r.output_files &&
+                          Object.entries(r.output_files).map(([filename, content]) => (
+                            <IOExpandable
+                              key={filename}
+                              label={`${filename} の中身を表示`}
+                              content={content}
+                            />
+                          ))}
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
             )}
 

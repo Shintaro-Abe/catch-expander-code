@@ -84,6 +84,74 @@ class TestPromptRecorderWithBucket:
         assert any("Failed to record prompt" in r.message for r in caplog.records)
 
 
+class TestPromptRecorderWithOutputFiles:
+    """2026-05-13 改修: output_files 引数とキー分離のテスト群。
+
+    `.steering/20260512-parse-claude-response-dict-contract/`
+    """
+
+    @patch("boto3.client")
+    def test_record_stores_output_files(self, mock_boto3, monkeypatch):
+        """output_files を渡したら S3 body に保存される (workspace モード対応)。"""
+        monkeypatch.setenv("PROMPTS_BUCKET", "test-prompts")
+        from src.observability.prompt_recorder import PromptRecorder
+
+        mock_s3 = MagicMock()
+        mock_boto3.return_value = mock_s3
+
+        recorder = PromptRecorder("exec-test-ws")
+        recorder.record(
+            "generator_text",
+            "0",
+            "prompt body",
+            "Wrote: deliverable.json",
+            output_files={"deliverable.json": '{"summary": "ok"}'},
+        )
+
+        body = json.loads(mock_s3.put_object.call_args.kwargs["Body"])
+        assert body["subagent"] == "generator_text"
+        assert body["output"] == "Wrote: deliverable.json"
+        assert body["output_files"] == {"deliverable.json": '{"summary": "ok"}'}
+
+    @patch("boto3.client")
+    def test_record_omits_output_files_when_none(self, mock_boto3, monkeypatch):
+        """output_files が None なら S3 body に含まれない (旧 record との後方互換)。"""
+        monkeypatch.setenv("PROMPTS_BUCKET", "test-prompts")
+        from src.observability.prompt_recorder import PromptRecorder
+
+        mock_s3 = MagicMock()
+        mock_boto3.return_value = mock_s3
+
+        recorder = PromptRecorder("exec-test-no-ws")
+        recorder.record("researcher", "step-001", "prompt body", "stdout output")
+
+        body = json.loads(mock_s3.put_object.call_args.kwargs["Body"])
+        assert "output_files" not in body
+
+    @patch("boto3.client")
+    def test_record_separates_generator_text_and_code_keys(self, mock_boto3, monkeypatch):
+        """text/code generator が別 S3 キーで分離される (派生 2 統合: 同キー上書きバグ解消)。"""
+        monkeypatch.setenv("PROMPTS_BUCKET", "test-prompts")
+        from src.observability.prompt_recorder import PromptRecorder
+
+        mock_s3 = MagicMock()
+        mock_boto3.return_value = mock_s3
+
+        recorder = PromptRecorder("exec-test-split")
+
+        recorder.record("generator_text", "0", "p1", "out1")
+        text_key = mock_s3.put_object.call_args.kwargs["Key"]
+
+        mock_s3.reset_mock()
+        recorder.record("generator_code", "iac_code", "p2", "out2")
+        code_key = mock_s3.put_object.call_args.kwargs["Key"]
+
+        # キーが完全に分離されている
+        assert text_key == "prompts/exec-test-split/generator_text_0.json"
+        assert code_key == "prompts/exec-test-split/generator_code_iac_code.json"
+        assert text_key != code_key
+
+
 class TestPromptRecorderWithoutBucket:
     """PROMPTS_BUCKET が未設定の場合の graceful skip テスト群。"""
 

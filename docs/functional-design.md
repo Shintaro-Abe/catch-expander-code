@@ -409,26 +409,53 @@ orchestrator.py（Pythonプロセス）
 - 文書生成に特化したシステムプロンプト
 - テキスト成果物（Notionブロック形式）の構造化ルールを含む
 - ユーザープロファイルに基づくカスタマイズ指示
-- 出力は `content_blocks` + `summary` のみ（`code_files` は出力しない旨を明示）
+- 出力は `content_blocks` + `summary` + `quality_metadata` の dict
+- **2026-05-13 改修**: 出力方式を **Write ツール経由のファイル書き込み** (`deliverable.json`) に変更。`code_files` は出力しない旨を明示
 
-#### 処理フロー
+#### 処理フロー (2026-05-13 改修: workspace モード)
 
 ```
 入力: オーケストレーターからの生成指示
   （調査結果一式 + ワークフロー計画 + ユーザープロファイル）
   ↓
-1. [Sonnet] 下書き生成（テキスト成果物）
+1. [Sonnet] sandbox 作成 (tempfile.mkdtemp)
+  ↓
+2. [Sonnet] Write ツール経由で `deliverable.json` に書き込み
    - 調査結果を Notion ブロック形式で整理
    - ユーザープロファイルに基づくカスタマイズ
+   - 推敲（全体の整合性確認、表現の改善、出典URLの挿入）
+   - 単一の JSON dict として `{content_blocks, summary, quality_metadata}` を書く
   ↓
-2. [Sonnet] 推敲
-   - 全体の整合性確認
-   - 表現の改善
-   - 出典URLの挿入
+3. [Python] stat() で size 検査 → read → 検証層 (5 種の検出)
+   - file_missing / file_too_large / invalid_json / not_dict /
+   - missing_keys / invalid_content_blocks / invalid_summary / invalid_quality_metadata
   ↓
-出力: オーケストレーターへ返却
-  （content_blocks + summary のみ。code_files は返さない）
+4. [Python] 失敗時は最大 2 回まで自動リトライ (exp backoff 2/4 秒)
+  ↓
+5. [Python] finally: sandbox cleanup
+  ↓
+出力: オーケストレーターへ返却 (検証 pass 済みの valid dict)
 ```
+
+#### Z-2 (workspace モード化) 採用の背景
+
+**2026-05-12 観測のインシデント**: 大規模トピック（5 つの概念をまとめて扱う等）で Claude Sonnet 4.6 が ~30,000 文字超の応答が必要な場合、独自に「Part 1 / Part 2 分割応答」戦略を発火することが実証された (同日トピック 3 回試行で 2 回失敗、`exec-20260512100453-f253b974` 等)。stdout に JSON コードブロックを含む自然文プロローグ + トップレベル `[...]` array を返し、`_parse_claude_response` の戦略 1 が list を返す → `deliverables.pop("code_files", None)` で `TypeError: pop expected at most 1 argument, got 2` で破壊的失敗。
+
+**境界設計変更による解決**: 「LLM の text 応答をアプリでパースする」境界をやめて、LLM に **Write ツール経由で deliverable.json を書かせる** ことで stdout 巨大 JSON 制約を物理的に消去。Part 分割応答を選ぶ動機が消える。code generation (3.3b) で既に採用されていた workspace モードを text generator にも適用する形。
+
+**「努力目標 + 検証層 + 自動リトライ」の三身一体**:
+- 努力目標: プロンプトで `deliverable.json` への書き出しを指示 (LLM 確率挙動依存)
+- 検証層: post-hoc に 8 種の失敗パターンを確定的に検出
+- 自動リトライ: 最大 2 回 (合計 3 試行) で確率的成功率を底上げ
+- 全試行失敗時は `NonDictGeneratorResponse` raise + `subagent_failed` emit + Slack 失敗通知
+
+詳細: `.steering/20260512-parse-claude-response-dict-contract/`
+
+#### feature flag
+
+環境変数 `WORKSPACE_TEXT_GEN` で切替可能 (デフォルト `"true"`):
+- `"true"`: workspace モード (Z-2 経路、`call_claude_with_text_workspace`)
+- `"false"`: 旧 stdout JSON 経路 (`call_claude` + `_parse_claude_response`、即時切り戻し用)
 
 #### 成果物タイプ別の生成仕様
 
@@ -472,7 +499,7 @@ finally:
 - ファイル数は最大 5 / タイプに抑制
 - 1 ファイルあたり 100KB 以下
 
-**性質的差異の根拠**: テキスト成果物（ジェネレーター本体）・トピック解析・ワークフロー設計・リサーチャー要約・レビュアー合否は **数百〜数千文字の構造化データ**で JSON 適性が高い。一方コード成果物は **10,000+ 文字 + 特殊文字密集**で JSON 適性が低い。この差異を認め、コード成果物のみファイル書き込み方式とする例外設計を採用した。
+**性質的差異の根拠**: トピック解析・ワークフロー設計・リサーチャー要約・レビュアー合否は **数百〜数千文字の構造化データ**で JSON 適性が高い。一方コード成果物 (3.3b) は **10,000+ 文字 + 特殊文字密集**で JSON 適性が低く、テキスト成果物 (3.3) も大規模トピックで **30,000+ 文字応答 + LLM の Part 分割応答リスク**が観測された (2026-05-12)。前者は当初からファイル書き込み方式、後者は本日 (2026-05-13) workspace モードに移行。残る 4 経路 (analysis / workflow / researcher / reviewer / fixer) は応答サイズが小さく Part 分割発火条件に達しないため、現状の stdout JSON 経路を維持する (派生 4 として将来検討)。
 
 ### 3.4 レビュアーエージェント
 

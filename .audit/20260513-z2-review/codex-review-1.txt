@@ -1,0 +1,53 @@
+## P1 (必修正)
+- なし
+
+## P2 (推奨修正)
+- [subagent_completed の名前が started/failed と非対称] workspace 有効時も完了イベントが `"generator"` で emit される (該当箇所: `src/agent/orchestrator.py:1320`, `src/agent/orchestrator.py:1452`)  
+  詳細: `subagent_started` は `"generator_text"`、全失敗時の `subagent_failed` も `"generator_text"` ですが、成功時の `subagent_completed` だけ `"generator"` 固定です。design.md は `generator_text` record / 表示順更新を前提にしており、イベントの対応付けや dashboard 集計で text generator の duration が欠落・別名集計される可能性があります。  
+  根拠: design.md Step 3 / AC-4 / 確定事項 7、特に `generator_text` への分離方針。  
+  推奨修正: `subagent_completed` の `subagent` を `generator_subagent_name` にする。workspace false 時は旧 `"generator"` のまま維持できます。あわせて成功時イベント名のテストを追加。
+
+- [feature flag テストが旧経路呼び出しを検証していない] テスト名と steering の期待に対して、実際は環境変数判定式だけを確認している (該当箇所: `tests/unit/agent/test_orchestrator.py:2243`)  
+  詳細: `call_claude`, `call_claude_with_text_workspace` を patch していますが、`run()` も分岐関数も呼んでいないため、「`WORKSPACE_TEXT_GEN=false` で旧 stdout 経路が呼ばれる」ことは保証できません。実装側で flag が無視されてもこのテストは通ります。  
+  根拠: AC-1 feature flag 制約、AC-6、design.md テスト設計の「旧 call_claude 経路が呼ばれる」。  
+  推奨修正: 依存を mock した薄い `run()` 統合テストにするか、text generator 分岐を小さな helper に抽出して、false 時に `call_claude` が呼ばれ workspace wrapper が呼ばれないことまで検証する。
+
+- [空の deliverable.json が PromptRecorder に保存されない] `deliverable_content == ""` の場合、生成ファイルが存在しても `output_files` が `None` になる (該当箇所: `src/agent/orchestrator.py:1752`)  
+  詳細: 空ファイルは `invalid_json` として重要な失敗証跡ですが、現状は `if deliverable_content` の truthiness 判定で S3 record から落ちます。AC-4 の「deliverable.json の中身を output_files に保存」と観測性の意図からは、空文字も保存対象です。  
+  根拠: AC-4、US-3、design.md Step 6。  
+  推奨修正: `output_files={"deliverable.json": deliverable_content} if deliverable_content is not None else None` に変更。
+
+- [巨大ファイルへの上限がない] text workspace は `deliverable.json` を無制限に read/record/parse する (該当箇所: `src/agent/orchestrator.py:932`)  
+  詳細: LLM が異常に大きな JSON を書いた場合、メモリ、S3 record サイズ、ログ/解析コストが膨らみます。code workspace には 100KB 上限がありますが、text workspace は単一 JSON 前提でも上限がありません。  
+  根拠: AC-2 検証層、design.md リスク「PromptRecorder S3 容量増」。  
+  推奨修正: text 用の上限を明示し、超過時は `file_too_large` 相当として retry/fail-fast する。reason を増やしたくないなら `invalid_json` ではなく別 reason の追加が運用上は明確です。
+
+- [検証層が summary / quality_metadata の型を見ていない] 必須キー存在だけで通過する (該当箇所: `src/agent/orchestrator.py:207`)  
+  詳細: `summary: []` や `quality_metadata: "..."` でも検証 pass します。後段 reviewer が上書きする設計でも、Slack summary や dashboard 表示に入る可能性があり、最低限 `summary` は non-empty string、`quality_metadata` は dict を確認した方が事故が少ないです。  
+  根拠: AC-2 の「valid な deliverable.json」趣旨、generator.md のスキーマ。  
+  推奨修正: `invalid_summary` / `invalid_quality_metadata` を追加するか、既存 `missing_keys` 後の schema validation として extras に型情報を残す。
+
+## P3 (情報提供)
+- [設計判断は妥当] stdout JSON パース境界をやめて workspace 化し、努力目標 + 検証層 + 自動リトライに分けた判断は、今回の Part 分割インシデントには適切です。text generator のみに絞るスコープも design.md 確定事項 2 と整合しています。
+
+- [call_claude_with_text_workspace は概ね既存 code workspace と整合] cleanup、Sonnet retry exhaust 時の Opus advisor、rate_limit/api_call_completed emit は既存パターンに沿っています。ただし `extra_files` は直下ファイルのみ検出なので、サブディレクトリ違反も観測したいなら `rglob` ベースにするとより強いです。
+
+- [直前 steering は revert 不要] fix loop の `_classify_content_blocks_fallback_reason` は fixer 応答置換時の本文消失防止、本件の `_validate_deliverable_payload` は text generator 直後の契約検証で、責務は分離できています。将来共通化候補としてのコメントも妥当です。
+
+- [リトライは同一 prompt の再試行] steering には合っていますが、失敗理由を retry prompt に追記すると成功率が上がる可能性があります。現状でも新規 Claude 実行なので確率的改善は見込めます。
+
+- [古い docstring が残っている] `call_claude_with_workspace` の docstring に「テキスト成果物のパスは call_claude のまま」とあります (該当箇所: `src/agent/orchestrator.py:681`)。実害はありませんが、Z-2 後は誤解を招きます。
+
+## 総合評価
+- 設計の妥当性: ✅
+- 検証層の網羅性: ⚠️
+- 自動リトライ実装: ✅
+- feature flag 運用: ⚠️
+- PromptRecorder キー分離: ⚠️
+- テストカバレッジ: ⚠️
+- 連続パッチアンチパターン回避: ✅
+
+## 結論
+- マージ可否: 可
+
+P1 はありません。TypeError 再発防止の主目的は満たしています。マージ前に直すなら、`subagent_completed` の名前不一致と feature flag テストの実効化が最優先です。

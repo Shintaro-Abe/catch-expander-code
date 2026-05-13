@@ -1,15 +1,139 @@
-title = "Catch-Expander gitleaks config"
+title = "Custom Security Rules"
 
+# gitleaks のデフォルトルールを継承したうえでカスタムルールを追加する
 [extend]
 useDefault = true
 
+# スキャン対象から除外するパス
 [allowlist]
+description = "Generated files and dependency directories"
 paths = [
-  ".venv/",
-  "node_modules/",
-  ".aws-sam/",
-  "uv.lock",
-  "frontend/dist/",
-  "obsidian/",
-  "graphify-out/",
+  '''(^|/)\.git(/|$)''',
+  '''(^|/)node_modules(/|$)''',
+  '''(^|/)\.venv(/|$)''',
+  '''(^|/)__pycache__(/|$)''',
+  '''\.pyc$''',
+  '''uv\.lock$''',
+  '''package-lock\.json$''',
+  '''yarn\.lock$''',
+  '''pnpm-lock\.yaml$''',
+  '''\.gitleaks\.toml$''',
+  '''(^|/)dist(/|$)''',
+  '''(^|/)\.aws(/|$)''',
+  '''(^|/)\.aws-sam(/|$)''',
+  '''(^|/)\.audit(/|$)''',
 ]
+
+# Python MagicMock の assert_* メソッド名が openai-oauth-refresh-token rule (`rt_*` 系)
+# 等で誤検出されるのを抑制するグローバル allowlist。
+# gitleaks の Match は `rt_not_called` 等 (`assert_not_called` の末尾) になるため、
+# rt_ プレフィックスを含む形で許可する。
+regexes = [
+  '''rt_(not_called|called_once_with|called_with|called_once|any_call|has_calls|has_any_call)''',
+]
+
+# ---- カスタムルール ----
+
+# プライベート IPv4 アドレス（RFC 1918）
+[[rules]]
+id = "private-ipv4"
+description = "Private IPv4 Address (RFC 1918)"
+regex = '''(?:^|[\s"'`=:{(\[,])(?:10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3})(?:$|[\s"'`})\],:\/])'''
+tags = ["ip", "network"]
+
+  [rules.allowlist]
+  description = "Allowlist test/example IPs and localhost references"
+  regexes = [
+    '''192\.168\.0\.[01](?:\b|$)''',      # ゲートウェイ例（ドキュメント等でよく使われる）
+    '''10\.0\.0\.[01](?:\b|$)''',
+  ]
+
+# メールアドレス（個人情報）
+[[rules]]
+id = "email-pii"
+description = "Email Address (PII)"
+regex = '''[a-zA-Z0-9._%+\-]{2,}@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'''
+tags = ["pii", "email"]
+
+  [rules.allowlist]
+  description = "Allowlist common non-personal email patterns"
+  regexes = [
+    '''@example\.(com|org|net)''',
+    '''@test\.(com|org|net)''',
+    '''noreply@''',
+    '''no-reply@''',
+    '''@anthropic\.com''',
+    '''localhost''',
+    # パッケージ管理・CI で使われるサービスドメイン
+    '''@github\.com''',
+    '''@githubusercontent\.com''',
+    '''@pypi\.org''',
+    '''@npmjs\.com''',
+  ]
+
+# 日本の電話番号（個人情報）
+[[rules]]
+id = "japanese-phone"
+description = "Japanese Phone Number (PII)"
+regex = '''(?:^|[^\d])(?:0[0-9]{1,4}[-\s]?[0-9]{1,4}[-\s]?[0-9]{3,4}|\+81[-\s]?[0-9]{1,4}[-\s]?[0-9]{1,4}[-\s]?[0-9]{4})(?:[^\d]|$)'''
+tags = ["pii", "phone"]
+
+  [rules.allowlist]
+  description = "Allowlist obviously non-phone number patterns"
+  regexes = [
+    # バージョン番号等の誤検知を減らす
+    '''0\.[0-9]+\.[0-9]+''',
+  ]
+
+# AWS アクセスキー ID（デフォルトルールでもカバーされるが明示的に定義）
+[[rules]]
+id = "aws-access-key-id"
+description = "AWS Access Key ID"
+regex = '''AKIA[0-9A-Z]{16}'''
+tags = ["aws", "secret"]
+
+# AWS シークレットアクセスキー
+[[rules]]
+id = "aws-secret-access-key"
+description = "AWS Secret Access Key"
+regex = '''(?i)(?:aws.{0,10})?secret.{0,10}(?:access.{0,10})?key\s*[:=]\s*["\']?([A-Za-z0-9/+=]{40})["\']?'''
+tags = ["aws", "secret"]
+
+# Anthropic (Claude) OAuth トークン — sk-ant- で始まる108文字のトークン
+[[rules]]
+id = "anthropic-oauth-token"
+description = "Anthropic Claude OAuth Token"
+regex = '''sk-ant-[A-Za-z0-9_\-]{20,}'''
+tags = ["anthropic", "oauth", "secret"]
+
+# OpenAI (Codex) OAuth リフレッシュトークン — rt_ で始まる90文字のトークン
+[[rules]]
+id = "openai-oauth-refresh-token"
+description = "OpenAI/Codex OAuth Refresh Token"
+regex = '''rt_[A-Za-z0-9_\-]{10,}'''
+tags = ["openai", "oauth", "secret"]
+
+  [rules.allowlist]
+  description = "Allowlist common non-token rt_ patterns"
+  regexes = [
+    '''(?i)rt_(?:timeout|error|success|limit|max|min|value|type|count|index)''',
+  ]
+
+# 汎用 API キー（変数名に api と key を含む代入パターン）
+[[rules]]
+id = "generic-api-key"
+description = "Generic API Key Assignment"
+regex = '''(?i)(?:api[_\-]?key|x-api-key)\s*[:=]\s*["\']?([a-zA-Z0-9_\-\.]{20,})["\']?'''
+tags = ["api", "secret"]
+
+  [rules.allowlist]
+  description = "Allowlist placeholder / dummy values"
+  regexes = [
+    '''(?i)your[_\-]?api[_\-]?key''',
+    '''(?i)insert[_\-]?api[_\-]?key''',
+    '''(?i)example[_\-]?api[_\-]?key''',
+    '''(?i)<api[_\-]?key>''',
+    '''xxxx''',
+    '''dummy''',
+    '''placeholder''',
+  ]

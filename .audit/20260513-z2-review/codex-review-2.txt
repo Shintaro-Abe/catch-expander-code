@@ -1,0 +1,33 @@
+## P1 (必修正)
+- なし
+
+## P2 (推奨修正)
+- [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:986): 巨大 `deliverable.json` 対策は部分解消です。実ファイル経路では `read_text()` で全量を読んだ後に `stat()` しており、さらに [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:1803) で検証前に PromptRecorder へ全量保存します。P2-4 の「無制限 read / record / parse 防止」のうち parse は防げていますが、read と S3 record はまだ防げていません。加えて [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:218) の `outcome.get("file_bytes", len(...))` は default 引数が常に評価されるため、`file_bytes` が存在しても巨大文字列を再 encode します。`stat()` を先に実行し、上限超過なら content を読まずに `deliverable_content=None` または短い preview のみにするのが良いです。
+- [frontend/src/routes/ExecutionDetail.tsx](/workspaces/Catch-Expander/frontend/src/routes/ExecutionDetail.tsx:405): Dashboard 表示側が `subagent === "generator"` だけを generator として扱うため、新しい `generator_text` / `generator_code` record が UI に表示されません。[frontend/src/api/types.ts](/workspaces/Catch-Expander/frontend/src/api/types.ts:166) も union に新 subagent と `output_files` を含んでいません。[src/dashboard_api/get_subagent_io/app.py](/workspaces/Catch-Expander/src/dashboard_api/get_subagent_io/app.py:13) の `_SUBAGENT_ORDER` も旧値のままです。requirements AC-5 / tasklist T-12, T-13 が未完了なので、「ステアリングすべて反映」とは言えません。
+
+## P3 (情報提供)
+- P2-1 のコード修正自体は [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:1373) と [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:1506) で解消しています。ただし追加テストは `_run_text_generator_with_retries()` 単体の PromptRecorder 名確認で、`subagent_completed` emit そのものは直接検証していません。将来の回帰防止としては `run()` 統合テストで `subagent_started` / `subagent_completed` のペアを直接見る方が強いです。
+- P2-2 もコード上は `_should_use_workspace_text_gen()` を `run()` が呼んでおり解消です。ただしテストは helper 判定式の直接検証なので、「`run()` が flag を無視したら落ちる」粒度ではありません。`WORKSPACE_TEXT_GEN=false` で旧 `call_claude()` 経路に入る統合テストを 1 本足すと完成度が上がります。
+- [src/agent/orchestrator.py](/workspaces/Catch-Expander/src/agent/orchestrator.py:596) のコメントは「file_too_large は retry も無意味なため backoff せず」とありますが、実装は全 validation failure に対して backoff retry します。動作かコメントのどちらかを揃えるとよいです。
+
+## 1 回目指摘の解消状況
+- P2-1 (subagent_completed 非対称): 解消 ✅
+- P2-2 (feature flag テスト実効性): 部分解消 ⚠️
+- P2-3 (空ファイル PromptRecorder): 解消 ✅
+- P2-4 (巨大ファイル上限): 部分解消 ⚠️
+- P2-5 (型検証): 解消 ✅
+- P3 (docstring): 解消 ✅
+
+## 多層ミス検出
+- 新規層の指摘あり
+- 内訳: 巨大ファイル上限が validation 層だけで、実ファイル read / PromptRecorder record の前段を止められていない。Dashboard / API / frontend type が `generator_text` / `generator_code` / `output_files` に未追従。
+
+## ステアリング遵守 (AC + 確定事項)
+- 一部未反映 ⚠️
+- AC-1, AC-2, AC-3, AC-4, AC-6 と確定事項 9〜11 は概ね反映。
+- AC-5 Dashboard frontend 改修、および T-13 `_SUBAGENT_ORDER` 更新は未反映。
+
+## 結論
+- 収束判定: 3 回目要 (新規 P2 あり)
+- マージ可否: 条件付き可  
+  backend の主目的である TypeError 再発防止と validation/retry は前進していますが、P2-4 の実効性不足と Dashboard 未追従はマージ前に直すのが妥当です。
