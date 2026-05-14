@@ -2450,3 +2450,147 @@ class TestTextGeneratorWorkspace:
         record_call = orch._prompt_recorder.record.call_args
         assert record_call.args[0] == "generator_text"
         assert deliverables["summary"] == "ok"
+
+
+class TestCallCodexErrorObservability:
+    """call_codex のエラー observability テスト
+
+    steering: .steering/20260514-codex-error-observability/
+    背景: 5/14 03:28 JST に Codex 401 失敗の真因が error_message から失われていた問題への対処。
+    CodexInvocationError(subprocess.CalledProcessError) サブクラス + __str__ オーバーライドで
+    str(e)[:500] スライスでも stderr 末尾が読めるようにした実装の回帰防止テスト。
+    """
+
+    def _make_failure_run(self, stderr: str):
+        """全 retry を CalledProcessError で失敗させる subprocess.run mock を返す"""
+        import subprocess
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=cmd, output="", stderr=stderr,
+            )
+        return fake_run
+
+    def test_raises_codex_invocation_error_on_total_failure(self):
+        from orchestrator import CodexInvocationError, call_codex
+
+        with (
+            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+            patch("orchestrator.time.sleep"),
+            pytest.raises(CodexInvocationError),
+        ):
+            call_codex("prompt")
+
+    def test_codex_invocation_error_is_a_called_process_error(self):
+        """継承により main.py:_notify_task_failure の Slack 通知分岐 (isinstance) が壊れないこと"""
+        import subprocess
+
+        from orchestrator import call_codex
+
+        with (
+            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+            patch("orchestrator.time.sleep"),
+            pytest.raises(subprocess.CalledProcessError),
+        ):
+            call_codex("prompt")
+
+    def test_str_includes_stderr_when_short(self):
+        """短い stderr (典型的なエラー) の場合、str(e)[:500] スライスで stderr が読めること.
+
+        emitter / DynamoDB / Slack / Dashboard の error_message = str(e)[:500] 経路の
+        実利上、最も重要なケース (Codex 401 のような短いエラーメッセージ).
+        """
+        from orchestrator import CodexInvocationError, call_codex
+
+        marker = "401_UNAUTHORIZED_TOKEN_REFRESH_FAILED"
+        with (
+            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run(marker)),
+            patch("orchestrator.time.sleep"),
+        ):
+            try:
+                call_codex("prompt")
+            except CodexInvocationError as e:
+                head500 = str(e)[:500]
+                assert marker in head500, f"marker not in head500: {head500!r}"
+            else:
+                pytest.fail("expected CodexInvocationError")
+
+    def test_str_keeps_stderr_tail_when_long(self):
+        """長い stderr の場合、末尾 1500 文字が __str__ 全体に含まれること.
+
+        実装の tail = stderr[-1500:] により、stderr が 1500 を超えても末尾は保持される.
+        """
+        from orchestrator import CodexInvocationError, call_codex
+
+        end_marker = "ENDMARKER_xyz123"
+        stderr_text = "X" * 3000 + end_marker + "Y" * 100
+        with (
+            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run(stderr_text)),
+            patch("orchestrator.time.sleep"),
+        ):
+            try:
+                call_codex("prompt")
+            except CodexInvocationError as e:
+                full_str = str(e)
+                assert end_marker in full_str, "stderr end marker should be in __str__"
+                # 旧スライス [:500] では捕まらないので、フル str を検証
+                # 一方、stderr 冒頭の "X" は cap で消える (3000 + end_marker + "Y"*100 > 1500)
+                assert len(full_str) <= 1600, f"__str__ should cap stderr at 1500: {len(full_str)}"
+            else:
+                pytest.fail("expected CodexInvocationError")
+
+    def test_preserves_cause_chain(self):
+        """exc.__cause__ に元 CalledProcessError がチェーンされ stack_trace が保持されること"""
+        import subprocess
+
+        from orchestrator import CodexInvocationError, call_codex
+
+        with (
+            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+            patch("orchestrator.time.sleep"),
+        ):
+            try:
+                call_codex("prompt")
+            except CodexInvocationError as e:
+                assert isinstance(e.__cause__, subprocess.CalledProcessError)
+            else:
+                pytest.fail("expected CodexInvocationError")
+
+    def test_preserves_cmd_for_slack_branch(self):
+        """exc.cmd に codex コマンドリストが入り main.py:201 の '"codex" in cmd_str' が動くこと"""
+        from orchestrator import CodexInvocationError, call_codex
+
+        with (
+            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+            patch("orchestrator.time.sleep"),
+        ):
+            try:
+                call_codex("prompt")
+            except CodexInvocationError as e:
+                cmd_str = " ".join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
+                assert "codex" in cmd_str
+            else:
+                pytest.fail("expected CodexInvocationError")
+
+    def test_logger_stderr_slice_2000(self, caplog):
+        """リトライ時 logger.warning の stderr スライスが 2000 文字まで保持されること"""
+        import contextlib
+
+        from orchestrator import call_codex
+
+        long_stderr = "A" * 3000
+        with (
+            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run(long_stderr)),
+            patch("orchestrator.time.sleep"),
+            caplog.at_level("WARNING", logger="catch-expander-agent"),
+            contextlib.suppress(Exception),
+        ):
+            call_codex("prompt")
+
+        retry_logs = [r for r in caplog.records if "Codex CLI error" in r.getMessage()]
+        assert retry_logs, "no retry warning found"
+        first_msg = retry_logs[0].getMessage()
+        assert "AAAA" in first_msg
+        stderr_part = first_msg.split("stderr=", 1)[1]
+        assert len(stderr_part) <= 2000
+        assert len(stderr_part) > 500  # 旧スライス [:500] より明確に長い

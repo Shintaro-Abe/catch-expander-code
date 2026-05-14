@@ -1056,6 +1056,20 @@ def call_claude_with_text_workspace(
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
+class CodexInvocationError(subprocess.CalledProcessError):
+    """call_codex 専用例外。
+
+    subprocess.CalledProcessError を継承するため
+    isinstance(exc, CalledProcessError) は引き続き真。
+    str(exc) の先頭に stderr 末尾を出すことで、
+    呼び出し側の error_message = str(e)[:500] スライスでも stderr が見える。
+    """
+
+    def __str__(self) -> str:
+        tail = (self.stderr or "")[-1500:]
+        return f"codex exec failed rc={self.returncode}: {tail}"
+
+
 def call_codex(
     prompt: str,
     model: str = CODEX_REVIEW_MODEL,
@@ -1099,13 +1113,18 @@ def call_codex(
                 logger.warning(
                     "Codex CLI error, retrying | rc=%s | stderr=%s",
                     e.returncode,
-                    (e.stderr or "")[:500],
+                    (e.stderr or "")[:2000],
                     extra={"attempt": attempt + 1, "wait_seconds": wait},
                 )
                 time.sleep(wait)
 
         if last_error:
-            raise last_error
+            raise CodexInvocationError(
+                last_error.returncode,
+                last_error.cmd,
+                last_error.output,
+                last_error.stderr,
+            ) from last_error
         msg = "Unexpected: no error and no response"
         raise RuntimeError(msg)
     finally:
