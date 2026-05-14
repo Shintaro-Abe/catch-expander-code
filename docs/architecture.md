@@ -373,8 +373,9 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
 | PK | `execution_id` |
 | SK | `sk`（`{timestamp}#{event_type}#{ulid}` 形式） |
 | GSI | `gsi_global_timestamp`（PK: `gsi_pk` / SK: `timestamp`） |
+| GSI | `gsi_status_timestamp`（PK: `status_at_emit` / SK: `timestamp`） |
 | GSI | `gsi_event_type_timestamp`（PK: `event_type` / SK: `timestamp`） |
-| TTL | 90 日 |
+| TTL | 5 年（`event_emitter._TTL_DAYS = 1825` で書き込み時に算出） |
 
 ダッシュボード API は主に `gsi_event_type_timestamp` を使い、イベント種別（`execution_completed` 等）を時刻範囲でクエリする。
 
@@ -404,6 +405,7 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
 |---------|-------|-----|-----|------|
 | workflow-executions | `user-id-index` | `user_id` | `created_at` | ユーザー別の実行履歴取得 |
 | events | `gsi_global_timestamp` | `gsi_pk` | `timestamp` | 全実行横断クエリ |
+| events | `gsi_status_timestamp` | `status_at_emit` | `timestamp` | ステータス別クエリ（将来拡張用、規模拡大時の耐性確保） |
 | events | `gsi_event_type_timestamp` | `event_type` | `timestamp` | イベント種別クエリ |
 
 ## 6. API Gateway設計
@@ -490,8 +492,12 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
 | シークレットの漏洩 | 全クレデンシャル（Claude Code OAuth含む）をSecrets Managerで管理。Dockerイメージ・環境変数にハードコードしない |
 | Notion APIの過剰操作 | アプリケーション層で操作制限（functional-design.md 4.2参照） |
 | DynamoDBへの不正アクセス | IAMロールでリソースARNレベルに制限 |
-| コンテナの権限昇格 | ECS Fargateのタスクロールで最小権限を付与 |
+| コンテナの権限昇格 | ECS Fargateのタスクロールで最小権限を付与。タスク定義は **非 root ユーザー実行 + readonly root filesystem** (commit 229ea33) |
 | 外部APIへの個人情報送信 | Web検索クエリにユーザー個人情報を含めない設計 |
+| イメージタグの上書き / supply chain | ECR リポジトリを **IMMUTABLE** に設定し、git HEAD SHA をタグとしてデプロイ（commit b550f67、`scripts/deploy-agent.sh`） |
+| データ消失 / 誤削除 | DynamoDB 全テーブルで **PITR (Point-in-Time Recovery) + Deletion Protection** を有効化（commit af86e33） |
+| S3 への意図しないアクセス | Frontend / Prompts / CloudFront ログ各バケットの BucketPolicy に **明示的 Deny ステートメント**（CloudFront OAC 以外の Principal、`aws:SecureTransport=false` 等）を追加（commit 5e5554e） |
+| 不正な配信経路の追跡 | CloudFront に **標準アクセスログ (legacy logging)** を有効化し `CloudFrontLogsBucket` に集約（commit 40edf2c） |
 
 ## 8. 監視・ログ設計
 
@@ -520,6 +526,8 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
 | Lambda実行エラー | エラー率 > 10%（5分間） | Slack通知 |
 | ECSタスク失敗 | 失敗タスク数 > 0（5分間） | Slack通知 |
 | Maxプラン利用上限接近 | カスタムメトリクスで検知 | Slack通知 |
+
+> **実装ステータス**: 上記 3 アラームは設計要件として定義されているが、`AWS::CloudWatch::Alarm` / `AWS::SNS::Topic` / `AWS::Logs::MetricFilter` リソースは現行の `template.yaml` に存在せず **未実装**。`AlarmNotificationEmail` パラメータと `HasAlarmEmail` Condition のみが事前準備として定義されている。観測経路としては当面、Lambda 内 `_post_slack_failure` (token_monitor) と ECS タスクの `_notify_task_failure` (§8.5) による直接 Slack 通知でカバーしており、CloudWatch Alarm + SNS による本格的な監視導線は別途 steering で設計予定（`.audit/2026-05-06_aws-architecture-review.md` Low #5 参照）。
 
 ## 8.5 タスク失敗時の通知設計
 

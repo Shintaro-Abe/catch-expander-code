@@ -571,8 +571,9 @@ finally:
 | コマンド | 機能 |
 |---------|------|
 | `@CatchExpander <トピック>` | トピック送信 |
-| `@CatchExpander profile` | プロファイル登録・更新（対話形式） |
-| `@CatchExpander status` | 実行中のワークフロー状況確認 |
+| `@CatchExpander profile` | プロファイル登録・更新（対話形式） — **未実装**（5.2 参照、設計のみ） |
+| `@CatchExpander status` | 実行中のワークフロー状況確認 — **未実装**（設計のみ） |
+| `履歴` / `history [keyword]` | 過去成果物の履歴取得（F9）— 実装済み |
 
 #### メッセージ構成
 
@@ -803,6 +804,8 @@ sequenceDiagram
 ```
 
 ### 5.2 プロファイル登録フロー
+
+> **実装ステータス**: 以下のシーケンスは設計のみ。`@CatchExpander profile` コマンドの対話式登録ハンドラは `src/trigger/app.py` および `src/agent/` に **未実装**。現状は `src/agent/state/dynamodb_client.py` の `put_user_profile()` を CLI / スクリプトから直接呼び出して `UserProfilesTable` に書き込む運用。F8 フィードバック学習で `learned_preferences` が自動累積されるため、プロファイル相当の効果は部分的に得られている。登録 UX の実装は別 steering で予定。
 
 ```mermaid
 sequenceDiagram
