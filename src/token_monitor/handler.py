@@ -194,6 +194,15 @@ def lambda_handler(event: dict, context: object) -> dict[str, Any]:
     if not _needs_refresh(expires_at_ms, REFRESH_BUFFER_MS, now_ms):
         remaining_min = (expires_at_ms - now_ms) // 60_000
         logger.info("Token still valid", extra={"remaining_min": remaining_min})
+        if _emitter is not None:
+            _emitter.emit(
+                "oauth_refresh_skipped",
+                {
+                    "reason": "still_valid",
+                    "remaining_seconds": (expires_at_ms - now_ms) // 1000,
+                },
+                status_at_emit="success",
+            )
         return {"refreshed": False, "reason": "still_valid"}
 
     if not refresh_token:

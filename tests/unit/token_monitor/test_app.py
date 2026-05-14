@@ -509,7 +509,7 @@ class TestEmitEvents:
         emitter.emit.assert_called_once()
         assert emitter.emit.call_args.args[0] == "oauth_refresh_failed"
 
-    def test_no_emit_when_token_still_valid(self, monkeypatch):
+    def test_oauth_refresh_skipped_emitted_on_still_valid(self, monkeypatch):
         self._set_env(monkeypatch)
         future_ms = int(time.time() * 1000) + 2 * 60 * 60 * 1000
         emitter_cls, emitter = self._mock_emitter()
@@ -522,9 +522,16 @@ class TestEmitEvents:
             patch("handler._EventEmitter", emitter_cls),
         ):
             from handler import lambda_handler
-            lambda_handler({}, None)
+            result = lambda_handler({}, None)
 
-        emitter.emit.assert_not_called()
+        assert result == {"refreshed": False, "reason": "still_valid"}
+        emitter.emit.assert_called_once()
+        call = emitter.emit.call_args
+        assert call.args[0] == "oauth_refresh_skipped"
+        assert call.args[1]["reason"] == "still_valid"
+        assert isinstance(call.args[1]["remaining_seconds"], int)
+        assert call.args[1]["remaining_seconds"] > 0
+        assert call.kwargs["status_at_emit"] == "success"
 
     def test_no_emit_when_event_emitter_none(self, monkeypatch):
         self._set_env(monkeypatch)

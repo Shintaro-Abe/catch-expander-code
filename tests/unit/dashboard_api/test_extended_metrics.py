@@ -221,9 +221,15 @@ class TestGetTokenMonitorHealth:
     def set_env(self, monkeypatch):
         monkeypatch.setenv("EVENTS_TABLE", "test-events")
 
-    def _run(self, successes: list, failures: list | None = None, period: str = "7d") -> dict:
+    def _run(
+        self,
+        successes: list,
+        failures: list | None = None,
+        skipped: list | None = None,
+        period: str = "7d",
+    ) -> dict:
         resource = MagicMock()
-        resource.Table.return_value = _mock_table_multi(successes, failures or [])
+        resource.Table.return_value = _mock_table_multi(successes, failures or [], skipped or [])
         with patch("src.dashboard_api.get_token_monitor_health.app._dynamodb", resource):
             from src.dashboard_api.get_token_monitor_health.app import lambda_handler
             return lambda_handler({"queryStringParameters": {"period": period}}, None)
@@ -273,6 +279,73 @@ class TestGetTokenMonitorHealth:
         assert data["last_refresh_at"] is None
         assert data["last_failure_at"] is None
         assert data["last_failure_reason"] is None
+        assert data["skip_count"] == 0
+        assert data["last_skip_at"] is None
+        assert data["last_check_at"] is None
+
+    def test_skip_count_and_last_skip_at_from_skipped_events(self):
+        skipped = [
+            _make_event("oauth_refresh_skipped", "system-token-refresh-1",
+                        payload={"reason": "still_valid", "remaining_seconds": 3600},
+                        ts="2026-05-02T03:00:00.000Z"),
+            _make_event("oauth_refresh_skipped", "system-token-refresh-2",
+                        payload={"reason": "still_valid", "remaining_seconds": 1800},
+                        ts="2026-05-02T09:00:00.000Z"),
+        ]
+        result = self._run([], None, skipped)
+        data = json.loads(result["body"])["data"]
+        assert data["skip_count"] == 2
+        assert data["last_skip_at"] == "2026-05-02T09:00:00.000Z"
+        assert data["last_check_at"] == "2026-05-02T09:00:00.000Z"
+        assert data["success_count"] == 0
+        assert data["failure_count"] == 0
+        assert data["total_refresh_attempts"] == 0
+        assert data["success_rate"] is None
+
+    def test_last_check_at_takes_max_across_three_event_types(self):
+        successes = [
+            _make_event("oauth_refresh_completed", "system-token-refresh-1",
+                        ts="2026-05-01T06:00:00.000Z"),
+        ]
+        failures = [
+            _make_event("oauth_refresh_failed", "system-token-refresh-0",
+                        payload={"error_message": "http_401"},
+                        ts="2026-05-01T12:00:00.000Z"),
+        ]
+        skipped = [
+            _make_event("oauth_refresh_skipped", "system-token-refresh-2",
+                        payload={"reason": "still_valid", "remaining_seconds": 7200},
+                        ts="2026-05-01T18:00:00.000Z"),
+        ]
+        result = self._run(successes, failures, skipped)
+        data = json.loads(result["body"])["data"]
+        assert data["success_count"] == 1
+        assert data["failure_count"] == 1
+        assert data["skip_count"] == 1
+        assert data["success_rate"] == 0.5
+        assert data["last_refresh_at"] == "2026-05-01T06:00:00.000Z"
+        assert data["last_failure_at"] == "2026-05-01T12:00:00.000Z"
+        assert data["last_skip_at"] == "2026-05-01T18:00:00.000Z"
+        assert data["last_check_at"] == "2026-05-01T18:00:00.000Z"
+
+    def test_skipped_excluded_from_success_rate(self):
+        successes = [
+            _make_event("oauth_refresh_completed", "system-token-refresh-1",
+                        ts="2026-05-01T06:00:00.000Z"),
+        ]
+        skipped = [
+            _make_event("oauth_refresh_skipped", "system-token-refresh-2",
+                        payload={"reason": "still_valid", "remaining_seconds": 3600},
+                        ts="2026-05-01T12:00:00.000Z"),
+            _make_event("oauth_refresh_skipped", "system-token-refresh-3",
+                        payload={"reason": "still_valid", "remaining_seconds": 1800},
+                        ts="2026-05-01T18:00:00.000Z"),
+        ]
+        result = self._run(successes, None, skipped)
+        data = json.loads(result["body"])["data"]
+        assert data["success_rate"] == 1.0
+        assert data["total_refresh_attempts"] == 1
+        assert data["skip_count"] == 2
 
     def test_invalid_period_returns_400(self):
         result = self._run([], period="bad")
