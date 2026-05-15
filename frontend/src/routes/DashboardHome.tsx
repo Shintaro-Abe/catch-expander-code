@@ -277,8 +277,8 @@ export function DashboardHome() {
                 />
                 <TokenMonitorRow
                   icon={<RefreshCw size={14} className="text-sky-400" />}
-                  label="最終更新"
-                  value={fmtRelative(token.last_refresh_at)}
+                  label="最終チェック"
+                  value={fmtRelative(token.last_check_at)}
                 />
                 {token.last_failure_reason && (
                   <TokenMonitorRow

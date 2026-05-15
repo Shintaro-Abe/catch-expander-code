@@ -31,9 +31,12 @@ export interface TokenMonitorHealth {
   total_refresh_attempts: number
   success_count: number
   failure_count: number
+  skip_count: number
   success_rate: number | null
   last_refresh_at: string | null
   last_failure_at: string | null
+  last_skip_at: string | null
+  last_check_at: string | null
   last_failure_reason: string | null
 }
 
