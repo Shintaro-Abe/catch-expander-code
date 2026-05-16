@@ -33,7 +33,7 @@
 |---------|------|
 | `app_mentions:read` | チャンネルでのメンション検知 |
 | `chat:write` | 進捗通知・完了通知の投稿 |
-| `im:history` | DM履歴の読み取り（プロファイル登録の対話用） |
+| `im:history` | DM 経由のトピック投入受信用（`channel_type == "im"` の `message` event を `src/trigger/app.py` で処理） |
 | `im:read` | DMチャンネルの情報取得 |
 | `im:write` | DMでのメッセージ送信 |
 

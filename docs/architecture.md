@@ -455,6 +455,9 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
     "ecs:RunTask",
     "iam:PassRole",
     "dynamodb:PutItem",
+    "dynamodb:Query",
+    "dynamodb:GetItem",
+    "dynamodb:UpdateItem",
     "secretsmanager:GetSecretValue",
     "logs:CreateLogGroup",
     "logs:CreateLogStream",
@@ -463,6 +466,8 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
   "Resource": ["対象リソースARNに限定"]
 }
 ```
+
+> `dynamodb:Query` は F9 履歴コマンド用、`dynamodb:GetItem` / `dynamodb:UpdateItem` は F6 ユーザープロファイル Modal（Slack interactive payload による登録・編集）が `UserProfilesTable` に直接読み書きするために必要。実際の SAM policy は `template.yaml` の `TriggerFunction.Policies` 参照。
 
 #### ECSTaskRole
 
