@@ -1290,3 +1290,273 @@ class TestTopicReceivedEmit:
 
         assert result["statusCode"] == 200
         mock_ecs.run_task.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# F6: User Profile Modal
+# ---------------------------------------------------------------------------
+
+
+def _make_interactive_event(payload: dict, timestamp: str | None = None) -> dict:
+    """Slack Interactive Components 形式 (application/x-www-form-urlencoded) の event を作る。"""
+    from urllib.parse import urlencode
+    ts = timestamp or str(int(time.time()))
+    body_str = urlencode({"payload": json.dumps(payload)})
+    sig = _make_signature(body_str, ts)
+    return {
+        "body": body_str,
+        "headers": {
+            "X-Slack-Request-Timestamp": ts,
+            "X-Slack-Signature": sig,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    }
+
+
+@pytest.mark.usefixtures("_env_vars")
+class TestProfileModal:
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_profile_keyword_opens_button_message(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """`@CatchExpander profile` でボタン付きメッセージが投稿される。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_client = MagicMock()
+        mock_webclient_cls.return_value = mock_client
+
+        body = {
+            "type": "event_callback",
+            "event": {
+                "type": "app_mention",
+                "user": "U_USER",
+                "text": "<@U_BOT> profile",
+                "channel": "C_CH",
+                "ts": "111.000",
+            },
+        }
+        result = lambda_handler(_make_event(body), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        mock_client.chat_postMessage.assert_called_once()
+        kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert kwargs["channel"] == "C_CH"
+        block_types = [b["type"] for b in kwargs["blocks"]]
+        assert "actions" in block_types
+        action_block = next(b for b in kwargs["blocks"] if b["type"] == "actions")
+        assert action_block["elements"][0]["action_id"] == "open_profile_modal"
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_block_actions_opens_modal_with_existing_values(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """既存プロファイルあり → views.open の initial_value に既存値が入る。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {
+            "Item": {"user_id": "U_USER", "role": "クラウドエンジニア", "interests": "AI"}
+        }
+        mock_dynamodb.Table.return_value = mock_table
+        mock_client = MagicMock()
+        mock_webclient_cls.return_value = mock_client
+
+        payload = {
+            "type": "block_actions",
+            "user": {"id": "U_USER"},
+            "channel": {"id": "C_CH"},
+            "trigger_id": "trig_123",
+            "actions": [{"action_id": "open_profile_modal"}],
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        mock_client.views_open.assert_called_once()
+        view = mock_client.views_open.call_args.kwargs["view"]
+        assert view["callback_id"] == "profile_submit"
+
+        role_block = next(b for b in view["blocks"] if b.get("block_id") == "block_role")
+        assert role_block["element"]["initial_value"] == "クラウドエンジニア"
+
+        expertise_block = next(b for b in view["blocks"] if b.get("block_id") == "block_expertise")
+        assert "initial_value" not in expertise_block["element"]
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_block_actions_opens_empty_modal_when_no_profile(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """既存プロファイル無し → views.open は呼ばれるが initial_value は全て無い。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {}
+        mock_dynamodb.Table.return_value = mock_table
+        mock_client = MagicMock()
+        mock_webclient_cls.return_value = mock_client
+
+        payload = {
+            "type": "block_actions",
+            "user": {"id": "U_NEW"},
+            "channel": {"id": "C_CH"},
+            "trigger_id": "trig_456",
+            "actions": [{"action_id": "open_profile_modal"}],
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        view = mock_client.views_open.call_args.kwargs["view"]
+        input_blocks = [b for b in view["blocks"] if b["type"] == "input"]
+        assert len(input_blocks) == 6
+        for b in input_blocks:
+            assert "initial_value" not in b["element"]
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_writes_set_and_remove(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """空欄あり/値ありの mix で update_item が SET + REMOVE 両方を含む式を発行する。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+        state_values = {
+            "block_role": {"input_role": {"value": "クラウドエンジニア"}},
+            "block_interests": {"input_interests": {"value": "AI, 料理"}},
+            "block_expertise": {"input_expertise": {"value": ""}},
+            "block_learning_goals": {"input_learning_goals": {"value": "  "}},  # trim 後空
+            "block_background": {"input_background": {"value": None}},
+            "block_output_preferences": {"input_output_preferences": {"value": ""}},
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_CH"}),
+                "state": {"values": state_values},
+            },
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        mock_table.update_item.assert_called_once()
+        kw = mock_table.update_item.call_args.kwargs
+        update_expr = kw["UpdateExpression"]
+        attr_names = kw["ExpressionAttributeNames"]
+
+        assert "SET" in update_expr and "REMOVE" in update_expr
+
+        # SET 部分のフィールド名集合: role, interests, updated_at, created_at
+        set_part = update_expr.split("REMOVE", 1)[0]
+        set_names = {attr_names[alias] for alias in attr_names if alias in set_part}
+        assert {"role", "interests", "updated_at", "created_at"} <= set_names
+
+        # REMOVE 部分のフィールド名集合: expertise, learning_goals, background, output_preferences
+        remove_part = update_expr.split("REMOVE", 1)[1]
+        remove_names = {attr_names[alias.strip()] for alias in remove_part.split(",")}
+        assert remove_names == {"expertise", "learning_goals", "background", "output_preferences"}
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_does_not_touch_learned_preferences(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """UpdateExpression に learned_preferences が一切登場しない (B 方式・AC-3)。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+        state_values = {
+            f"block_{k}": {f"input_{k}": {"value": "x"}}
+            for k in ["role", "interests", "expertise", "learning_goals", "background", "output_preferences"]
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_CH"}),
+                "state": {"values": state_values},
+            },
+        }
+        lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+
+        kw = mock_table.update_item.call_args.kwargs
+        assert "learned_preferences" not in str(kw)
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_returns_errors_for_long_fields(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """501 文字以上を含む submit に response_action:errors が返り、update_item は呼ばれない。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+        long_val = "あ" * 501
+        state_values = {
+            "block_role": {"input_role": {"value": "OK"}},
+            "block_interests": {"input_interests": {"value": long_val}},
+            "block_expertise": {"input_expertise": {"value": ""}},
+            "block_learning_goals": {"input_learning_goals": {"value": ""}},
+            "block_background": {"input_background": {"value": ""}},
+            "block_output_preferences": {"input_output_preferences": {"value": ""}},
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": "{}",
+                "state": {"values": state_values},
+            },
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+
+        body = json.loads(result["body"])
+        assert body["response_action"] == "errors"
+        assert "block_interests" in body["errors"]
+        mock_table.update_item.assert_not_called()
+
+    @patch("app.secrets_client")
+    def test_interactive_payload_with_missing_payload_returns_400(self, mock_secrets):
+        """form body に payload キーが無ければ 400 を返す。"""
+        from urllib.parse import urlencode
+
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+
+        ts = str(int(time.time()))
+        body_str = urlencode({"foo": "bar"})
+        sig = _make_signature(body_str, ts)
+        event = {
+            "body": body_str,
+            "headers": {
+                "X-Slack-Request-Timestamp": ts,
+                "X-Slack-Signature": sig,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        }
+        result = lambda_handler(event, _make_lambda_context())
+        assert result["statusCode"] == 400

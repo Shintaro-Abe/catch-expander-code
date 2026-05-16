@@ -689,9 +689,8 @@ LLM呼び出し②: セルフレビュー
 ### MVP（初回リリース）
 - F1〜F9の基本機能（品質担保、フィードバック学習、成果物履歴管理を含む）
   - ※ F8（フィードバック学習）・F9（成果物履歴管理）は当初 MVP 対象外として宣言されていたが、初回リリース後に追加実装され、現在は production 反映済み
-  - ※ **F6（ユーザープロファイル）は部分実装**。`UserProfilesTable` (DynamoDB) と `get_user_profile` / `put_user_profile` の読み書き API、orchestrator から `learned_preferences` を含むプロファイルを参照する経路は production 反映済み (`src/agent/state/dynamodb_client.py`、`src/agent/orchestrator.py`)。一方で `@CatchExpander profile` コマンドによる対話式登録ハンドラ・スキーマバリデーションは **未実装**。現在は F8 フィードバック学習による `learned_preferences` の累積でプロファイル相当の効果を得ている。AC-3 の「登録できる」を満たす登録 UX は別途 steering で起票予定（`.steering/20260405-initial-implementation/requirements.md` 事後追記参照）。
+  - ※ **F6（ユーザープロファイル）は完全実装** (2026-05-15)。`@CatchExpander profile` で Slack Modal が開き、5W1H 直交 6 フィールド（役割・職業 / 関心分野 / 専門・得意領域 / 学習の目的 / 背景・状況 / 受け取り方の好み）を登録・編集できる (`.steering/20260515-user-profile-modal/`)。各フィールドは任意・最大 500 字、空欄保存でフィールド単位の削除（B 方式）に対応。`learned_preferences` (F8 で自動累積) は本登録経路で上書き / 削除されない。閲覧 UX（ダッシュボード可視化 + Slack 専用閲覧コマンド）は別 steering で対応予定。
 - 1ユーザー・1ワークスペース対応
-- ユーザープロファイル手動登録 UX は未実装（DynamoDB `put_user_profile` を CLI / 直接書き込みで投入する運用）
 
 ### 将来拡張
 - 複数ユーザー対応

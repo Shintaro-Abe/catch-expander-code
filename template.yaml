@@ -679,6 +679,14 @@ Resources:
                 - !GetAtt WorkflowExecutionsTable.Arn
                 - !Sub ${WorkflowExecutionsTable.Arn}/index/user-id-index
                 - !GetAtt DeliverablesTable.Arn
+            # [F6] User Profile Modal: TriggerFunction が UserProfilesTable を
+            # 直接読み書きする必要があるため最小権限で追加 (GetItem + UpdateItem のみ)
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt UserProfilesTable.Arn
             - Effect: Allow
               Action:
                 - ecs:RunTask

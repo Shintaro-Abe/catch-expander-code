@@ -28,6 +28,24 @@ ecs_client = boto3.client("ecs")
 _cached_secrets: dict[str, str] = {}
 
 
+# User Profile Modal フィールド定義（F6、5W1H 直交フレーム）
+# (key, label, placeholder, multiline)
+PROFILE_FIELDS: list[tuple[str, str, str, bool]] = [
+    ("role", "役割・職業",
+     "クラウドエンジニア（AWS 中心、SRE 担当） / マーケター（B2B SaaS）", False),
+    ("interests", "関心分野",
+     "AI（LLM のビジネス活用）、料理（時短レシピ）、投資（インデックス中心）", True),
+    ("expertise", "専門・得意領域",
+     "インフラ設計（5 年）、Python・SQL は実務レベル、統計は基礎のみ", True),
+    ("learning_goals", "学習の目的",
+     "副業として Web 制作で案件獲得したい。HTML/CSS は理解しているが営業ノウハウが弱い", True),
+    ("background", "背景・状況",
+     "30 代後半、子育て中、SaaS 企業のインフラチーム所属、転職活動準備中", False),
+    ("output_preferences", "受け取り方の好み",
+     "箇条書き重視、実例 3 つ必須、専門用語は注釈付き、英語ソース引用 OK", True),
+]
+
+
 def _find_completed_execution(user_id: str, thread_ts: str, table_prefix: str) -> dict | None:
     """workflow-executions テーブルを user-id-index GSI でクエリし、
     指定 thread_ts に一致する実行レコードを返す。
@@ -186,6 +204,222 @@ def _post_history_result(
     slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
 
 
+# ---------------------------------------------------------------------------
+# User Profile Modal ヘルパー群 (F6)
+# ---------------------------------------------------------------------------
+
+
+def _get_user_profile(user_id: str) -> dict | None:
+    """UserProfilesTable から既存プロファイル取得（trigger ローカル実装）。"""
+    table = dynamodb.Table(f"{os.environ['DYNAMODB_TABLE_PREFIX']}-user-profiles")
+    response = table.get_item(Key={"user_id": user_id})
+    return response.get("Item")
+
+
+def _update_user_profile_fields(user_id: str, fields: dict[str, str]) -> None:
+    """値ありは SET、空欄は REMOVE する UpdateItem を 1 発で反映。
+
+    learned_preferences など他キーは UpdateExpression に含めないため自動的に保持される。
+    """
+    table = dynamodb.Table(f"{os.environ['DYNAMODB_TABLE_PREFIX']}-user-profiles")
+    set_keys = {k: v for k, v in fields.items() if v}
+    remove_keys = [k for k, v in fields.items() if not v]
+
+    now = datetime.now(UTC).isoformat()
+    set_expr_parts: list[str] = []
+    remove_expr_parts: list[str] = []
+    expr_attr_names: dict[str, str] = {}
+    expr_attr_values: dict[str, str] = {}
+
+    for i, (k, v) in enumerate(set_keys.items()):
+        name_alias = f"#k{i}"
+        value_alias = f":v{i}"
+        set_expr_parts.append(f"{name_alias} = {value_alias}")
+        expr_attr_names[name_alias] = k
+        expr_attr_values[value_alias] = v
+
+    for i, k in enumerate(remove_keys):
+        name_alias = f"#r{i}"
+        remove_expr_parts.append(name_alias)
+        expr_attr_names[name_alias] = k
+
+    expr_attr_names["#u"] = "updated_at"
+    expr_attr_values[":u"] = now
+    set_expr_parts.append("#u = :u")
+    expr_attr_names["#c"] = "created_at"
+    expr_attr_values[":c"] = now
+    set_expr_parts.append("#c = if_not_exists(#c, :c)")
+
+    update_expr_parts: list[str] = []
+    if set_expr_parts:
+        update_expr_parts.append("SET " + ", ".join(set_expr_parts))
+    if remove_expr_parts:
+        update_expr_parts.append("REMOVE " + ", ".join(remove_expr_parts))
+    update_expression = " ".join(update_expr_parts)
+
+    table.update_item(
+        Key={"user_id": user_id},
+        UpdateExpression=update_expression,
+        ExpressionAttributeNames=expr_attr_names,
+        ExpressionAttributeValues=expr_attr_values,
+    )
+
+
+def _post_profile_open_button(slack_token: str, channel: str, user_id: str) -> None:
+    """プロファイル登録 Modal を開くボタン付きメッセージを投稿。"""
+    client = WebClient(token=slack_token)
+    client.chat_postMessage(
+        channel=channel,
+        text="プロファイル登録",
+        blocks=[
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f"<@{user_id}> プロファイルを登録・編集できます。"},
+            },
+            {
+                "type": "actions",
+                "block_id": "profile_actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "open_profile_modal",
+                        "text": {"type": "plain_text", "text": "プロファイルを開く"},
+                        "style": "primary",
+                    }
+                ],
+            },
+        ],
+    )
+
+
+def _build_profile_modal(existing: dict, callback_metadata: dict) -> dict:
+    """Modal の Block Kit view を生成。既存値があれば initial_value に注入。"""
+    blocks: list[dict] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ("💡 *具体例を交えて 100〜300 字で書くと、出力の精度が上がります*。"
+                         "各フィールドの placeholder を参考にしてください。"),
+            },
+        },
+    ]
+    for key, label, placeholder, multiline in PROFILE_FIELDS:
+        element: dict = {
+            "type": "plain_text_input",
+            "action_id": f"input_{key}",
+            "multiline": multiline,
+            "max_length": 500,
+            "placeholder": {"type": "plain_text", "text": placeholder[:150]},
+        }
+        if existing.get(key):
+            element["initial_value"] = existing[key]
+        blocks.append({
+            "type": "input",
+            "block_id": f"block_{key}",
+            "label": {"type": "plain_text", "text": label},
+            "element": element,
+            "optional": True,
+        })
+    return {
+        "type": "modal",
+        "callback_id": "profile_submit",
+        "title": {"type": "plain_text", "text": "プロファイル登録"},
+        "submit": {"type": "plain_text", "text": "保存"},
+        "close": {"type": "plain_text", "text": "キャンセル"},
+        "private_metadata": json.dumps(callback_metadata),
+        "blocks": blocks,
+    }
+
+
+def _post_profile_saved(slack_token: str, channel: str, user_id: str, fields: dict) -> None:
+    """保存完了メッセージを投稿。set/removed を区別してサマリ表示。"""
+    client = WebClient(token=slack_token)
+    label_map = {k: lbl for k, lbl, _, _ in PROFILE_FIELDS}
+    set_fields = [(k, v) for k, v in fields.items() if v]
+    removed_fields = [k for k, v in fields.items() if not v]
+
+    text_parts = [f"<@{user_id}> ✅ プロファイルを保存しました"]
+    if set_fields:
+        text_parts.append("\n*登録された内容:*")
+        for k, v in set_fields:
+            preview = v if len(v) <= 80 else v[:80] + "..."
+            text_parts.append(f"• {label_map[k]}: {preview}")
+    if removed_fields:
+        text_parts.append("\n*削除されたフィールド:*")
+        for k in removed_fields:
+            text_parts.append(f"• {label_map[k]}")
+
+    client.chat_postMessage(channel=channel, text="\n".join(text_parts))
+
+
+def _handle_block_actions(payload: dict, slack_token: str) -> dict:
+    """block_actions ペイロードを処理。open_profile_modal action のみハンドル。"""
+    action = payload["actions"][0]
+    if action.get("action_id") != "open_profile_modal":
+        return {"statusCode": 200, "body": ""}
+
+    trigger_id = payload["trigger_id"]
+    user_id = payload["user"]["id"]
+    channel_id = payload.get("channel", {}).get("id", "")
+
+    existing = _get_user_profile(user_id) or {}
+
+    client = WebClient(token=slack_token)
+    client.views_open(
+        trigger_id=trigger_id,
+        view=_build_profile_modal(existing, callback_metadata={"channel_id": channel_id}),
+    )
+    return {"statusCode": 200, "body": ""}
+
+
+def _handle_view_submission(payload: dict, slack_token: str) -> dict:
+    """view_submission ペイロードを処理。profile_submit callback のみハンドル。"""
+    view = payload["view"]
+    if view.get("callback_id") != "profile_submit":
+        return {"statusCode": 200, "body": ""}
+
+    user_id = payload["user"]["id"]
+    metadata = json.loads(view.get("private_metadata", "{}"))
+    channel_id = metadata.get("channel_id", "")
+
+    values = view["state"]["values"]
+    new_fields: dict[str, str] = {}
+    for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
+        v = values.get(f"block_{key}", {}).get(f"input_{key}", {}).get("value") or ""
+        new_fields[key] = v.strip()
+
+    long_keys = [k for k, v in new_fields.items() if len(v) > 500]
+    if long_keys:
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "response_action": "errors",
+                "errors": {f"block_{k}": "500 文字以内で入力してください" for k in long_keys},
+            }),
+        }
+
+    _update_user_profile_fields(user_id, new_fields)
+
+    if channel_id:
+        _post_profile_saved(slack_token, channel_id, user_id, new_fields)
+
+    return {"statusCode": 200, "body": ""}
+
+
+def _handle_interactive(payload: dict, slack_token: str) -> dict:
+    """Slack Interactive Components のディスパッチ。"""
+    payload_type = payload.get("type")
+    if payload_type == "block_actions":
+        return _handle_block_actions(payload, slack_token)
+    if payload_type == "view_submission":
+        return _handle_view_submission(payload, slack_token)
+    logger.info("Ignoring unknown interactive payload", extra={"type": payload_type})
+    return {"statusCode": 200, "body": ""}
+
+
 @logger.inject_lambda_context
 def lambda_handler(event: dict, context: object) -> dict:
     """Slackイベントを受信し、ECSタスクを起動するLambdaハンドラー"""
@@ -208,6 +442,20 @@ def lambda_handler(event: dict, context: object) -> dict:
     if not verify_slack_signature(signing_secret, timestamp, body_str, signature):
         logger.warning("Slack signature verification failed")
         return {"statusCode": 403, "body": "Invalid signature"}
+
+    # Slack Interactive Components は application/x-www-form-urlencoded で
+    # payload=<URL encoded JSON> 形式で届く。Event API (application/json) とは
+    # ボディ形式が違うため、Content-Type で早期分岐する。
+    content_type = headers_lower.get("content-type", "")
+    if "application/x-www-form-urlencoded" in content_type:
+        from urllib.parse import parse_qs
+        parsed = parse_qs(body_str)
+        payload_str = parsed.get("payload", [None])[0]
+        if not payload_str:
+            return {"statusCode": 400, "body": "Missing payload"}
+        payload = json.loads(payload_str)
+        slack_token = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
+        return _handle_interactive(payload, slack_token)
 
     body = json.loads(body_str)
 
@@ -248,6 +496,12 @@ def lambda_handler(event: dict, context: object) -> dict:
     event_thread_ts = event_data.get("thread_ts")
     event_msg_ts = event_data.get("ts", "")
     is_thread_reply = bool(event_thread_ts and event_thread_ts != event_msg_ts)
+
+    # [F6] プロファイル登録コマンド検出（トップレベル投稿、"profile" 完全一致）
+    if not is_thread_reply and topic.strip().lower() == "profile":
+        slack_token_p = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
+        _post_profile_open_button(slack_token_p, channel, user_id)
+        return {"statusCode": 200, "body": ""}
 
     # [F9] 履歴コマンド検出（トップレベル投稿のみ）
     if not is_thread_reply and _is_history_command(topic):

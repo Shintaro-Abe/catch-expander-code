@@ -805,7 +805,14 @@ sequenceDiagram
 
 ### 5.2 プロファイル登録フロー
 
-> **実装ステータス**: 以下のシーケンスは設計のみ。`@CatchExpander profile` コマンドの対話式登録ハンドラは `src/trigger/app.py` および `src/agent/` に **未実装**。現状は `src/agent/state/dynamodb_client.py` の `put_user_profile()` を CLI / スクリプトから直接呼び出して `UserProfilesTable` に書き込む運用。F8 フィードバック学習で `learned_preferences` が自動累積されるため、プロファイル相当の効果は部分的に得られている。登録 UX の実装は別 steering で予定。
+> **実装ステータス**: 本機能は `.steering/20260515-user-profile-modal/` で **Slack Modal ベース** として実装済み。
+> 当初設計の「1 メッセージ 1 質問の対話式」とは UX が異なるが、登録項目は同等の 5W1H 6 軸（汎用名・IT 限定語を排除）。
+> - 起動: `@CatchExpander profile` でボタン付きメッセージ → ボタン押下で Modal 表示
+> - 入力: 6 フィールド（役割・職業 / 関心分野 / 専門・得意領域 / 学習の目的 / 背景・状況 / 受け取り方の好み）、各 500 字、任意（空欄可）
+> - 保存: 値ありフィールドは SET、空欄フィールドは Item から REMOVE（B 方式・個別フィールドの「削除」を自然に表現）
+> - 既存値: Modal 再表示時に initial_value として注入（編集モード）
+> - F8 で自動累積される `learned_preferences` は本登録経路で上書き / 削除されない（マージ保持）
+> - 閲覧 UX（ダッシュボード可視化 + Slack 専用閲覧コマンド）は別 steering で対応予定
 
 ```mermaid
 sequenceDiagram
@@ -814,19 +821,14 @@ sequenceDiagram
     participant CE as Catch Expander
 
     U->>S: @CatchExpander profile
-    CE->>S: プロファイルを設定します。ロールを教えてください。
-    U->>S: クラウドエンジニア
-    CE->>S: 担当クラウドを教えてください。
-    U->>S: AWS, Google Cloud
-    CE->>S: 技術スタックを教えてください。
-    U->>S: Terraform, Python, Kubernetes
-    CE->>S: 専門領域を教えてください。
-    U->>S: インフラ設計、CI/CD
-    CE->>S: 関心領域を教えてください。
-    U->>S: サーバーレス、AI/ML
-    CE->>S: 組織コンテキストを教えてください。
-    U->>S: SaaS企業のインフラチーム
-    CE->>S: ✅ プロファイルを保存しました（確認内容を表示）
+    CE->>S: プロファイル登録ボタン付きメッセージ
+    U->>S: 「プロファイルを開く」ボタン押下
+    CE->>S: Modal を表示（既存値があれば initial_value に注入）
+    Note over CE,S: 6 フィールド（5W1H 直交、汎用名）<br/>役割・職業 / 関心分野 / 専門・得意領域 /<br/>学習の目的 / 背景・状況 / 受け取り方の好み<br/>placeholder にベストプラクティス例を提示
+    U->>S: 値を入力して「保存」ボタン押下
+    CE->>CE: バリデーション（各 500 字以内）
+    CE->>CE: DynamoDB UpdateItem<br/>値あり: SET / 空欄: REMOVE<br/>(learned_preferences は触らない)
+    CE->>S: ✅ プロファイルを保存しました（登録内容 + 削除されたフィールドを表示）
 ```
 
 ## 6. F8 フィードバック学習
