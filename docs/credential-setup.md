@@ -34,8 +34,8 @@
 | `app_mentions:read` | チャンネルでのメンション検知 |
 | `chat:write` | 進捗通知・完了通知の投稿 |
 | `im:history` | DM 経由のトピック投入受信用（`channel_type == "im"` の `message` event を `src/trigger/app.py` で処理） |
-| `im:read` | DMチャンネルの情報取得 |
-| `im:write` | DMでのメッセージ送信 |
+
+> Note: 過去版で記載していた `im:read` / `im:write` は現行実装で使用するコードパスが無いため削除した（最小権限）。将来 `conversations.open` 等で DM を能動的に開く機能を追加する際に再度追加すること。
 
 ### 1.3 Event Subscriptionsの設定
 

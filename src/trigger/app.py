@@ -334,13 +334,17 @@ def _build_profile_modal(existing: dict, callback_metadata: dict) -> dict:
 
 
 def _post_profile_saved(slack_token: str, channel: str, user_id: str, fields: dict) -> None:
-    """保存完了メッセージを投稿。set/removed を区別してサマリ表示。"""
+    """保存完了メッセージを投稿。set/removed を区別してサマリ表示。
+
+    プロファイル内容は個人属性を含むため、`chat.postEphemeral` で本人のみに表示する
+    (public/private channel の他参加者には見えない)。
+    """
     client = WebClient(token=slack_token)
     label_map = {k: lbl for k, lbl, _, _ in PROFILE_FIELDS}
     set_fields = [(k, v) for k, v in fields.items() if v]
     removed_fields = [k for k, v in fields.items() if not v]
 
-    text_parts = [f"<@{user_id}> ✅ プロファイルを保存しました"]
+    text_parts = ["✅ プロファイルを保存しました"]
     if set_fields:
         text_parts.append("\n*登録された内容:*")
         for k, v in set_fields:
@@ -351,18 +355,23 @@ def _post_profile_saved(slack_token: str, channel: str, user_id: str, fields: di
         for k in removed_fields:
             text_parts.append(f"• {label_map[k]}")
 
-    client.chat_postMessage(channel=channel, text="\n".join(text_parts))
+    client.chat_postEphemeral(channel=channel, user=user_id, text="\n".join(text_parts))
 
 
 def _handle_block_actions(payload: dict, slack_token: str) -> dict:
     """block_actions ペイロードを処理。open_profile_modal action のみハンドル。"""
-    action = payload["actions"][0]
+    actions = payload.get("actions") or []
+    if not actions:
+        return {"statusCode": 200, "body": ""}
+    action = actions[0]
     if action.get("action_id") != "open_profile_modal":
         return {"statusCode": 200, "body": ""}
 
-    trigger_id = payload["trigger_id"]
-    user_id = payload["user"]["id"]
-    channel_id = payload.get("channel", {}).get("id", "")
+    trigger_id = payload.get("trigger_id")
+    user_id = (payload.get("user") or {}).get("id")
+    if not trigger_id or not user_id:
+        return {"statusCode": 200, "body": ""}
+    channel_id = (payload.get("channel") or {}).get("id", "")
 
     existing = _get_user_profile(user_id) or {}
 
@@ -376,19 +385,33 @@ def _handle_block_actions(payload: dict, slack_token: str) -> dict:
 
 def _handle_view_submission(payload: dict, slack_token: str) -> dict:
     """view_submission ペイロードを処理。profile_submit callback のみハンドル。"""
-    view = payload["view"]
+    view = payload.get("view") or {}
     if view.get("callback_id") != "profile_submit":
         return {"statusCode": 200, "body": ""}
 
-    user_id = payload["user"]["id"]
-    metadata = json.loads(view.get("private_metadata", "{}"))
+    user_id = (payload.get("user") or {}).get("id")
+    if not user_id:
+        return {"statusCode": 200, "body": ""}
+
+    try:
+        metadata = json.loads(view.get("private_metadata") or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
     channel_id = metadata.get("channel_id", "")
 
-    values = view["state"]["values"]
+    values = view.get("state", {}).get("values", {})
     new_fields: dict[str, str] = {}
     for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
-        v = values.get(f"block_{key}", {}).get(f"input_{key}", {}).get("value") or ""
-        new_fields[key] = v.strip()
+        block = values.get(f"block_{key}")
+        if block is None:
+            continue  # Modal に存在しないフィールドは no-op (将来追加で古い submit が来ても安全)
+        action = block.get(f"input_{key}")
+        if action is None:
+            continue
+        raw = action.get("value")
+        if raw is None:
+            continue  # 明示的に空文字が届いた場合のみ REMOVE 対象とする
+        new_fields[key] = raw.strip()
 
     long_keys = [k for k, v in new_fields.items() if len(v) > 500]
     if long_keys:
@@ -400,6 +423,9 @@ def _handle_view_submission(payload: dict, slack_token: str) -> dict:
                 "errors": {f"block_{k}": "500 文字以内で入力してください" for k in long_keys},
             }),
         }
+
+    if not new_fields:
+        return {"statusCode": 200, "body": ""}
 
     _update_user_profile_fields(user_id, new_fields)
 
@@ -453,7 +479,11 @@ def lambda_handler(event: dict, context: object) -> dict:
         payload_str = parsed.get("payload", [None])[0]
         if not payload_str:
             return {"statusCode": 400, "body": "Missing payload"}
-        payload = json.loads(payload_str)
+        try:
+            payload = json.loads(payload_str)
+        except json.JSONDecodeError:
+            logger.warning("Invalid JSON in interactive payload")
+            return {"statusCode": 400, "body": "Invalid payload"}
         slack_token = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
         return _handle_interactive(payload, slack_token)
 

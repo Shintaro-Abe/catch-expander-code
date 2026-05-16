@@ -1436,8 +1436,8 @@ class TestProfileModal:
             "block_role": {"input_role": {"value": "クラウドエンジニア"}},
             "block_interests": {"input_interests": {"value": "AI, 料理"}},
             "block_expertise": {"input_expertise": {"value": ""}},
-            "block_learning_goals": {"input_learning_goals": {"value": "  "}},  # trim 後空
-            "block_background": {"input_background": {"value": None}},
+            "block_learning_goals": {"input_learning_goals": {"value": "  "}},  # trim 後空 → REMOVE
+            "block_background": {"input_background": {"value": None}},  # 欠落扱い → no-op
             "block_output_preferences": {"input_output_preferences": {"value": ""}},
         }
         payload = {
@@ -1464,10 +1464,11 @@ class TestProfileModal:
         set_names = {attr_names[alias] for alias in attr_names if alias in set_part}
         assert {"role", "interests", "updated_at", "created_at"} <= set_names
 
-        # REMOVE 部分のフィールド名集合: expertise, learning_goals, background, output_preferences
+        # REMOVE 部分のフィールド名集合: expertise, learning_goals, output_preferences
+        # (background は value: None で欠落扱い、no-op になり REMOVE に含まれない)
         remove_part = update_expr.split("REMOVE", 1)[1]
         remove_names = {attr_names[alias.strip()] for alias in remove_part.split(",")}
-        assert remove_names == {"expertise", "learning_goals", "background", "output_preferences"}
+        assert remove_names == {"expertise", "learning_goals", "output_preferences"}
 
     @patch("app.dynamodb")
     @patch("app.WebClient")
@@ -1560,3 +1561,94 @@ class TestProfileModal:
         }
         result = lambda_handler(event, _make_lambda_context())
         assert result["statusCode"] == 400
+
+    @patch("app.secrets_client")
+    def test_interactive_payload_with_invalid_json_returns_400(self, mock_secrets):
+        """payload に壊れた JSON が入っていたら 400 を返し、500 にならない。"""
+        from urllib.parse import urlencode
+
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+
+        ts = str(int(time.time()))
+        body_str = urlencode({"payload": "{not-json"})
+        sig = _make_signature(body_str, ts)
+        event = {
+            "body": body_str,
+            "headers": {
+                "X-Slack-Request-Timestamp": ts,
+                "X-Slack-Signature": sig,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        }
+        result = lambda_handler(event, _make_lambda_context())
+        assert result["statusCode"] == 400
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_skips_missing_blocks(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """PROFILE_FIELDS の block が完全に欠落 → 何も更新せず 200 を返す (no-op)。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_CH"}),
+                "state": {"values": {}},  # block が一切無い古い Modal を想定
+            },
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+        mock_table.update_item.assert_not_called()
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_uses_ephemeral_for_save_confirmation(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """保存完了メッセージは chat_postEphemeral で本人のみに送る (チャンネル参加者には見えない)。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_client = MagicMock()
+        mock_webclient_cls.return_value = mock_client
+
+        state_values = {
+            "block_role": {"input_role": {"value": "クラウドエンジニア"}},
+            "block_interests": {"input_interests": {"value": "AI"}},
+            "block_expertise": {"input_expertise": {"value": "infra"}},
+            "block_learning_goals": {"input_learning_goals": {"value": "growth"}},
+            "block_background": {"input_background": {"value": "SaaS"}},
+            "block_output_preferences": {"input_output_preferences": {"value": "箇条書き"}},
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_CH"}),
+                "state": {"values": state_values},
+            },
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        mock_client.chat_postEphemeral.assert_called_once()
+        kw = mock_client.chat_postEphemeral.call_args.kwargs
+        assert kw["channel"] == "C_CH"
+        assert kw["user"] == "U_USER"
+        # 公開チャンネルに本文が出ないことを保証 (chat_postMessage は呼ばれない)
+        mock_client.chat_postMessage.assert_not_called()

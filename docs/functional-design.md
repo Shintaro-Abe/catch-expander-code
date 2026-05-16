@@ -1115,7 +1115,7 @@ sequenceDiagram
 | `get_metrics_summary` | `GET /api/v1/metrics/summary?period=` | 実行件数・ステータス分布・平均実行時間・レビュー合格率 |
 | `get_cost_summary` | `GET /api/v1/metrics/cost?period=` | トークン使用量・コスト集計 |
 | `get_api_health` | `GET /api/v1/metrics/api-health?period=` | 外部 API 呼び出し成功率・レイテンシ |
-| `get_token_monitor_health` | `GET /api/v1/metrics/token-monitor?period=` | OAuth トークン更新状況（成功 / 失敗 / `skip_count`（still_valid スキップ回数）と `last_refresh_at` / `last_failure_at` / `last_skip_at` / `last_check_at`（3 種の最新タイムスタンプの max）を返す） |
+| `get_token_monitor_health` | `GET /api/v1/metrics/token-monitor?period=` | OAuth トークン更新状況（成功 / 失敗 / `skip_count`（still_valid スキップ回数）と `last_refresh_at` / `last_failure_at` / `last_skip_at` / `last_check_at`（3 種の最新タイムスタンプの max）を返す。`success_rate` は **実リフレッシュ試行成功率 = `success_count / (success_count + failure_count)`** で、skipped (`oauth_refresh_skipped`) は分母から除外する） |
 | `get_review_quality` | `GET /api/v1/metrics/review-quality?days=` | レビュー合否・未修正コード指摘一覧 |
 | `get_errors` | `GET /api/v1/errors?days=` | エラーイベント一覧・タイプ別集計 |
 | `get_feedback_aggregation` | `GET /api/v1/metrics/feedback?period=` | フィードバック受信数・preferences 更新状況 |
