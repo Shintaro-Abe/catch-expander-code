@@ -8,6 +8,7 @@ import boto3
 from aws_lambda_powertools import Logger
 from boto3.dynamodb.conditions import Attr, Key
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from slack_verify import verify_slack_signature
 
 # events DDB への構造化イベント書き込み (T1-3、design.md §7.3)。
@@ -360,18 +361,20 @@ def _post_profile_saved(slack_token: str, channel: str, user_id: str, fields: di
 
 def _handle_block_actions(payload: dict, slack_token: str) -> dict:
     """block_actions ペイロードを処理。open_profile_modal action のみハンドル。"""
-    actions = payload.get("actions") or []
-    if not actions:
+    actions = payload.get("actions")
+    if not isinstance(actions, list) or not actions:
         return {"statusCode": 200, "body": ""}
     action = actions[0]
-    if action.get("action_id") != "open_profile_modal":
+    if not isinstance(action, dict) or action.get("action_id") != "open_profile_modal":
         return {"statusCode": 200, "body": ""}
 
     trigger_id = payload.get("trigger_id")
-    user_id = (payload.get("user") or {}).get("id")
+    user = payload.get("user")
+    user_id = user.get("id") if isinstance(user, dict) else None
     if not trigger_id or not user_id:
         return {"statusCode": 200, "body": ""}
-    channel_id = (payload.get("channel") or {}).get("id", "")
+    channel = payload.get("channel")
+    channel_id = channel.get("id", "") if isinstance(channel, dict) else ""
 
     existing = _get_user_profile(user_id) or {}
 
@@ -385,32 +388,39 @@ def _handle_block_actions(payload: dict, slack_token: str) -> dict:
 
 def _handle_view_submission(payload: dict, slack_token: str) -> dict:
     """view_submission ペイロードを処理。profile_submit callback のみハンドル。"""
-    view = payload.get("view") or {}
-    if view.get("callback_id") != "profile_submit":
+    view = payload.get("view")
+    if not isinstance(view, dict) or view.get("callback_id") != "profile_submit":
         return {"statusCode": 200, "body": ""}
 
-    user_id = (payload.get("user") or {}).get("id")
+    user = payload.get("user")
+    user_id = user.get("id") if isinstance(user, dict) else None
     if not user_id:
         return {"statusCode": 200, "body": ""}
 
     try:
         metadata = json.loads(view.get("private_metadata") or "{}")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
         metadata = {}
     channel_id = metadata.get("channel_id", "")
 
-    values = view.get("state", {}).get("values", {})
+    state = view.get("state")
+    values = state.get("values") if isinstance(state, dict) else {}
+    if not isinstance(values, dict):
+        values = {}
+
     new_fields: dict[str, str] = {}
     for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
         block = values.get(f"block_{key}")
-        if block is None:
-            continue  # Modal に存在しないフィールドは no-op (将来追加で古い submit が来ても安全)
+        if not isinstance(block, dict):
+            continue  # Modal に存在しない / 想定外型のフィールドは no-op (将来追加で古い submit が来ても安全)
         action = block.get(f"input_{key}")
-        if action is None:
+        if not isinstance(action, dict):
             continue
         raw = action.get("value")
-        if raw is None:
-            continue  # 明示的に空文字が届いた場合のみ REMOVE 対象とする
+        if not isinstance(raw, str):
+            continue  # 明示的に空文字 ("") が届いた場合のみ REMOVE 対象とする (None や非 str は no-op)
         new_fields[key] = raw.strip()
 
     long_keys = [k for k, v in new_fields.items() if len(v) > 500]
@@ -430,7 +440,20 @@ def _handle_view_submission(payload: dict, slack_token: str) -> dict:
     _update_user_profile_fields(user_id, new_fields)
 
     if channel_id:
-        _post_profile_saved(slack_token, channel_id, user_id, new_fields)
+        try:
+            _post_profile_saved(slack_token, channel_id, user_id, new_fields)
+        except SlackApiError as e:
+            # DDB 更新は完了済み。通知失敗で Lambda 全体を 500 にすると Slack Modal が失敗扱いになり、
+            # ユーザー再送 → 重複更新を招くため、通知だけ log warning にとどめて 200 を返す。
+            logger.warning(
+                "Failed to post profile saved ephemeral notice",
+                extra={
+                    "error_class": type(e).__name__,
+                    "error_response": getattr(e, "response", {}).get("error") if hasattr(e, "response") else None,
+                    "channel_id": channel_id,
+                    "user_id": user_id,
+                },
+            )
 
     return {"statusCode": 200, "body": ""}
 
@@ -483,6 +506,9 @@ def lambda_handler(event: dict, context: object) -> dict:
             payload = json.loads(payload_str)
         except json.JSONDecodeError:
             logger.warning("Invalid JSON in interactive payload")
+            return {"statusCode": 400, "body": "Invalid payload"}
+        if not isinstance(payload, dict):
+            logger.warning("Interactive payload is not a JSON object")
             return {"statusCode": 400, "body": "Invalid payload"}
         slack_token = _get_secret(os.environ["SLACK_BOT_TOKEN_SECRET_ARN"])
         return _handle_interactive(payload, slack_token)

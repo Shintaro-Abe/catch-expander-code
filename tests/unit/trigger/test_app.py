@@ -1652,3 +1652,72 @@ class TestProfileModal:
         assert kw["user"] == "U_USER"
         # 公開チャンネルに本文が出ないことを保証 (chat_postMessage は呼ばれない)
         mock_client.chat_postMessage.assert_not_called()
+
+    @patch("app.secrets_client")
+    def test_interactive_payload_with_non_dict_returns_400(self, mock_secrets):
+        """valid JSON だが top-level が dict でない (list / string 等) 場合は 400 を返し、500 にならない。"""
+        from urllib.parse import urlencode
+
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+
+        # payload が list の場合
+        ts = str(int(time.time()))
+        body_str = urlencode({"payload": "[1, 2, 3]"})
+        sig = _make_signature(body_str, ts)
+        event = {
+            "body": body_str,
+            "headers": {
+                "X-Slack-Request-Timestamp": ts,
+                "X-Slack-Signature": sig,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        }
+        result = lambda_handler(event, _make_lambda_context())
+        assert result["statusCode"] == 400
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_succeeds_even_when_ephemeral_post_fails(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """ephemeral 通知が SlackApiError を投げても DDB 更新は確定し 200 を返す (重複更新防止)。"""
+        from slack_sdk.errors import SlackApiError
+
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+        mock_client = MagicMock()
+        mock_client.chat_postEphemeral.side_effect = SlackApiError(
+            message="channel_not_found",
+            response={"error": "channel_not_found"},
+        )
+        mock_webclient_cls.return_value = mock_client
+
+        state_values = {
+            "block_role": {"input_role": {"value": "X"}},
+            "block_interests": {"input_interests": {"value": "Y"}},
+            "block_expertise": {"input_expertise": {"value": "Z"}},
+            "block_learning_goals": {"input_learning_goals": {"value": "A"}},
+            "block_background": {"input_background": {"value": "B"}},
+            "block_output_preferences": {"input_output_preferences": {"value": "C"}},
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_GONE"}),
+                "state": {"values": state_values},
+            },
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+
+        # 通知失敗でも 200 を返す
+        assert result["statusCode"] == 200
+        # DDB 更新は完了している
+        mock_table.update_item.assert_called_once()
