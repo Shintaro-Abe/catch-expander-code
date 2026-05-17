@@ -250,3 +250,59 @@ graph TD
 - 共通のデザインシステム（Tailwind CSS）を使用して統一感を保つ
 - セキュリティを考慮したコーディング（XSS対策、入力バリデーションなど）
 - 図表は必要最小限に留め、メンテナンスコストを抑える
+
+## 作業規律
+
+セッション中の行動規範。成果物（docs / .steering）とは別に、Claude の挙動そのものを縛るルール。
+
+### 1. 検証の基準（Verification Standards）
+
+「完了」と報告してよいのは、観測した事実がある場合のみ。
+
+- **デプロイ完了 ≠ 機能検証**
+  - `sam deploy` 成功 / CI pass / exit code 0 は「動いた」根拠にならない
+  - CloudWatch Logs の実出力、エンドポイント実呼び出し、UI の実画面のいずれかで挙動を確認してから報告する
+- **artifact の実反映を確認**
+  - `sam deploy` 後は CloudFormation Outputs か ECS task definition で image SHA / version が更新されたことを確認
+  - フロントは S3 sync 後の CloudFront invalidation 完了まで含めて検証
+- **報告フォーマット**
+  - 「verified」と書く場合は (1) 受け入れ基準、(2) 各基準の根拠（コマンド / ログ / URL）、(3) 未検証で推測している項目 を明示する
+  - (3) に該当するものは「verified」と呼ばない
+
+### 2. ステアリングワークフロー（Steering Workflow）
+
+機能追加・修正は必ず steering 経由で行う。
+
+- **承認順序の厳守**
+  - `requirements.md` → ユーザー承認 → `design.md` → ユーザー承認 → `tasklist.md` → ユーザー承認 → 実装
+  - 前段の承認なしに次のファイルを作成しない
+- **再発バグエリアの扱い**
+  - 同じ症状を過去に修正した領域（例: `_run_review_loop`、Slack Modal 入力）では、まずプロジェクトメモリと過去 steering を検索する
+  - 提案する修正が「症状パッチ」か「構造修正」かを明示してから推奨する
+  - 症状パッチを選ぶ場合は理由（時間制約 / 影響範囲）を書く
+
+### 3. セッションハンドオフ（Session Handoff）
+
+トークン消費が高まったら、ユーザーが指示する前にハンドオフを完了させる。
+
+- **トリガ**: 残コンテキストが体感で残り少ない / 自然な区切り / ユーザーの「終わる」発言
+- **更新ファイル**: `/home/vscode/.claude/projects/-workspaces-Catch-Expander/memory/project_YYYY-MM-DD-session-end.md`
+- **必須 4 項目**:
+  1. 完了作業（commit hash + 1 行要約）
+  2. 現在の状態（HEAD、デプロイ revision、working tree clean か）
+  3. 次候補タスク（具体的な再開ポイント）
+  4. ブロッカー / pre-existing failure
+- 既存のセッション終端メモ（`project_2026-05-1*-session-end.md`）を雛形にする
+
+### 4. Codex レビューゲート（Codex Review Gate）
+
+コード変更を伴うコミット後は、Codex レビューを挟むまで次の build / deploy に進まない。
+
+- **タイミング**: `git push` 完了直後
+- **手順**:
+  1. `.audit/YYYY-MM-DD_<topic>.prompt.md` にレビュー観点を書いた prompt を用意
+  2. `.audit/YYYY-MM-DD_<topic>.md` を結果保存先として準備
+  3. ユーザーに「Codex レビューを回す承認」を求めて停止
+  4. 承認後のみ手動 `codex -c sandbox_mode="danger-full-access"` を実行（companion 経由は WSL2 で hang する）
+- **連続レビュー**: 1 pass 完了後に「2 pass 目を回すか」を必ず確認、承認なしで連続自動実行しない
+- **build / deploy**: Codex 指摘ゼロが確認できた後、ユーザーの明示承認をもらってから `sam build` / `sam deploy` を実行
