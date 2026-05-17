@@ -414,14 +414,21 @@ def _handle_view_submission(payload: dict, slack_token: str) -> dict:
     for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
         block = values.get(f"block_{key}")
         if not isinstance(block, dict):
-            continue  # Modal に存在しない / 想定外型のフィールドは no-op (将来追加で古い submit が来ても安全)
+            continue  # Modal block 自体が無い → no-op (フィールド追加直後の古い submit を防御)
         action = block.get(f"input_{key}")
         if not isinstance(action, dict):
             continue
+        # Slack 仕様: optional な plain_text_input を空欄で submit すると
+        # `value: null` (Python では None) で届く。空文字 `""` で届くとは限らない。
+        # block / action が存在する以上ユーザーが Modal を submit した明示的意図なので、
+        # None も「空欄保存 = REMOVE 対象」として扱う。想定外型 (int 等) のみ no-op。
         raw = action.get("value")
-        if not isinstance(raw, str):
-            continue  # 明示的に空文字 ("") が届いた場合のみ REMOVE 対象とする (None や非 str は no-op)
-        new_fields[key] = raw.strip()
+        if raw is None:
+            new_fields[key] = ""
+        elif isinstance(raw, str):
+            new_fields[key] = raw.strip()
+        else:
+            continue
 
     long_keys = [k for k, v in new_fields.items() if len(v) > 500]
     if long_keys:

@@ -1437,7 +1437,8 @@ class TestProfileModal:
             "block_interests": {"input_interests": {"value": "AI, 料理"}},
             "block_expertise": {"input_expertise": {"value": ""}},
             "block_learning_goals": {"input_learning_goals": {"value": "  "}},  # trim 後空 → REMOVE
-            "block_background": {"input_background": {"value": None}},  # 欠落扱い → no-op
+            # Slack の optional input は空欄で value: null を送るため、None も明示的空欄として REMOVE
+            "block_background": {"input_background": {"value": None}},
             "block_output_preferences": {"input_output_preferences": {"value": ""}},
         }
         payload = {
@@ -1464,11 +1465,10 @@ class TestProfileModal:
         set_names = {attr_names[alias] for alias in attr_names if alias in set_part}
         assert {"role", "interests", "updated_at", "created_at"} <= set_names
 
-        # REMOVE 部分のフィールド名集合: expertise, learning_goals, output_preferences
-        # (background は value: None で欠落扱い、no-op になり REMOVE に含まれない)
+        # REMOVE 部分: 空文字 / trim 後空 / value: null すべて REMOVE
         remove_part = update_expr.split("REMOVE", 1)[1]
         remove_names = {attr_names[alias.strip()] for alias in remove_part.split(",")}
-        assert remove_names == {"expertise", "learning_goals", "output_preferences"}
+        assert remove_names == {"expertise", "learning_goals", "background", "output_preferences"}
 
     @patch("app.dynamodb")
     @patch("app.WebClient")
@@ -1676,6 +1676,60 @@ class TestProfileModal:
         }
         result = lambda_handler(event, _make_lambda_context())
         assert result["statusCode"] == 400
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_removes_field_when_slack_sends_value_null(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """実機シナリオ: ユーザーが Modal で `interests` だけ空欄にして保存。
+
+        Slack の optional plain_text_input は空欄を `value: null` で送るため、
+        block/action が存在する以上、None は明示的な空欄保存として REMOVE 対象になる。
+        他フィールドは値ありなら SET、未表示の block は no-op (今回のテストでは全 6 件表示)。
+        """
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+        # interests だけ value: null (空欄)、他はすべて値あり
+        state_values = {
+            "block_role": {"input_role": {"value": "クラウドエンジニア"}},
+            "block_interests": {"input_interests": {"value": None}},  # ← 空欄保存
+            "block_expertise": {"input_expertise": {"value": "infra"}},
+            "block_learning_goals": {"input_learning_goals": {"value": "growth"}},
+            "block_background": {"input_background": {"value": "SaaS"}},
+            "block_output_preferences": {"input_output_preferences": {"value": "箇条書き"}},
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_CH"}),
+                "state": {"values": state_values},
+            },
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        mock_table.update_item.assert_called_once()
+        kw = mock_table.update_item.call_args.kwargs
+        update_expr = kw["UpdateExpression"]
+        attr_names = kw["ExpressionAttributeNames"]
+
+        # interests のみ REMOVE
+        remove_part = update_expr.split("REMOVE", 1)[1] if "REMOVE" in update_expr else ""
+        remove_names = {attr_names[alias.strip()] for alias in remove_part.split(",") if alias.strip()}
+        assert remove_names == {"interests"}
+
+        # 他 5 フィールドは SET 側に乗る
+        set_part = update_expr.split("REMOVE", 1)[0]
+        set_names = {attr_names[alias] for alias in attr_names if alias in set_part}
+        assert {"role", "expertise", "learning_goals", "background", "output_preferences"} <= set_names
 
     @patch("app.dynamodb")
     @patch("app.WebClient")
