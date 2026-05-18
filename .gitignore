@@ -63,3 +63,6 @@ graphify-out/
 
 # Local design assets (not part of repo deliverables)
 aws-architecture.drawio
+
+# Claude Code MCP server config (environment-specific paths and personal MCP setup)
+.mcp.json
