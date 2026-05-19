@@ -134,6 +134,24 @@ export interface AuthMeResponse {
   expires_at: number
 }
 
+// F6 User Profile 閲覧用: dashboard_api/get_my_profile が返す本人プロファイル。
+// 値が REMOVE 済 / 未設定の軸は null で返る。learned_preferences は要素なしなら空配列。
+export interface MyProfile {
+  user_id: string
+  role: string | null
+  interests: string | null
+  expertise: string | null
+  learning_goals: string | null
+  background: string | null
+  output_preferences: string | null
+  learned_preferences: string[]
+  updated_at: string | null
+}
+
+export interface MyProfileResponse {
+  data: MyProfile
+}
+
 export type Period = "24h" | "7d" | "30d"
 
 export interface FeedbackEvent {

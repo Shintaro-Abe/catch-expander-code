@@ -14,6 +14,7 @@ _LAMBDA_APP_MODULES = [
     "src.dashboard_api.get_review_quality.app",
     "src.dashboard_api.get_errors.app",
     "src.dashboard_api.list_executions.app",
+    "src.dashboard_api.get_my_profile.app",
 ]
 
 for _mod in _LAMBDA_APP_MODULES:

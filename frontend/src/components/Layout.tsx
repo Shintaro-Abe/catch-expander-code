@@ -2,7 +2,7 @@ import { useState } from "react"
 import { NavLink, Outlet } from "react-router-dom"
 import {
   LayoutDashboard, List, Star, AlertTriangle, MessageSquare,
-  LogOut, User, Menu, ChevronLeft, ChevronRight,
+  LogOut, User, UserCircle, Menu, ChevronLeft, ChevronRight,
 } from "lucide-react"
 import { useAuth } from "@/contexts/AuthContext"
 
@@ -12,6 +12,7 @@ const NAV = [
   { to: "/review-quality", icon: Star,             label: "レビュー品質"      },
   { to: "/errors",         icon: AlertTriangle,    label: "エラー"            },
   { to: "/feedback",       icon: MessageSquare,    label: "フィードバック分析" },
+  { to: "/profile",        icon: UserCircle,       label: "マイプロファイル"   },
 ]
 
 export function Layout() {

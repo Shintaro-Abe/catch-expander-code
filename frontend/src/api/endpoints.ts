@@ -9,6 +9,7 @@ import type {
   ExecutionListResponse,
   FeedbackAggregationResponse,
   MetricsSummary,
+  MyProfileResponse,
   Period,
   ReviewQualityResponse,
   SubagentIOResponse,
@@ -30,6 +31,9 @@ export const endpoints = {
 
   tokenMonitor: (period: Period) =>
     api.get<{ data: TokenMonitorHealth }>(`/api/v1/metrics/token-monitor?period=${period}`),
+
+  myProfile: () =>
+    api.get<MyProfileResponse>("/api/v1/profile/me"),
 
   executions: (params?: { limit?: number; from?: string; to?: string; status?: string; topic?: string }) => {
     const q = new URLSearchParams()

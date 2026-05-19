@@ -1212,6 +1212,35 @@ Resources:
                 - !GetAtt DashboardEventsTable.Arn
                 - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
 
+  # [F6] User Profile 閲覧 Lambda: UserProfilesTable から本人プロファイルを read-only で返す。
+  # 編集は src/trigger/app.py の Slack Modal フローで完結 (UpdateItem は付与しない)。
+  DashboardGetMyProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-my-profile
+      Handler: get_my_profile.app.lambda_handler
+      CodeUri: src/dashboard_api/
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          USER_PROFILES_TABLE: !Ref UserProfilesTable
+      Events:
+        GetMyProfile:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/profile/me
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                - !GetAtt UserProfilesTable.Arn
+
   DashboardGetFeedbackAggregationFunction:
     Type: AWS::Serverless::Function
     Properties:
