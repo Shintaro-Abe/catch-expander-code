@@ -8,6 +8,7 @@ JWT 由来の user_sub から Slack user_id を導出し、UserProfilesTable か
 
 import logging
 import os
+import re
 
 import boto3
 from _common import error_response, json_response
@@ -27,6 +28,10 @@ _PROFILE_KEYS = (
     "output_preferences",
 )
 
+# Slack user_id は U / W プレフィックス + uppercase alphanumeric。
+# 形状破壊時に「placeholder 表示」で隠れず即 401 で原因特定を早めるためのガード。
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
+
 
 def _extract_slack_user_id(user_sub: str | None) -> str | None:
     """Slack OIDC sub から Slack user_id を取り出す。
@@ -35,10 +40,38 @@ def _extract_slack_user_id(user_sub: str | None) -> str | None:
     実機 cookie デコードで確認済 (.steering/20260518-frontend-profile-view/tasklist.md T0-1)。
     将来 "<user_id>-<team_id>" 形式に変わっても壊れないよう split("-")[0] で防御。
     Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様。
+    抽出後に Slack user_id らしさを regex 検証し、形状破壊を 401 で早期 fail させる。
     """
     if not user_sub:
         return None
-    return user_sub.split("-", 1)[0]
+    candidate = user_sub.split("-", 1)[0]
+    if not _SLACK_USER_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _serialize_learned_preferences(raw: object) -> list[str]:
+    """UserProfilesTable の learned_preferences を frontend 用 string[] に正規化する。
+
+    実保存形式は `{"text": str, "created_at": str}` の dict 配列 (feedback_processor.py:199)。
+    将来の互換性のため、文字列要素 / 旧形式 / 想定外型も吸収する:
+    - dict: "text" フィールドを抽出 (空文字や whitespace-only はスキップ)
+    - str: そのまま採用
+    - その他: スキップ
+    """
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for pref in raw:
+        if isinstance(pref, str):
+            text: object = pref
+        elif isinstance(pref, dict):
+            text = pref.get("text")
+        else:
+            continue
+        if isinstance(text, str) and text.strip():
+            result.append(text)
+    return result
 
 
 def lambda_handler(event: dict, context: object) -> dict:
@@ -61,7 +94,7 @@ def lambda_handler(event: dict, context: object) -> dict:
     body = {
         "user_id": user_id,
         **{k: item.get(k) for k in _PROFILE_KEYS},
-        "learned_preferences": item.get("learned_preferences") or [],
+        "learned_preferences": _serialize_learned_preferences(item.get("learned_preferences")),
         "updated_at": item.get("updated_at"),
     }
     return json_response(200, {"data": body})

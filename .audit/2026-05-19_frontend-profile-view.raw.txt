@@ -1,0 +1,2340 @@
+OpenAI Codex v0.125.0 (research preview)
+--------
+workdir: /workspaces/Catch-Expander
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 019e4088-fe60-7351-9b28-5b9d23c4eb81
+--------
+user
+# Codex レビュー依頼 (1 回目): Frontend Profile View (F6 閲覧 UX)
+
+## 役割
+
+あなたは Catch-Expander プロジェクトのシニアレビュアーです。F6 (User Profile) の閲覧 UX を frontend SPA に追加する PR をレビューしてください。
+
+対象 commit: `99d8abf feat(dashboard): add /profile read-only view for F6 user profile`
+
+## 背景
+
+### 機能の位置づけ
+
+F6 = ユーザーの 5W1H 直交 6 軸プロファイル (役割・職業 / 関心分野 / 専門・得意領域 / 学習の目的 / 背景・状況 / 受け取り方の好み、各 500 字、任意)。
+
+これまでの状態:
+- 登録 / 編集 / 削除は **Slack Modal 経由で完了済み** (commits `20392bf` / `97b033e` / `73c9a56` / `c8f5e97`、`src/trigger/app.py` 内 `PROFILE_FIELDS` / `TestProfileModal` 7 ケース)
+- DynamoDB `UserProfilesTable` (PK: `user_id`) に保存
+- **閲覧する手段がない** — Slack Modal を再オープンしないと中身が見えない
+
+本 PR はこの欠落を埋めるため:
+- 新規 Lambda `DashboardGetMyProfileFunction`
+- 新規 HttpApi route `GET /api/v1/profile/me`
+- frontend に `/profile` サブページ + Sidebar 「マイプロファイル」
+- すべて read-only (編集は Slack Modal 1 系統維持)
+
+### スコープ外（意図的）
+
+- 編集 UI は frontend 側に置かない (Slack Modal の 1 系統メンテに統一)
+- 他ユーザー閲覧経路は作らない (API ルートは `/me` 固定、JWT 由来 user_id のみ参照)
+- learned_preferences の編集 / リセット機能
+
+### 設計判断 (`.steering/20260518-frontend-profile-view/design.md` §4.1)
+
+**JWT sub → Slack user_id 変換**:
+- 実機 cookie デコード結果 (2026-05-19): `sub` は `U04JBJU88A0` のような pure user_id 形式 (ハイフン区切りなし)
+- ただし Slack OIDC 仕様上 `<user_id>-<team_id>` 形式の可能性も残るため、防御的に `split("-", 1)[0]` を採用
+- Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様 → split は実害ゼロ
+
+## レビュー対象
+
+### 変更 1: Backend Lambda 新規 (`src/dashboard_api/get_my_profile/app.py`, +67 行)
+
+```python
+"""F6 User Profile 閲覧用 Lambda。
+
+JWT 由来の user_sub から Slack user_id を導出し、UserProfilesTable から
+本人プロファイル (6 軸 + learned_preferences) を read-only で取得する。
+
+設計: .steering/20260518-frontend-profile-view/design.md
+"""
+
+import logging
+import os
+
+import boto3
+from _common import error_response, json_response
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+_dynamodb = boto3.resource("dynamodb")
+
+# 5W1H 6 軸キー (src/trigger/app.py:PROFILE_FIELDS と整合)
+_PROFILE_KEYS = (
+    "role",
+    "interests",
+    "expertise",
+    "learning_goals",
+    "background",
+    "output_preferences",
+)
+
+
+def _extract_slack_user_id(user_sub: str | None) -> str | None:
+    """Slack OIDC sub から Slack user_id を取り出す。
+
+    本番 Slack OIDC は pure user_id 形式 (例: "U0XXXXXXXX") を返すことを
+    実機 cookie デコードで確認済 (.steering/20260518-frontend-profile-view/tasklist.md T0-1)。
+    将来 "<user_id>-<team_id>" 形式に変わっても壊れないよう split("-")[0] で防御。
+    Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様。
+    """
+    if not user_sub:
+        return None
+    return user_sub.split("-", 1)[0]
+
+
+def lambda_handler(event: dict, context: object) -> dict:
+    request_id = getattr(context, "aws_request_id", "")
+
+    auth_ctx = event.get("requestContext", {}).get("authorizer", {}).get("lambda", {})
+    user_sub = auth_ctx.get("user_sub")
+    user_id = _extract_slack_user_id(user_sub)
+    if not user_id:
+        return error_response(401, "UNAUTHORIZED", "Missing or invalid user_sub", request_id)
+
+    table = _dynamodb.Table(os.environ["USER_PROFILES_TABLE"])
+    try:
+        result = table.get_item(Key={"user_id": user_id})
+    except Exception as e:  # noqa: BLE001
+        logger.error("DDB get_item failed for request %s: %s", request_id, type(e).__name__)
+        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+
+    item = result.get("Item") or {}
+    body = {
+        "user_id": user_id,
+        **{k: item.get(k) for k in _PROFILE_KEYS},
+        "learned_preferences": item.get("learned_preferences") or [],
+        "updated_at": item.get("updated_at"),
+    }
+    return json_response(200, {"data": body})
+```
+
+**重要な設計判断**:
+- レコード未存在 → HTTP 200 + null フィールド (404 ではない)。初見ユーザー UX を「エラー画面」ではなく「プレースホルダー画面」に統一するため
+- 個人情報保護: profile 内容は CloudWatch Logs に書き出さない (logger.error は request_id + 例外型のみ)
+
+### 変更 2: template.yaml に Lambda + Event + IAM 追加 (+29 行)
+
+```yaml
+  # [F6] User Profile 閲覧 Lambda: UserProfilesTable から本人プロファイルを read-only で返す。
+  # 編集は src/trigger/app.py の Slack Modal フローで完結 (UpdateItem は付与しない)。
+  DashboardGetMyProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: catch-expander-dashboard-get-my-profile
+      Handler: get_my_profile.app.lambda_handler
+      CodeUri: src/dashboard_api/
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          USER_PROFILES_TABLE: !Ref UserProfilesTable
+      Events:
+        GetMyProfile:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /api/v1/profile/me
+            Method: GET
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource:
+                - !GetAtt UserProfilesTable.Arn
+```
+
+**最小権限**: GetItem のみ (UpdateItem は付与しない)。
+
+### 変更 3: Frontend ページ新規 (`frontend/src/routes/MyProfile.tsx`, +118 行)
+
+```tsx
+import { useQuery } from "@tanstack/react-query"
+import { Info } from "lucide-react"
+
+import { endpoints } from "@/api/endpoints"
+import type { MyProfile } from "@/api/types"
+import { fmtRelative } from "@/lib/time"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
+
+// 5W1H 6 軸キーとラベルの対応 (backend get_my_profile.app._PROFILE_KEYS と整合)
+const AXIS_FIELDS: ReadonlyArray<{ key: keyof Omit<MyProfile, "user_id" | "learned_preferences" | "updated_at">; label: string }> = [
+  { key: "role",                label: "役割・職業" },
+  { key: "interests",           label: "関心分野" },
+  { key: "expertise",           label: "専門・得意領域" },
+  { key: "learning_goals",      label: "学習の目的" },
+  { key: "background",          label: "背景・状況" },
+  { key: "output_preferences",  label: "受け取り方の好み" },
+]
+
+function AxisRow({ label, value }: { label: string; value: string | null }) {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-[200px_1fr] gap-2 py-3 border-b border-border last:border-b-0">
+      <div className="text-sm font-medium text-foreground">{label}</div>
+      {value ? (
+        <div className="text-sm text-foreground whitespace-pre-wrap break-words">{value}</div>
+      ) : (
+        <div className="text-sm italic text-muted-foreground">未設定</div>
+      )}
+    </div>
+  )
+}
+
+export function MyProfile() {
+  const q = useQuery({
+    queryKey: ["my-profile"],
+    queryFn: () => endpoints.myProfile().then((r) => r.data),
+    staleTime: 60_000,
+  })
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold">マイプロファイル</h1>
+        <p className="text-sm text-muted-foreground mt-1">
+          AI に伝わっているあなたの 5W1H 6 軸プロファイル (read-only) と、自動学習された好みの一覧です。
+        </p>
+      </div>
+
+      {/* 編集導線 banner */}
+      <div className="flex items-start gap-3 p-4 rounded-md border border-border bg-muted/30">
+        <Info size={16} className="shrink-0 mt-0.5 text-muted-foreground" />
+        <div className="text-sm">
+          編集は Slack で <code className="px-1.5 py-0.5 rounded bg-muted text-foreground font-mono text-xs">@CatchExpander profile</code> を実行してください。
+        </div>
+      </div>
+
+      {q.isLoading && (
+        <Card>
+          <CardContent className="pt-6 space-y-3">
+            {AXIS_FIELDS.map((f) => (
+              <Skeleton key={f.key} className="h-16 w-full" />
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {q.isError && (
+        <Card>
+          <CardContent className="pt-6">
+            <div className="text-sm text-destructive">
+              プロファイルの取得に失敗しました。時間を置いて再読み込みしてください。
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {q.data && (
+        <>
+          <Card>
+            <CardHeader>
+              <CardTitle>プロファイル</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {AXIS_FIELDS.map((f) => (
+                <AxisRow key={f.key} label={f.label} value={q.data[f.key]} />
+              ))}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>学習履歴 (learned_preferences)</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {q.data.learned_preferences.length === 0 ? (
+                <div className="text-sm italic text-muted-foreground">
+                  学習履歴はまだありません。フィードバックを送ると AI が自動で好みを学習します。
+                </div>
+              ) : (
+                <ul className="space-y-2 list-disc list-inside text-sm">
+                  {q.data.learned_preferences.map((pref, i) => (
+                    <li key={i} className="text-foreground break-words">{pref}</li>
+                  ))}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+
+          {q.data.updated_at && (
+            <div className="text-xs text-muted-foreground text-right">
+              最終更新: {fmtRelative(q.data.updated_at)}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+```
+
+### 変更 4: API クライアント + ルート + Sidebar (合計 +27 行)
+
+`frontend/src/api/types.ts` (+18 行):
+
+```typescript
+export interface MyProfile {
+  user_id: string
+  role: string | null
+  interests: string | null
+  expertise: string | null
+  learning_goals: string | null
+  background: string | null
+  output_preferences: string | null
+  learned_preferences: string[]
+  updated_at: string | null
+}
+
+export interface MyProfileResponse {
+  data: MyProfile
+}
+```
+
+`frontend/src/api/endpoints.ts` に追加:
+
+```typescript
+  myProfile: () =>
+    api.get<MyProfileResponse>("/api/v1/profile/me"),
+```
+
+`frontend/src/App.tsx` に追加:
+
+```tsx
+<Route path="profile" element={<MyProfile />} />
+```
+
+`frontend/src/components/Layout.tsx` の NAV 配列末尾に:
+
+```typescript
+  { to: "/profile",        icon: UserCircle,       label: "マイプロファイル"   },
+```
+
+### テスト (`tests/unit/dashboard_api/test_get_my_profile.py` 新規, +168 行)
+
+`TestGetMyProfile` クラスに 7 ケース:
+
+1. `test_returns_full_profile` — 6 軸全部設定済み + learned_preferences あり → 200
+2. `test_returns_placeholder_when_record_missing` — レコード未存在 → 200 + 全 null + 空配列
+3. `test_partial_fields_missing` — 一部フィールド REMOVE 済み → 200 + 該当 null
+4. `test_strips_team_suffix_from_sub_defensive` — sub が `U...-T...` 形式でも user_id 抽出
+5. `test_missing_user_sub_returns_401` — user_sub 欠落 → 401 UNAUTHORIZED
+6. `test_empty_user_sub_returns_401` — user_sub が空文字 → 401 UNAUTHORIZED
+7. `test_ddb_failure_returns_500` — DDB raise → 500 INTERNAL_ERROR
+
+```
+$ uv run pytest tests/unit/dashboard_api/test_get_my_profile.py -v
+7 passed in 0.36s
+```
+
+### 変更ファイル統計
+
+```
+src/dashboard_api/get_my_profile/__init__.py      |   0 行 (空)
+src/dashboard_api/get_my_profile/app.py           | +67 行
+template.yaml                                     | +29 行
+tests/unit/dashboard_api/conftest.py              |  +1 行
+tests/unit/dashboard_api/test_get_my_profile.py   | +168 行
+frontend/src/api/types.ts                         | +18 行
+frontend/src/api/endpoints.ts                     |  +4 行
+frontend/src/routes/MyProfile.tsx                 | +118 行
+frontend/src/App.tsx                              |  +2 行
+frontend/src/components/Layout.tsx                |  +3 / -1 行
+合計: +411 行 / -1 行 (steering 3 文書 +760 行を除く)
+```
+
+## レビュー観点
+
+以下を **Critical / High / Medium / Low / Info** の 5 段階で分類してください。
+
+### A. 設計・構造の妥当性
+
+- A1: backend Lambda は既存 `src/dashboard_api/get_token_monitor_health/app.py` のパターンを正しく踏襲しているか。`_common.py` の使い方、boto3 リソース初期化、HttpApi event 構造の扱いに齟齬はないか
+- A2: API ルート `/api/v1/profile/me` の固定 (path parameter なし) は「他ユーザー閲覧経路を作らない」設計意図と整合しているか。Authorizer 経由で取得する `user_sub` のみを信用する経路に閉じているか
+- A3: レコード未存在時に 404 ではなく 200 + null を返す判断は、frontend UX (プレースホルダー表示) を考慮した妥当な設計か。API のセマンティクスとして API 利用者を混乱させないか
+- A4: `_PROFILE_KEYS` (Lambda 側) と `AXIS_FIELDS` (frontend 側) と `PROFILE_FIELDS` (`src/trigger/app.py`) の 3 箇所で 6 軸定義が分散している。整合性を担保する仕組み (テスト / 型) は十分か、それとも分散自体が後の drift リスクか
+- A5: IAM ポリシーは `dynamodb:GetItem` のみで最小権限。Resource は `UserProfilesTable.Arn` 単一。これに過不足はないか
+
+### B. エッジケース・例外経路
+
+- B1: `_extract_slack_user_id` の防御挙動 (`split("-", 1)[0]`)。実機 `sub` が pure user_id (例: `U04JBJU88A0`) であることは検証済だが、将来 Slack OIDC 仕様変更で sub が `<user>-<team>` 形式になっても安全か。逆に sub が想定外形式 (空文字 / 数字のみ / 特殊文字含む) のとき抽出ロジックが不正値を返す経路は塞がれているか
+- B2: `os.environ["USER_PROFILES_TABLE"]` が未設定の場合 KeyError → Lambda 500 になる。テストでは monkeypatch で env を設定しているが、本番デプロイでは template.yaml で確実に注入される。env 不在ケースに防御を追加すべきか、それとも IaC 信頼で十分か
+- B3: DynamoDB エラー時の `except Exception as e: # noqa: BLE001` は過剰捕捉。`ClientError` のみに絞るべきか、それとも Lambda の包括的失敗防御として現状で良いか
+- B4: `result.get("Item") or {}` で None / 空 dict を吸収しているが、UserProfilesTable の item.learned_preferences が「文字列」「dict」「None」など想定外型を保持していた場合 (旧データ移行など) `or []` で吸収しきれず frontend で render エラーになる可能性。型契約の防御は十分か
+- B5: frontend `MyProfile.tsx` の `q.isError` ハンドリング。401 (cookie 期限切れ) でも単に「取得に失敗しました」を出すだけで、本来は login redirect が期待される。axios interceptor / client の 401 ハンドリングはどこで行われているか確認の必要
+
+### C. 再発バグ領域 / アンチパターン回避
+
+- C1: F6 関連 (`src/trigger/app.py` の Modal フロー) では過去 4 連続パッチ (`20392bf` / `97b033e` / `73c9a56` / `c8f5e97`) が発生したエリア。本 PR は **同ファイルに触れない別 Lambda** を追加する形で、再発リスクの構造的隔離は適切か。`_PROFILE_KEYS` のような共通定義を `trigger/app.py:PROFILE_FIELDS` から import する選択肢を取らなかった (key だけ手動同期する) 判断はリスクか
+- C2: `memory/feedback_anti_pattern_discipline.md` の 3 層代替案規律 (プロンプト層 / パイプライン層 / 型層)。本 PR は「新規機能追加」であって既存バグ修正ではないが、design.md §4.1 (sub 抽出の案 A/B/C 比較) は規律を満たしているか
+- C3: `memory/2026-04-29_codex-iterative-review-finds-multilayer-misses.md` の知見 (2-3 pass で次層が剥がれる)。Pass 1 で見落としがちな次層 (例: frontend 401 ハンドリング / DDB 型契約) を本観点で先に潰す
+- C4: `memory/feedback_codex_finding_interpretation_pitfall.md`: 外部仕様の実態確認なしで Codex 指摘を拡大解釈しない。今回の sub 形式確認は実機 cookie デコードで実証済なので OK と判断するが、Slack OIDC の公式仕様 (URL 引用希望) と照合して本実装は妥当か
+
+## 出力フォーマット
+
+```markdown
+# Codex Review — 2026-05-19 frontend-profile-view (Pass 1)
+
+## サマリ
+- Critical: N / High: N / Medium: N / Low: N / Info: N
+- 総合所感 (5 行以内)
+
+## 指摘事項
+
+### [severity] [path:line] 短いタイトル
+- 問題: ...
+- 影響: ...
+- 推奨修正: ...
+
+(severity 順に列挙、severity は Critical / High / Medium / Low / Info)
+
+## 総合評価
+- 設計の妥当性: ✅ / ⚠️ / ❌
+- エッジケース網羅: ✅ / ⚠️ / ❌
+- アンチパターン回避: ✅ / ⚠️ / ❌
+- テストカバレッジ: ✅ / ⚠️ / ❌
+
+## 結論
+- マージ可否: 可 / 条件付き可 (指摘対応後) / 不可
+```
+
+注意:
+- 「対応が完全 / 不要修正なし」も明示してほしい
+- 公式仕様への引用があれば URL 付きで (例: Slack OIDC sub 仕様)
+- 推奨修正は具体的なコードスニペットで示してほしい
+codex
+レビュー対象の実装と既存パターンを照合します。あわせて Slack OIDC の `sub` 仕様は公式ドキュメントで確認して、推測と実測の境界を分けます。
+exec
+/bin/bash -lc 'git status --short && git show --stat --oneline --decorate --no-renames 99d8abf' in /workspaces/Catch-Expander
+exec
+/bin/bash -lc "rg -n \"def lambda_handler|user_sub|authorizer|json_response|error_response|UserProfilesTable|PROFILE_FIELDS|learned_preferences|create\\(|axios|interceptor|401|Routes|NAV|myProfile\" src frontend tests template.yaml" in /workspaces/Catch-Expander
+ succeeded in 219ms:
+tests/unit/token_monitor/test_app.py:94:    def test_propagates_http_401(self):
+tests/unit/token_monitor/test_app.py:99:            code=401,
+tests/unit/token_monitor/test_app.py:109:        assert exc_info.value.code == 401
+tests/unit/token_monitor/test_app.py:217:            _post_slack_failure("slack-token", "C123", "http_401", past_ms)
+tests/unit/token_monitor/test_app.py:222:        assert "http_401" in text
+tests/unit/token_monitor/test_app.py:312:    def test_http_401_notifies_slack(self, monkeypatch):
+tests/unit/token_monitor/test_app.py:315:        err = HTTPError(url="...", code=401, msg="Unauthorized", hdrs=None, fp=None)
+tests/unit/token_monitor/test_app.py:330:        assert result == {"refreshed": False, "reason": "http_401"}
+tests/unit/token_monitor/test_app.py:333:        assert mock_notify.call_args.args[2] == "http_401"
+tests/unit/token_monitor/test_app.py:476:        err = HTTPError(url="...", code=401, msg="Unauthorized", hdrs=None, fp=None)
+tests/unit/token_monitor/test_app.py:492:        assert call.args[1]["error_message"] == "http_401"
+src/dashboard_api/get_execution/app.py:7:from _common import error_response, json_response
+src/dashboard_api/get_execution/app.py:15:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_execution/app.py:19:        return error_response(400, "MISSING_PARAM", "execution_id is required", request_id)
+src/dashboard_api/get_execution/app.py:26:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_execution/app.py:29:        return error_response(404, "EXECUTION_NOT_FOUND", f"Execution {execution_id} not found", request_id)
+src/dashboard_api/get_execution/app.py:44:    return json_response(200, {
+frontend/src/contexts/AuthContext.tsx:27:  // isError means 401 → client.ts already triggered redirect to /api/v1/auth/login
+tests/unit/agent/test_slack_client.py:54:        error_response = MagicMock()
+tests/unit/agent/test_slack_client.py:55:        error_response.__getitem__ = MagicMock(return_value="rate_limited")
+tests/unit/agent/test_slack_client.py:56:        error_response.status_code = 429
+tests/unit/agent/test_slack_client.py:57:        slack_error = SlackApiError("rate limited", error_response)
+tests/unit/agent/test_slack_client.py:70:        error_response = MagicMock()
+tests/unit/agent/test_slack_client.py:71:        error_response.__getitem__ = MagicMock(return_value="rate_limited")
+tests/unit/agent/test_slack_client.py:72:        error_response.status_code = 429
+tests/unit/agent/test_slack_client.py:73:        slack_error = SlackApiError("rate limited", error_response)
+tests/unit/token_monitor/conftest.py:20:        import handler  # noqa: F401
+tests/unit/dashboard_api/test_extended_metrics.py:247:                        payload={"error_message": "http_401"}, ts="2026-04-30T06:00:00.000Z"),
+tests/unit/dashboard_api/test_extended_metrics.py:312:                        payload={"error_message": "http_401"},
+tests/unit/dashboard_api/test_extended_metrics.py:394:                "learned_preferences_updated": True,
+tests/unit/dashboard_api/test_extended_metrics.py:399:                "learned_preferences_updated": False,
+tests/unit/dashboard_api/test_extended_metrics.py:444:                "learned_preferences_updated": True,
+tests/unit/dashboard_api/test_extended_metrics.py:456:        assert e["learned_preferences_updated"] is True
+src/dashboard_api/auth_me/app.py:3:from _common import json_response
+src/dashboard_api/auth_me/app.py:9:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/auth_me/app.py:11:    auth_ctx = event.get("requestContext", {}).get("authorizer", {}).get("lambda", {})
+src/dashboard_api/auth_me/app.py:12:    return json_response(200, {
+src/dashboard_api/auth_me/app.py:13:        "user_sub": auth_ctx.get("user_sub"),
+frontend/src/api/types.ts:132:  user_sub: string
+frontend/src/api/types.ts:138:// 値が REMOVE 済 / 未設定の軸は null で返る。learned_preferences は要素なしなら空配列。
+frontend/src/api/types.ts:147:  learned_preferences: string[]
+frontend/src/api/types.ts:162:  learned_preferences_updated: boolean
+src/dashboard_api/auth_callback/app.py:65:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/auth_callback/app.py:129:        return _error(401, "workspace_mismatch")
+src/dashboard_api/get_token_monitor_health/app.py:6:from _common import PERIOD_MAP, error_response, json_response, query_event_type, ts_range
+src/dashboard_api/get_token_monitor_health/app.py:13:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_token_monitor_health/app.py:17:        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
+src/dashboard_api/get_token_monitor_health/app.py:29:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_token_monitor_health/app.py:46:    return json_response(200, {
+tests/unit/agent/test_orchestrator.py:1409:    """learned_preferences が profile_text に反映されるテスト"""
+tests/unit/agent/test_orchestrator.py:1432:    def test_learned_preferences_included_in_prompts(self, mock_call_claude, _mock_load):
+tests/unit/agent/test_orchestrator.py:1433:        """learned_preferences が1件以上ある場合、最初の call_claude 呼び出しに好みが含まれる"""
+tests/unit/agent/test_orchestrator.py:1442:            "learned_preferences": [
+tests/unit/agent/test_orchestrator.py:1463:    def test_empty_learned_preferences_not_included_in_prompts(self, mock_call_claude, _mock_load):
+tests/unit/agent/test_orchestrator.py:1464:        """learned_preferences が空の場合、profile_text に好みセクションが含まれない"""
+tests/unit/agent/test_orchestrator.py:1473:            # learned_preferences なし（既存ユーザー）
+tests/unit/agent/test_orchestrator.py:2099:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2127:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2144:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2164:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2183:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2203:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2223:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2246:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2270:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2319:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2343:        from orchestrator import Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2366:        from orchestrator import NonDictGeneratorResponse, Orchestrator  # noqa: F401
+tests/unit/agent/test_orchestrator.py:2459:    背景: 5/14 03:28 JST に Codex 401 失敗の真因が error_message から失われていた問題への対処。
+tests/unit/agent/test_orchestrator.py:2501:        実利上、最も重要なケース (Codex 401 のような短いエラーメッセージ).
+tests/unit/agent/test_orchestrator.py:2505:        marker = "401_UNAUTHORIZED_TOKEN_REFRESH_FAILED"
+frontend/src/api/endpoints.ts:35:  myProfile: () =>
+frontend/src/routes/MyProfile.tsx:11:const AXIS_FIELDS: ReadonlyArray<{ key: keyof Omit<MyProfile, "user_id" | "learned_preferences" | "updated_at">; label: string }> = [
+frontend/src/routes/MyProfile.tsx:36:    queryFn: () => endpoints.myProfile().then((r) => r.data),
+frontend/src/routes/MyProfile.tsx:92:              <CardTitle>学習履歴 (learned_preferences)</CardTitle>
+frontend/src/routes/MyProfile.tsx:95:              {q.data.learned_preferences.length === 0 ? (
+frontend/src/routes/MyProfile.tsx:101:                  {q.data.learned_preferences.map((pref, i) => (
+src/dashboard_api/get_errors/app.py:7:from _common import error_response, json_response, query_event_type
+src/dashboard_api/get_errors/app.py:17:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_errors/app.py:23:        return error_response(400, "INVALID_PARAM", "days must be an integer", request_id)
+src/dashboard_api/get_errors/app.py:34:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_errors/app.py:52:    return json_response(200, {
+src/dashboard_api/get_api_health/app.py:6:from _common import PERIOD_MAP, error_response, json_response, query_event_type, ts_range
+src/dashboard_api/get_api_health/app.py:21:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_api_health/app.py:25:        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
+src/dashboard_api/get_api_health/app.py:35:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_api_health/app.py:76:    return json_response(200, {
+src/dashboard_api/auth_logout/app.py:10:def lambda_handler(event: dict, context: object) -> dict:
+tests/unit/agent/test_notion_client.py:204:        error_response = mock_request.return_value
+tests/unit/agent/test_notion_client.py:205:        error_response.status_code = 400
+tests/unit/agent/test_notion_client.py:206:        error_response.text = "Bad Request"
+tests/unit/agent/test_notion_client.py:207:        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+tests/unit/agent/test_notion_client.py:220:        error_response = mock_request.return_value
+tests/unit/agent/test_notion_client.py:221:        error_response.status_code = 503
+tests/unit/agent/test_notion_client.py:222:        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+tests/unit/agent/test_notion_client.py:267:        error_response = mock_request.return_value
+tests/unit/agent/test_notion_client.py:268:        error_response.status_code = 429
+tests/unit/agent/test_notion_client.py:269:        error_response.text = "rate limited"
+tests/unit/agent/test_notion_client.py:270:        error_response.headers = {"Retry-After": "30"}
+tests/unit/agent/test_notion_client.py:271:        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+tests/unit/agent/test_notion_client.py:288:        error_response = mock_request.return_value
+tests/unit/agent/test_notion_client.py:289:        error_response.status_code = 403
+tests/unit/agent/test_notion_client.py:290:        error_response.text = "Attention Required! | Cloudflare"
+tests/unit/agent/test_notion_client.py:291:        error_response.headers = {"CF-Ray": "abc123-NRT"}
+tests/unit/agent/test_notion_client.py:292:        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+tests/unit/agent/test_notion_client.py:334:    def _make_error_response(self, status_code: int, text: str, headers: dict | None = None):
+tests/unit/agent/test_notion_client.py:348:        mock_request.return_value = self._make_error_response(
+tests/unit/agent/test_notion_client.py:362:        mock_request.return_value = self._make_error_response(
+tests/unit/agent/test_notion_client.py:374:        mock_request.return_value = self._make_error_response(
+tests/unit/agent/test_notion_client.py:391:        mock_request.return_value = self._make_error_response(
+tests/unit/agent/test_notion_client.py:404:    def test_401_is_not_cloudflare(self, mock_request):
+tests/unit/agent/test_notion_client.py:409:        mock_request.return_value = self._make_error_response(401, "Unauthorized", {})
+tests/unit/agent/test_notion_client.py:423:        mock_request.return_value = self._make_error_response(500, "Server Error", {})
+tests/unit/agent/test_notion_client.py:438:        mock_request.return_value = self._make_error_response(
+tests/unit/agent/test_notion_client.py:462:        mock_request.return_value = self._make_error_response(
+frontend/src/api/client.ts:8:  if (res.status === 401) {
+frontend/src/routes/FeedbackAnalysis.tsx:232:                      {e.learned_preferences_updated
+src/dashboard_api/get_subagent_io/app.py:8:from _common import error_response, json_response
+src/dashboard_api/get_subagent_io/app.py:37:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_subagent_io/app.py:41:        return error_response(400, "MISSING_PARAM", "execution_id is required", request_id)
+src/dashboard_api/get_subagent_io/app.py:51:        return error_response(500, "INTERNAL_ERROR", "Failed to list records", request_id)
+src/dashboard_api/get_subagent_io/app.py:54:        return json_response(200, {"data": {"execution_id": execution_id, "records": []}})
+src/dashboard_api/get_subagent_io/app.py:66:    return json_response(200, {"data": {"execution_id": execution_id, "records": records}})
+src/dashboard_api/auth_login/app.py:38:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_metrics_summary/app.py:7:from _common import PERIOD_MAP, error_response, json_response, ts_range
+src/dashboard_api/get_metrics_summary/app.py:29:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_metrics_summary/app.py:33:        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
+src/dashboard_api/get_metrics_summary/app.py:42:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_metrics_summary/app.py:80:    return json_response(200, {
+src/dashboard_api/get_cost_summary/app.py:6:from _common import PERIOD_MAP, error_response, json_response, query_event_type, ts_range
+src/dashboard_api/get_cost_summary/app.py:13:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_cost_summary/app.py:17:        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
+src/dashboard_api/get_cost_summary/app.py:26:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_cost_summary/app.py:54:    return json_response(200, {
+tests/unit/agent/test_feedback_processor.py:166:        assert len(saved_profile["learned_preferences"]) == 1
+tests/unit/agent/test_feedback_processor.py:167:        assert saved_profile["learned_preferences"][0]["text"] == "Terraformはmodule分割する"
+tests/unit/agent/test_feedback_processor.py:282:        saved_prefs = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+tests/unit/agent/test_feedback_processor.py:303:        """好みが抽出された場合、learned_preferences_updated=True で emit される"""
+tests/unit/agent/test_feedback_processor.py:323:        assert payload["learned_preferences_updated"] is True
+tests/unit/agent/test_feedback_processor.py:330:    def test_feedback_received_marks_learned_preferences_false_when_no_extraction(
+tests/unit/agent/test_feedback_processor.py:336:        # parse_error → preferences 空配列 → learned_preferences_updated False
+tests/unit/agent/test_feedback_processor.py:347:        assert payload["learned_preferences_updated"] is False
+src/dashboard_api/get_execution_events/app.py:7:from _common import error_response, json_response
+src/dashboard_api/get_execution_events/app.py:15:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_execution_events/app.py:19:        return error_response(400, "MISSING_PARAM", "execution_id is required", request_id)
+src/dashboard_api/get_execution_events/app.py:36:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_execution_events/app.py:38:    return json_response(200, {
+src/dashboard_api/authorizer/app.py:40:def lambda_handler(event: dict, context: object) -> dict[str, Any]:
+src/dashboard_api/authorizer/app.py:44:    - 成功: {"isAuthorized": True, "context": {"user_sub": ..., "user_name": ...}}
+src/dashboard_api/authorizer/app.py:58:                "user_sub": claims["sub"],
+tests/unit/agent/test_github_client.py:78:        error_response = mock_request.return_value
+tests/unit/agent/test_github_client.py:79:        error_response.status_code = 500
+tests/unit/agent/test_github_client.py:80:        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+tests/unit/agent/test_github_client.py:126:        error_response = mock_request.return_value
+tests/unit/agent/test_github_client.py:127:        error_response.status_code = 429
+tests/unit/agent/test_github_client.py:128:        error_response.headers = {"Retry-After": "60"}
+tests/unit/agent/test_github_client.py:129:        error_response.raise_for_status.side_effect = requests.HTTPError(response=error_response)
+src/dashboard_api/get_review_quality/app.py:7:from _common import error_response, json_response, query_event_type
+src/dashboard_api/get_review_quality/app.py:17:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_review_quality/app.py:23:        return error_response(400, "INVALID_PARAM", "days must be an integer", request_id)
+src/dashboard_api/get_review_quality/app.py:34:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_review_quality/app.py:52:    return json_response(200, {
+src/dashboard_api/get_my_profile/app.py:3:JWT 由来の user_sub から Slack user_id を導出し、UserProfilesTable から
+src/dashboard_api/get_my_profile/app.py:4:本人プロファイル (6 軸 + learned_preferences) を read-only で取得する。
+src/dashboard_api/get_my_profile/app.py:13:from _common import error_response, json_response
+src/dashboard_api/get_my_profile/app.py:20:# 5W1H 6 軸キー (src/trigger/app.py:PROFILE_FIELDS と整合)
+src/dashboard_api/get_my_profile/app.py:31:def _extract_slack_user_id(user_sub: str | None) -> str | None:
+src/dashboard_api/get_my_profile/app.py:39:    if not user_sub:
+src/dashboard_api/get_my_profile/app.py:41:    return user_sub.split("-", 1)[0]
+src/dashboard_api/get_my_profile/app.py:44:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_my_profile/app.py:47:    auth_ctx = event.get("requestContext", {}).get("authorizer", {}).get("lambda", {})
+src/dashboard_api/get_my_profile/app.py:48:    user_sub = auth_ctx.get("user_sub")
+src/dashboard_api/get_my_profile/app.py:49:    user_id = _extract_slack_user_id(user_sub)
+src/dashboard_api/get_my_profile/app.py:51:        return error_response(401, "UNAUTHORIZED", "Missing or invalid user_sub", request_id)
+src/dashboard_api/get_my_profile/app.py:58:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_my_profile/app.py:64:        "learned_preferences": item.get("learned_preferences") or [],
+src/dashboard_api/get_my_profile/app.py:67:    return json_response(200, {"data": body})
+src/dashboard_api/get_feedback_aggregation/app.py:7:from _common import PERIOD_MAP, error_response, json_response, query_event_type, ts_range
+src/dashboard_api/get_feedback_aggregation/app.py:14:def lambda_handler(event: dict, context: object) -> dict:
+src/dashboard_api/get_feedback_aggregation/app.py:18:        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
+src/dashboard_api/get_feedback_aggregation/app.py:27:        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+src/dashboard_api/get_feedback_aggregation/app.py:31:        1 for i in items if (i.get("payload") or {}).get("learned_preferences_updated")
+src/dashboard_api/get_feedback_aggregation/app.py:65:            "learned_preferences_updated": bool(payload.get("learned_preferences_updated")),
+src/dashboard_api/get_feedback_aggregation/app.py:70:    return json_response(200, {
+frontend/src/components/Layout.tsx:9:const NAV = [
+frontend/src/components/Layout.tsx:57:            {NAV.map(({ to, icon: Icon, label }) => (
+frontend/src/components/Layout.tsx:112:            {NAV.map(({ to, icon: Icon, label }) => (
+
+ succeeded in 3458ms:
+?? .audit/2026-05-19_frontend-profile-view.md
+?? .audit/2026-05-19_frontend-profile-view.prompt.md
+?? .audit/2026-05-19_frontend-profile-view.raw.txt
+99d8abf (HEAD -> main, origin/main, origin/HEAD) feat(dashboard): add /profile read-only view for F6 user profile
+ .steering/20260518-frontend-profile-view/design.md | 328 +++++++++++++++++++++
+ .../20260518-frontend-profile-view/requirements.md | 120 ++++++++
+ .../20260518-frontend-profile-view/tasklist.md     | 312 ++++++++++++++++++++
+ frontend/src/App.tsx                               |   2 +
+ frontend/src/api/endpoints.ts                      |   4 +
+ frontend/src/api/types.ts                          |  18 ++
+ frontend/src/components/Layout.tsx                 |   3 +-
+ frontend/src/routes/MyProfile.tsx                  | 118 ++++++++
+ src/dashboard_api/get_my_profile/__init__.py       |   0
+ src/dashboard_api/get_my_profile/app.py            |  67 +++++
+ template.yaml                                      |  29 ++
+ tests/unit/dashboard_api/conftest.py               |   1 +
+ tests/unit/dashboard_api/test_get_my_profile.py    | 168 +++++++++++
+ 13 files changed, 1169 insertions(+), 1 deletion(-)
+
+codex
+既存の dashboard API は `_common` と module-level `boto3.resource` を同じ形で使っており、401 は frontend の共通 client 側で処理されている痕跡があります。次に該当行番号付きで、型契約と IaC の細部を確認します。
+exec
+/bin/bash -lc 'nl -ba src/dashboard_api/get_my_profile/app.py' in /workspaces/Catch-Expander
+ succeeded in 0ms:
+     1	"""F6 User Profile 閲覧用 Lambda。
+     2	
+     3	JWT 由来の user_sub から Slack user_id を導出し、UserProfilesTable から
+     4	本人プロファイル (6 軸 + learned_preferences) を read-only で取得する。
+     5	
+     6	設計: .steering/20260518-frontend-profile-view/design.md
+     7	"""
+     8	
+     9	import logging
+    10	import os
+    11	
+    12	import boto3
+    13	from _common import error_response, json_response
+    14	
+    15	logger = logging.getLogger(__name__)
+    16	logger.setLevel(logging.INFO)
+    17	
+    18	_dynamodb = boto3.resource("dynamodb")
+    19	
+    20	# 5W1H 6 軸キー (src/trigger/app.py:PROFILE_FIELDS と整合)
+    21	_PROFILE_KEYS = (
+    22	    "role",
+    23	    "interests",
+    24	    "expertise",
+    25	    "learning_goals",
+    26	    "background",
+    27	    "output_preferences",
+    28	)
+    29	
+    30	
+    31	def _extract_slack_user_id(user_sub: str | None) -> str | None:
+    32	    """Slack OIDC sub から Slack user_id を取り出す。
+    33	
+    34	    本番 Slack OIDC は pure user_id 形式 (例: "U0XXXXXXXX") を返すことを
+    35	    実機 cookie デコードで確認済 (.steering/20260518-frontend-profile-view/tasklist.md T0-1)。
+    36	    将来 "<user_id>-<team_id>" 形式に変わっても壊れないよう split("-")[0] で防御。
+    37	    Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様。
+    38	    """
+    39	    if not user_sub:
+    40	        return None
+    41	    return user_sub.split("-", 1)[0]
+    42	
+    43	
+    44	def lambda_handler(event: dict, context: object) -> dict:
+    45	    request_id = getattr(context, "aws_request_id", "")
+    46	
+    47	    auth_ctx = event.get("requestContext", {}).get("authorizer", {}).get("lambda", {})
+    48	    user_sub = auth_ctx.get("user_sub")
+    49	    user_id = _extract_slack_user_id(user_sub)
+    50	    if not user_id:
+    51	        return error_response(401, "UNAUTHORIZED", "Missing or invalid user_sub", request_id)
+    52	
+    53	    table = _dynamodb.Table(os.environ["USER_PROFILES_TABLE"])
+    54	    try:
+    55	        result = table.get_item(Key={"user_id": user_id})
+    56	    except Exception as e:  # noqa: BLE001
+    57	        logger.error("DDB get_item failed for request %s: %s", request_id, type(e).__name__)
+    58	        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+    59	
+    60	    item = result.get("Item") or {}
+    61	    body = {
+    62	        "user_id": user_id,
+    63	        **{k: item.get(k) for k in _PROFILE_KEYS},
+    64	        "learned_preferences": item.get("learned_preferences") or [],
+    65	        "updated_at": item.get("updated_at"),
+    66	    }
+    67	    return json_response(200, {"data": body})
+
+exec
+/bin/bash -lc 'nl -ba frontend/src/routes/MyProfile.tsx' in /workspaces/Catch-Expander
+ succeeded in 0ms:
+     1	import { useQuery } from "@tanstack/react-query"
+     2	import { Info } from "lucide-react"
+     3	
+     4	import { endpoints } from "@/api/endpoints"
+     5	import type { MyProfile } from "@/api/types"
+     6	import { fmtRelative } from "@/lib/time"
+     7	import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+     8	import { Skeleton } from "@/components/ui/skeleton"
+     9	
+    10	// 5W1H 6 軸キーとラベルの対応 (backend get_my_profile.app._PROFILE_KEYS と整合)
+    11	const AXIS_FIELDS: ReadonlyArray<{ key: keyof Omit<MyProfile, "user_id" | "learned_preferences" | "updated_at">; label: string }> = [
+    12	  { key: "role",                label: "役割・職業" },
+    13	  { key: "interests",           label: "関心分野" },
+    14	  { key: "expertise",           label: "専門・得意領域" },
+    15	  { key: "learning_goals",      label: "学習の目的" },
+    16	  { key: "background",          label: "背景・状況" },
+    17	  { key: "output_preferences",  label: "受け取り方の好み" },
+    18	]
+    19	
+    20	function AxisRow({ label, value }: { label: string; value: string | null }) {
+    21	  return (
+    22	    <div className="grid grid-cols-1 md:grid-cols-[200px_1fr] gap-2 py-3 border-b border-border last:border-b-0">
+    23	      <div className="text-sm font-medium text-foreground">{label}</div>
+    24	      {value ? (
+    25	        <div className="text-sm text-foreground whitespace-pre-wrap break-words">{value}</div>
+    26	      ) : (
+    27	        <div className="text-sm italic text-muted-foreground">未設定</div>
+    28	      )}
+    29	    </div>
+    30	  )
+    31	}
+    32	
+    33	export function MyProfile() {
+    34	  const q = useQuery({
+    35	    queryKey: ["my-profile"],
+    36	    queryFn: () => endpoints.myProfile().then((r) => r.data),
+    37	    staleTime: 60_000,
+    38	  })
+    39	
+    40	  return (
+    41	    <div className="space-y-6">
+    42	      <div>
+    43	        <h1 className="text-2xl font-semibold">マイプロファイル</h1>
+    44	        <p className="text-sm text-muted-foreground mt-1">
+    45	          AI に伝わっているあなたの 5W1H 6 軸プロファイル (read-only) と、自動学習された好みの一覧です。
+    46	        </p>
+    47	      </div>
+    48	
+    49	      {/* 編集導線 banner */}
+    50	      <div className="flex items-start gap-3 p-4 rounded-md border border-border bg-muted/30">
+    51	        <Info size={16} className="shrink-0 mt-0.5 text-muted-foreground" />
+    52	        <div className="text-sm">
+    53	          編集は Slack で <code className="px-1.5 py-0.5 rounded bg-muted text-foreground font-mono text-xs">@CatchExpander profile</code> を実行してください。
+    54	        </div>
+    55	      </div>
+    56	
+    57	      {q.isLoading && (
+    58	        <Card>
+    59	          <CardContent className="pt-6 space-y-3">
+    60	            {AXIS_FIELDS.map((f) => (
+    61	              <Skeleton key={f.key} className="h-16 w-full" />
+    62	            ))}
+    63	          </CardContent>
+    64	        </Card>
+    65	      )}
+    66	
+    67	      {q.isError && (
+    68	        <Card>
+    69	          <CardContent className="pt-6">
+    70	            <div className="text-sm text-destructive">
+    71	              プロファイルの取得に失敗しました。時間を置いて再読み込みしてください。
+    72	            </div>
+    73	          </CardContent>
+    74	        </Card>
+    75	      )}
+    76	
+    77	      {q.data && (
+    78	        <>
+    79	          <Card>
+    80	            <CardHeader>
+    81	              <CardTitle>プロファイル</CardTitle>
+    82	            </CardHeader>
+    83	            <CardContent>
+    84	              {AXIS_FIELDS.map((f) => (
+    85	                <AxisRow key={f.key} label={f.label} value={q.data[f.key]} />
+    86	              ))}
+    87	            </CardContent>
+    88	          </Card>
+    89	
+    90	          <Card>
+    91	            <CardHeader>
+    92	              <CardTitle>学習履歴 (learned_preferences)</CardTitle>
+    93	            </CardHeader>
+    94	            <CardContent>
+    95	              {q.data.learned_preferences.length === 0 ? (
+    96	                <div className="text-sm italic text-muted-foreground">
+    97	                  学習履歴はまだありません。フィードバックを送ると AI が自動で好みを学習します。
+    98	                </div>
+    99	              ) : (
+   100	                <ul className="space-y-2 list-disc list-inside text-sm">
+   101	                  {q.data.learned_preferences.map((pref, i) => (
+   102	                    <li key={i} className="text-foreground break-words">{pref}</li>
+   103	                  ))}
+   104	                </ul>
+   105	              )}
+   106	            </CardContent>
+   107	          </Card>
+   108	
+   109	          {q.data.updated_at && (
+   110	            <div className="text-xs text-muted-foreground text-right">
+   111	              最終更新: {fmtRelative(q.data.updated_at)}
+   112	            </div>
+   113	          )}
+   114	        </>
+   115	      )}
+   116	    </div>
+   117	  )
+   118	}
+
+exec
+/bin/bash -lc 'nl -ba src/dashboard_api/get_token_monitor_health/app.py src/dashboard_api/_common.py src/dashboard_api/authorizer/app.py' in /workspaces/Catch-Expander
+ succeeded in 0ms:
+     1	import logging
+     2	import os
+     3	
+     4	import boto3
+     5	
+     6	from _common import PERIOD_MAP, error_response, json_response, query_event_type, ts_range
+     7	
+     8	logger = logging.getLogger(__name__)
+     9	logger.setLevel(logging.INFO)
+    10	
+    11	_dynamodb = boto3.resource("dynamodb")
+    12	
+    13	def lambda_handler(event: dict, context: object) -> dict:
+    14	    request_id = getattr(context, "aws_request_id", "")
+    15	    period = (event.get("queryStringParameters") or {}).get("period", "7d")
+    16	    if period not in PERIOD_MAP:
+    17	        return error_response(400, "INVALID_PARAM", f"period must be one of {list(PERIOD_MAP)}", request_id)
+    18	
+    19	    from_ts, to_ts = ts_range(period)
+    20	    table = _dynamodb.Table(os.environ["EVENTS_TABLE"])
+    21	
+    22	    try:
+    23	        # token_monitor uses system- prefix execution_ids — do NOT filter by exec- prefix
+    24	        successes = query_event_type(table, "oauth_refresh_completed", from_ts, to_ts)
+    25	        failures = query_event_type(table, "oauth_refresh_failed", from_ts, to_ts)
+    26	        skipped = query_event_type(table, "oauth_refresh_skipped", from_ts, to_ts)
+    27	    except Exception as e:
+    28	        logger.error("DDB query failed: %s", e)
+    29	        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+    30	
+    31	    success_count = len(successes)
+    32	    failure_count = len(failures)
+    33	    skip_count = len(skipped)
+    34	    total = success_count + failure_count
+    35	
+    36	    # Latest event timestamps (ISO string; items are ordered by timestamp in GSI)
+    37	    last_refresh_at = successes[-1]["timestamp"] if successes else None
+    38	    last_failure_at = failures[-1]["timestamp"] if failures else None
+    39	    last_skip_at = skipped[-1]["timestamp"] if skipped else None
+    40	    candidate_ts = [ts for ts in (last_refresh_at, last_failure_at, last_skip_at) if ts is not None]
+    41	    last_check_at = max(candidate_ts) if candidate_ts else None
+    42	    last_failure_reason = None
+    43	    if failures:
+    44	        last_failure_reason = (failures[-1].get("payload") or {}).get("error_message")
+    45	
+    46	    return json_response(200, {
+    47	        "data": {
+    48	            "period": period,
+    49	            "total_refresh_attempts": total,
+    50	            "success_count": success_count,
+    51	            "failure_count": failure_count,
+    52	            "skip_count": skip_count,
+    53	            "success_rate": round(success_count / total, 4) if total > 0 else None,
+    54	            "last_refresh_at": last_refresh_at,
+    55	            "last_failure_at": last_failure_at,
+    56	            "last_skip_at": last_skip_at,
+    57	            "last_check_at": last_check_at,
+    58	            "last_failure_reason": last_failure_reason,
+    59	        },
+    60	    })
+    61	"""dashboard_api Lambda 共通ユーティリティ。"""
+    62	from __future__ import annotations
+    63	
+    64	import decimal
+    65	import json
+    66	from datetime import UTC, datetime, timedelta
+    67	from typing import Any
+    68	
+    69	from boto3.dynamodb.conditions import Key
+    70	
+    71	
+    72	PERIOD_MAP = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
+    73	
+    74	
+    75	class _DecimalEncoder(json.JSONEncoder):
+    76	    def default(self, o: Any) -> Any:
+    77	        if isinstance(o, decimal.Decimal):
+    78	            return int(o) if o % 1 == 0 else float(o)
+    79	        return super().default(o)
+    80	
+    81	
+    82	def json_response(status: int, body: Any) -> dict:
+    83	    return {
+    84	        "statusCode": status,
+    85	        "headers": {"Content-Type": "application/json"},
+    86	        "body": json.dumps(body, cls=_DecimalEncoder),
+    87	    }
+    88	
+    89	
+    90	def error_response(status: int, code: str, message: str, request_id: str = "") -> dict:
+    91	    return json_response(status, {"error": {"code": code, "message": message, "request_id": request_id}})
+    92	
+    93	
+    94	def ts_range(period: str) -> tuple[str, str]:
+    95	    delta = PERIOD_MAP[period]
+    96	    now = datetime.now(UTC)
+    97	    from_ts = (now - delta).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    98	    to_ts = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    99	    return from_ts, to_ts
+   100	
+   101	
+   102	def query_event_type(table, event_type: str, from_ts: str, to_ts: str) -> list:
+   103	    kwargs: dict = {
+   104	        "IndexName": "gsi_event_type_timestamp",
+   105	        "KeyConditionExpression": (
+   106	            Key("event_type").eq(event_type) & Key("timestamp").between(from_ts, to_ts)
+   107	        ),
+   108	    }
+   109	    items: list = []
+   110	    while True:
+   111	        result = table.query(**kwargs)
+   112	        items.extend(result.get("Items", []))
+   113	        if "LastEvaluatedKey" not in result:
+   114	            break
+   115	        kwargs["ExclusiveStartKey"] = result["LastEvaluatedKey"]
+   116	    return items
+   117	import logging
+   118	import os
+   119	from typing import Any
+   120	
+   121	import boto3
+   122	import jwt
+   123	
+   124	logger = logging.getLogger(__name__)
+   125	logger.setLevel(logging.INFO)
+   126	
+   127	secrets_client = boto3.client("secretsmanager")
+   128	
+   129	# JWT 署名キーはモジュールレベルでキャッシュ (同一 execution environment で再利用)
+   130	_jwt_signing_key: str | None = None
+   131	
+   132	
+   133	def _get_jwt_signing_key() -> str:
+   134	    global _jwt_signing_key
+   135	    if _jwt_signing_key is None:
+   136	        arn = os.environ["JWT_KEY_SECRET_ARN"]
+   137	        response = secrets_client.get_secret_value(SecretId=arn)
+   138	        _jwt_signing_key = response["SecretString"]
+   139	    return _jwt_signing_key
+   140	
+   141	
+   142	def _parse_session_token(cookies: list[str]) -> str | None:
+   143	    """HTTP API 2.0 payload の cookies リスト (["name=value", ...]) から session cookie を抽出。
+   144	
+   145	    API GW が Cookie ヘッダを "; " で分割してリストに格納するため、
+   146	    各エントリを "=" で分割して名前を比較する。
+   147	    """
+   148	    for entry in cookies:
+   149	        for part in entry.split(";"):
+   150	            name, _, value = part.strip().partition("=")
+   151	            if name.strip() == "session":
+   152	                return value.strip()
+   153	    return None
+   154	
+   155	
+   156	def lambda_handler(event: dict, context: object) -> dict[str, Any]:
+   157	    """HTTP API Lambda Authorizer (simple response format)。
+   158	
+   159	    - cookie の `session` 値を JWT として検証
+   160	    - 成功: {"isAuthorized": True, "context": {"user_sub": ..., "user_name": ...}}
+   161	    - 失敗: {"isAuthorized": False}
+   162	    """
+   163	    cookies: list[str] = event.get("cookies") or []
+   164	    token = _parse_session_token(cookies)
+   165	    if not token:
+   166	        return {"isAuthorized": False}
+   167	
+   168	    try:
+   169	        signing_key = _get_jwt_signing_key()
+   170	        claims = jwt.decode(token, signing_key, algorithms=["HS256"])
+   171	        return {
+   172	            "isAuthorized": True,
+   173	            "context": {
+   174	                "user_sub": claims["sub"],
+   175	                "user_name": claims["name"],
+   176	                "exp": claims["exp"],
+   177	            },
+   178	        }
+   179	    except jwt.PyJWTError as e:
+   180	        logger.info("JWT validation failed: %s", type(e).__name__)
+   181	        return {"isAuthorized": False}
+
+exec
+/bin/bash -lc 'nl -ba frontend/src/api/client.ts frontend/src/contexts/AuthContext.tsx frontend/src/api/endpoints.ts frontend/src/api/types.ts' in /workspaces/Catch-Expander
+ succeeded in 0ms:
+     1	const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ""
+     2	
+     3	async function request<T>(path: string, init?: RequestInit): Promise<T> {
+     4	  const res = await fetch(`${API_BASE}${path}`, {
+     5	    credentials: "include",
+     6	    ...init,
+     7	  })
+     8	  if (res.status === 401) {
+     9	    window.location.href = "/api/v1/auth/login"
+    10	    return Promise.reject(new Error("Unauthorized"))
+    11	  }
+    12	  if (!res.ok) {
+    13	    throw new Error(`${res.status} ${res.statusText}`)
+    14	  }
+    15	  return res.json() as Promise<T>
+    16	}
+    17	
+    18	export const api = {
+    19	  get: <T>(path: string) => request<T>(path),
+    20	}
+    21	import { createContext, useContext, type ReactNode } from "react"
+    22	import { useQuery } from "@tanstack/react-query"
+    23	
+    24	import { endpoints } from "@/api/endpoints"
+    25	import type { AuthMeResponse } from "@/api/types"
+    26	
+    27	const AuthContext = createContext<AuthMeResponse | null>(null)
+    28	
+    29	export function AuthProvider({ children }: { children: ReactNode }) {
+    30	  const q = useQuery({
+    31	    queryKey: ["authMe"],
+    32	    queryFn: () => endpoints.authMe(),
+    33	    staleTime: 4 * 60_000,
+    34	    refetchInterval: 5 * 60_000,
+    35	    refetchOnWindowFocus: true,
+    36	    retry: false,
+    37	  })
+    38	
+    39	  if (q.isPending) {
+    40	    return (
+    41	      <div className="flex items-center justify-center min-h-screen bg-background">
+    42	        <span className="text-sm text-muted-foreground">認証中…</span>
+    43	      </div>
+    44	    )
+    45	  }
+    46	
+    47	  // isError means 401 → client.ts already triggered redirect to /api/v1/auth/login
+    48	  if (q.isError || !q.data) return null
+    49	
+    50	  return (
+    51	    <AuthContext.Provider value={q.data}>
+    52	      {children}
+    53	    </AuthContext.Provider>
+    54	  )
+    55	}
+    56	
+    57	export function useAuth(): AuthMeResponse {
+    58	  const ctx = useContext(AuthContext)
+    59	  if (!ctx) throw new Error("useAuth must be used inside AuthProvider")
+    60	  return ctx
+    61	}
+    62	import { api } from "./client"
+    63	import type {
+    64	  ApiHealth,
+    65	  AuthMeResponse,
+    66	  CostSummary,
+    67	  ErrorListResponse,
+    68	  ExecutionDetailResponse,
+    69	  ExecutionEventsResponse,
+    70	  ExecutionListResponse,
+    71	  FeedbackAggregationResponse,
+    72	  MetricsSummary,
+    73	  MyProfileResponse,
+    74	  Period,
+    75	  ReviewQualityResponse,
+    76	  SubagentIOResponse,
+    77	  TokenMonitorHealth,
+    78	} from "./types"
+    79	
+    80	export const endpoints = {
+    81	  authMe: () =>
+    82	    api.get<AuthMeResponse>("/api/v1/auth/me"),
+    83	
+    84	  metricsSummary: (period: Period) =>
+    85	    api.get<{ data: MetricsSummary }>(`/api/v1/metrics/summary?period=${period}`),
+    86	
+    87	  costSummary: (period: Period) =>
+    88	    api.get<{ data: CostSummary }>(`/api/v1/metrics/cost?period=${period}`),
+    89	
+    90	  apiHealth: (period: Period) =>
+    91	    api.get<{ data: ApiHealth }>(`/api/v1/metrics/api-health?period=${period}`),
+    92	
+    93	  tokenMonitor: (period: Period) =>
+    94	    api.get<{ data: TokenMonitorHealth }>(`/api/v1/metrics/token-monitor?period=${period}`),
+    95	
+    96	  myProfile: () =>
+    97	    api.get<MyProfileResponse>("/api/v1/profile/me"),
+    98	
+    99	  executions: (params?: { limit?: number; from?: string; to?: string; status?: string; topic?: string }) => {
+   100	    const q = new URLSearchParams()
+   101	    if (params?.limit)  q.set("limit",  String(params.limit))
+   102	    if (params?.from)   q.set("from",   params.from)
+   103	    if (params?.to)     q.set("to",     params.to)
+   104	    if (params?.status) q.set("status", params.status)
+   105	    if (params?.topic)  q.set("topic",  params.topic)
+   106	    return api.get<ExecutionListResponse>(`/api/v1/executions?${q}`)
+   107	  },
+   108	
+   109	  reviewQuality: (days: number) =>
+   110	    api.get<ReviewQualityResponse>(`/api/v1/metrics/review-quality?days=${days}`),
+   111	
+   112	  errors: (days: number) =>
+   113	    api.get<ErrorListResponse>(`/api/v1/errors?days=${days}`),
+   114	
+   115	  execution: (id: string) =>
+   116	    api.get<ExecutionDetailResponse>(`/api/v1/executions/${id}`),
+   117	
+   118	  executionEvents: (id: string) =>
+   119	    api.get<ExecutionEventsResponse>(`/api/v1/executions/${id}/events`),
+   120	
+   121	  feedbackAggregation: (period: Period) =>
+   122	    api.get<FeedbackAggregationResponse>(`/api/v1/metrics/feedback?period=${period}`),
+   123	
+   124	  subagentIO: (id: string) =>
+   125	    api.get<SubagentIOResponse>(`/api/v1/executions/${id}/subagent-io`),
+   126	}
+   127	export interface MetricsSummary {
+   128	  period: string
+   129	  total_executions: number
+   130	  status_counts: Record<string, number>
+   131	  avg_duration_ms: number | null
+   132	  review_pass_rate: number | null
+   133	}
+   134	
+   135	export interface CostSummary {
+   136	  period: string
+   137	  total_executions: number
+   138	  total_tokens_used: number | null
+   139	  total_cost_usd: number | null
+   140	  avg_tokens_per_execution: number | null
+   141	}
+   142	
+   143	export interface ServiceHealth {
+   144	  total_calls: number
+   145	  success_rate: number | null
+   146	  rate_limit_count: number
+   147	  avg_duration_ms: number | null
+   148	}
+   149	
+   150	export interface ApiHealth {
+   151	  period: string
+   152	  by_service: Record<string, ServiceHealth>
+   153	}
+   154	
+   155	export interface TokenMonitorHealth {
+   156	  period: string
+   157	  total_refresh_attempts: number
+   158	  success_count: number
+   159	  failure_count: number
+   160	  skip_count: number
+   161	  success_rate: number | null
+   162	  last_refresh_at: string | null
+   163	  last_failure_at: string | null
+   164	  last_skip_at: string | null
+   165	  last_check_at: string | null
+   166	  last_failure_reason: string | null
+   167	}
+   168	
+   169	export interface Execution {
+   170	  execution_id: string
+   171	  user_id: string
+   172	  topic: string
+   173	  status: string
+   174	  created_at: string
+   175	  completed_at?: string
+   176	  category?: string
+   177	  slack_channel?: string
+   178	  workflow_plan?: Record<string, unknown>
+   179	  intent?: string
+   180	  perspectives?: string[]
+   181	  deliverable_types?: string[]
+   182	  total_tokens_used?: number | null
+   183	  total_input_tokens?: number | null
+   184	  total_output_tokens?: number | null
+   185	  total_cost_usd?: number | null
+   186	}
+   187	
+   188	export interface ExecutionListResponse {
+   189	  data: Execution[]
+   190	  meta: { total: number; next_cursor: string | null }
+   191	}
+   192	
+   193	export interface DashboardEvent {
+   194	  execution_id: string
+   195	  sk: string
+   196	  event_type: string
+   197	  timestamp: string
+   198	  sequence_number: number
+   199	  status_at_emit: string
+   200	  payload: Record<string, unknown>
+   201	}
+   202	
+   203	export interface Deliverable {
+   204	  execution_id: string
+   205	  deliverable_id?: string
+   206	  deliverable_type?: string
+   207	  title?: string
+   208	  created_at?: string
+   209	  [key: string]: unknown
+   210	}
+   211	
+   212	export interface ExecutionDetailResponse {
+   213	  data: {
+   214	    execution: Execution
+   215	    deliverables: Deliverable[]
+   216	  }
+   217	}
+   218	
+   219	export interface ExecutionEventsResponse {
+   220	  data: DashboardEvent[]
+   221	  meta: { total: number }
+   222	}
+   223	
+   224	export interface UnfixedCodeIssue {
+   225	  execution_id: string
+   226	  timestamp: string
+   227	  iteration: number | null
+   228	  code_related_unfixed_count: number
+   229	}
+   230	
+   231	export interface ReviewQualityData {
+   232	  period_days: number
+   233	  total_reviews: number
+   234	  pass_count: number
+   235	  pass_rate: number | null
+   236	  unfixed_code_issues: UnfixedCodeIssue[]
+   237	}
+   238	
+   239	export interface ReviewQualityResponse {
+   240	  data: ReviewQualityData
+   241	}
+   242	
+   243	export interface ErrorItem {
+   244	  execution_id: string
+   245	  timestamp: string
+   246	  error_type: string
+   247	  error_message: string
+   248	  stage: string
+   249	  is_recoverable: boolean | null
+   250	}
+   251	
+   252	export interface ErrorListResponse {
+   253	  data: ErrorItem[]
+   254	  meta: { total: number; by_type: Record<string, number> }
+   255	}
+   256	
+   257	export interface AuthMeResponse {
+   258	  user_sub: string
+   259	  user_name: string
+   260	  expires_at: number
+   261	}
+   262	
+   263	// F6 User Profile 閲覧用: dashboard_api/get_my_profile が返す本人プロファイル。
+   264	// 値が REMOVE 済 / 未設定の軸は null で返る。learned_preferences は要素なしなら空配列。
+   265	export interface MyProfile {
+   266	  user_id: string
+   267	  role: string | null
+   268	  interests: string | null
+   269	  expertise: string | null
+   270	  learning_goals: string | null
+   271	  background: string | null
+   272	  output_preferences: string | null
+   273	  learned_preferences: string[]
+   274	  updated_at: string | null
+   275	}
+   276	
+   277	export interface MyProfileResponse {
+   278	  data: MyProfile
+   279	}
+   280	
+   281	export type Period = "24h" | "7d" | "30d"
+   282	
+   283	export interface FeedbackEvent {
+   284	  execution_id: string
+   285	  timestamp: string
+   286	  subtype: string
+   287	  reply_text_summary: string
+   288	  learned_preferences_updated: boolean
+   289	  new_preferences_count: number
+   290	  total_preferences_count: number | null
+   291	}
+   292	
+   293	export interface DailyCount {
+   294	  date: string
+   295	  count: number
+   296	}
+   297	
+   298	export interface FeedbackAggregation {
+   299	  period: string
+   300	  total_feedback_count: number
+   301	  preferences_updated_count: number
+   302	  avg_new_preferences: number | null
+   303	  latest_total_preferences: number | null
+   304	  daily_counts?: DailyCount[]
+   305	  events?: FeedbackEvent[]
+   306	}
+   307	
+   308	export interface FeedbackAggregationResponse {
+   309	  data: FeedbackAggregation
+   310	}
+   311	
+   312	// 2026-05-13: text generator workspace 化に伴い subagent literal を拡張
+   313	// (.steering/20260512-parse-claude-response-dict-contract/)
+   314	// - "generator_text": 新方式 (Write tool で deliverable.json に書く)
+   315	// - "generator_code": 新方式 (code 成果物別パス)
+   316	// - "generator": 後方互換 (旧 record / feature flag false 時)
+   317	export interface SubagentIORecord {
+   318	  subagent:
+   319	    | "researcher"
+   320	    | "generator"
+   321	    | "generator_text"
+   322	    | "generator_code"
+   323	    | "reviewer_eval"
+   324	    | "reviewer_fix"
+   325	  index: string
+   326	  prompt: string
+   327	  output: string
+   328	  output_files?: Record<string, string>
+   329	  recorded_at: string
+   330	}
+   331	
+   332	export interface SubagentIOResponse {
+   333	  data: {
+   334	    execution_id: string
+   335	    records: SubagentIORecord[]
+   336	  }
+   337	}
+
+web search: 
+web search: site:api.slack.com openid connect sub claim user id team id
+exec
+/bin/bash -lc "nl -ba src/agent/feedback/feedback_processor.py | sed -n '40,120p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+    40	            try:
+    41	                execution = self.db.get_execution(execution_id)
+    42	                topic = execution.get("topic", "不明")
+    43	                category = execution.get("category", "不明")
+    44	            except (KeyError, Exception):
+    45	                logger.warning("Execution not found, proceeding without context", extra={"execution_id": execution_id})
+    46	                topic = "不明"
+    47	                category = "不明"
+    48	
+    49	            # 2. ユーザープロファイル取得
+    50	            profile = self.db.get_user_profile(user_id) or {}
+    51	            existing_prefs: list[dict] = profile.get("learned_preferences", [])
+    52	
+    53	            # T1-2b (Codex 2 回目 P2 対応): emitter を Claude / Slack 呼び出しの **前** に作成し、
+    54	            # それぞれの API call が api_call_completed として観測されるようにする。
+    55	            emitter = _EventEmitter(execution_id) if _EventEmitter is not None else None
+    56	            if emitter is not None:
+    57	                self.slack._emitter = emitter
+    58	
+    59	            # 3. Claude による好み抽出
+    60	            prompt = self._build_extraction_prompt(topic, category, existing_prefs, feedback_text)
+    61	            raw = call_claude(prompt, allowed_tools=None, emitter=emitter)
+    62	            parsed = _parse_claude_response(raw)
+    63	
+    64	            if parsed.get("parse_error"):
+    65	                new_preferences: list[dict] = []
+    66	            else:
+    67	                new_preferences = parsed.get("preferences", [])[:MAX_PREFERENCES_PER_FEEDBACK]
+    68	
+    69	            # 4. マージ
+    70	            merged = self._merge_preferences(existing_prefs, new_preferences)
+    71	
+    72	            # 5. プロファイル更新（learned_preferences と updated_at のみ）
+    73	            profile["user_id"] = user_id
+    74	            profile["learned_preferences"] = merged
+    75	            profile["updated_at"] = datetime.now(tz=UTC).isoformat()
+    76	            self.db.put_user_profile(profile)
+    77	
+    78	            logger.info(
+    79	                "Preferences updated",
+    80	                extra={
+    81	                    "user_id": user_id,
+    82	                    "new_count": len(new_preferences),
+    83	                    "total_count": len(merged),
+    84	                },
+    85	            )
+    86	
+    87	            # 6. T1-2b: feedback_received イベント emit (Tier 2.4)。
+    88	            # F8 はメンション必須経路のみ実装済み (project_slack_feedback_requires_mention)。
+    89	            # emoji_reaction subtype は将来拡張のため、現状は mention_reply 固定。
+    90	            # PII 配慮: feedback_text は raw 保存せず先頭 200 文字 + 「…」のサマリのみ。
+    91	            #
+    92	            # Codex 3 回目 P2 対応: Slack 通知前に emit する。Slack post が retry exhaust
+    93	            # で失敗した場合、後続の self.slack.post_feedback_result が例外を投げて
+    94	            # outer except に飛んでも、フィードバックを受信・処理した事実は events に
+    95	            # 残る (DB 更新は成功している)。
+    96	            if emitter is not None:
+    97	                reply_summary = feedback_text[:_FEEDBACK_REPLY_SUMMARY_MAX_CHARS]
+    98	                if len(feedback_text) > _FEEDBACK_REPLY_SUMMARY_MAX_CHARS:
+    99	                    reply_summary += "…"
+   100	                emitter.emit(
+   101	                    "feedback_received",
+   102	                    {
+   103	                        "subtype": "mention_reply",
+   104	                        "execution_id": execution_id,
+   105	                        "reply_text_summary": reply_summary,
+   106	                        "learned_preferences_updated": bool(new_preferences),
+   107	                        "new_preferences_count": len(new_preferences),
+   108	                        "total_preferences_count": len(merged),
+   109	                    },
+   110	                )
+   111	
+   112	            # 7. Slack 応答 (emitter は step 2 直後で作成済み、self.slack._emitter も伝搬済み)
+   113	            if new_preferences:
+   114	                self.slack.post_feedback_result(
+   115	                    slack_channel,
+   116	                    slack_thread_ts,
+   117	                    new_preferences,
+   118	                    len(merged),
+   119	                )
+   120	            else:
+
+exec
+/bin/bash -lc "nl -ba src/trigger/app.py | sed -n '30,50p;200,235p;405,430p'" in /workspaces/Catch-Expander
+exec
+/bin/bash -lc "nl -ba tests/unit/agent/test_feedback_processor.py | sed -n '150,180p;270,290p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+   150	        """好みが抽出できた場合: DynamoDB更新 + post_feedback_result"""
+   151	        mock_db = MagicMock()
+   152	        mock_db.get_execution.return_value = {"topic": "Terraform", "category": "技術"}
+   153	        mock_db.get_user_profile.return_value = {"user_id": "U1", "role": "エンジニア"}
+   154	
+   155	        mock_call_claude.return_value = json.dumps(
+   156	            {"result": json.dumps({"preferences": [{"text": "Terraformはmodule分割する", "replaces_index": None}]})}
+   157	        )
+   158	
+   159	        mock_slack = MagicMock()
+   160	        processor = self._make_processor(mock_slack=mock_slack, mock_db=mock_db)
+   161	        processor.process("U1", "コードが良かった", "exec-001", "C1", "ts1")
+   162	
+   163	        # DynamoDB に保存された内容を確認
+   164	        mock_db.put_user_profile.assert_called_once()
+   165	        saved_profile = mock_db.put_user_profile.call_args[0][0]
+   166	        assert len(saved_profile["learned_preferences"]) == 1
+   167	        assert saved_profile["learned_preferences"][0]["text"] == "Terraformはmodule分割する"
+   168	        assert "role" in saved_profile  # 既存フィールドが保持されている
+   169	
+   170	        # Slack 通知
+   171	        mock_slack.post_feedback_result.assert_called_once()
+   172	        mock_slack.post_feedback_unextracted.assert_not_called()
+   173	
+   174	    @patch("feedback.feedback_processor.call_claude")
+   175	    def test_no_preferences_extracted_posts_unextracted_message(self, mock_call_claude):
+   176	        """好みが0件の場合: post_feedback_unextracted を呼ぶ"""
+   177	        mock_db = MagicMock()
+   178	        mock_db.get_execution.return_value = {"topic": "topic", "category": "cat"}
+   179	        mock_db.get_user_profile.return_value = None
+   180	
+   270	                            {"text": "好み3", "replaces_index": None},
+   271	                            {"text": "好み4（切り捨て）", "replaces_index": None},
+   272	                        ]
+   273	                    }
+   274	                )
+   275	            }
+   276	        )
+   277	
+   278	        mock_slack = MagicMock()
+   279	        processor = self._make_processor(mock_slack=mock_slack, mock_db=mock_db)
+   280	        processor.process("U1", "feedback", "exec-001", "C1", "ts1")
+   281	
+   282	        saved_prefs = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+   283	        assert len(saved_prefs) == 3
+   284	
+   285	        # Slack通知に渡すのも3件以内
+   286	        notified_prefs = mock_slack.post_feedback_result.call_args[0][2]
+   287	        assert len(notified_prefs) == 3
+   288	
+   289	
+   290	class TestFeedbackReceivedEmit:
+
+ succeeded in 0ms:
+    30	
+    31	
+    32	# User Profile Modal フィールド定義（F6、5W1H 直交フレーム）
+    33	# (key, label, placeholder, multiline)
+    34	PROFILE_FIELDS: list[tuple[str, str, str, bool]] = [
+    35	    ("role", "役割・職業",
+    36	     "クラウドエンジニア（AWS 中心、SRE 担当） / マーケター（B2B SaaS）", False),
+    37	    ("interests", "関心分野",
+    38	     "AI（LLM のビジネス活用）、料理（時短レシピ）、投資（インデックス中心）", True),
+    39	    ("expertise", "専門・得意領域",
+    40	     "インフラ設計（5 年）、Python・SQL は実務レベル、統計は基礎のみ", True),
+    41	    ("learning_goals", "学習の目的",
+    42	     "副業として Web 制作で案件獲得したい。HTML/CSS は理解しているが営業ノウハウが弱い", True),
+    43	    ("background", "背景・状況",
+    44	     "30 代後半、子育て中、SaaS 企業のインフラチーム所属、転職活動準備中", False),
+    45	    ("output_preferences", "受け取り方の好み",
+    46	     "箇条書き重視、実例 3 つ必須、専門用語は注釈付き、英語ソース引用 OK", True),
+    47	]
+    48	
+    49	
+    50	def _find_completed_execution(user_id: str, thread_ts: str, table_prefix: str) -> dict | None:
+   200	                lines.append(f"   💻 {item['github_url']}")
+   201	            if not item.get("notion_url") and not item.get("github_url"):
+   202	                lines.append("   （URL なし）")
+   203	        text = "\n".join(lines)
+   204	
+   205	    slack_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+   206	
+   207	
+   208	# ---------------------------------------------------------------------------
+   209	# User Profile Modal ヘルパー群 (F6)
+   210	# ---------------------------------------------------------------------------
+   211	
+   212	
+   213	def _get_user_profile(user_id: str) -> dict | None:
+   214	    """UserProfilesTable から既存プロファイル取得（trigger ローカル実装）。"""
+   215	    table = dynamodb.Table(f"{os.environ['DYNAMODB_TABLE_PREFIX']}-user-profiles")
+   216	    response = table.get_item(Key={"user_id": user_id})
+   217	    return response.get("Item")
+   218	
+   219	
+   220	def _update_user_profile_fields(user_id: str, fields: dict[str, str]) -> None:
+   221	    """値ありは SET、空欄は REMOVE する UpdateItem を 1 発で反映。
+   222	
+   223	    learned_preferences など他キーは UpdateExpression に含めないため自動的に保持される。
+   224	    """
+   225	    table = dynamodb.Table(f"{os.environ['DYNAMODB_TABLE_PREFIX']}-user-profiles")
+   226	    set_keys = {k: v for k, v in fields.items() if v}
+   227	    remove_keys = [k for k, v in fields.items() if not v]
+   228	
+   229	    now = datetime.now(UTC).isoformat()
+   230	    set_expr_parts: list[str] = []
+   231	    remove_expr_parts: list[str] = []
+   232	    expr_attr_names: dict[str, str] = {}
+   233	    expr_attr_values: dict[str, str] = {}
+   234	
+   235	    for i, (k, v) in enumerate(set_keys.items()):
+   405	        metadata = {}
+   406	    channel_id = metadata.get("channel_id", "")
+   407	
+   408	    state = view.get("state")
+   409	    values = state.get("values") if isinstance(state, dict) else {}
+   410	    if not isinstance(values, dict):
+   411	        values = {}
+   412	
+   413	    new_fields: dict[str, str] = {}
+   414	    for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
+   415	        block = values.get(f"block_{key}")
+   416	        if not isinstance(block, dict):
+   417	            continue  # Modal block 自体が無い → no-op (フィールド追加直後の古い submit を防御)
+   418	        action = block.get(f"input_{key}")
+   419	        if not isinstance(action, dict):
+   420	            continue
+   421	        # Slack 仕様: optional な plain_text_input を空欄で submit すると
+   422	        # `value: null` (Python では None) で届く。空文字 `""` で届くとは限らない。
+   423	        # block / action が存在する以上ユーザーが Modal を submit した明示的意図なので、
+   424	        # None も「空欄保存 = REMOVE 対象」として扱う。想定外型 (int 等) のみ no-op。
+   425	        raw = action.get("value")
+   426	        if raw is None:
+   427	            new_fields[key] = ""
+   428	        elif isinstance(raw, str):
+   429	            new_fields[key] = raw.strip()
+   430	        else:
+
+exec
+/bin/bash -lc "nl -ba src/agent/orchestrator.py | sed -n '1240,1285p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+  1240	
+  1241	        # _NoOpEmitter (__init__) を本物に差し替え。ECS image で src.observability が
+  1242	        # 未配置の場合 (_EventEmitter is None) は _NoOpEmitter のままで継続する。
+  1243	        if _EventEmitter is not None:
+  1244	            self._emitter = _EventEmitter(execution_id)
+  1245	            # T1-2b: storage / notify クライアントにも EventEmitter を伝搬し、
+  1246	            # 各クライアントの `_request_with_retry` / `_post_with_retry` から
+  1247	            # api_call_completed / rate_limit_hit を emit させる。
+  1248	            self.notion._emitter = self._emitter
+  1249	            self.github._emitter = self._emitter
+  1250	            self.slack._emitter = self._emitter
+  1251	        if _PromptRecorder is not None:
+  1252	            self._prompt_recorder = _PromptRecorder(execution_id)
+  1253	
+  1254	        overall_start_ns = time.monotonic_ns()
+  1255	        final_status = "in_progress"
+  1256	        notion_url: str | None = None
+  1257	        github_url: str | None = None
+  1258	
+  1259	        try:
+  1260	            # 1. プロファイル取得
+  1261	            profile = self.db.get_user_profile(user_id) or {}
+  1262	            profile_text_base = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
+  1263	            learned_prefs = profile.get("learned_preferences", [])
+  1264	            if learned_prefs:
+  1265	                prefs_lines = "\n".join(f"- {p['text']}" for p in learned_prefs)
+  1266	                profile_text = (
+  1267	                    f"{profile_text_base}\n\n"
+  1268	                    "## ユーザーの蓄積された好み（学習済み）\n"
+  1269	                    "以下の好みを成果物の生成方針に必ず反映してください：\n"
+  1270	                    f"{prefs_lines}"
+  1271	                )
+  1272	            else:
+  1273	                profile_text = profile_text_base
+  1274	
+  1275	            # 2. トピック解析
+  1276	            orchestrator_prompt = _load_prompt("orchestrator")
+  1277	            analysis_prompt = (
+  1278	                f"{orchestrator_prompt}\n\n"
+  1279	                f"## トピック解析を実行してください\n\n"
+  1280	                f"トピック: {topic}\n\n"
+  1281	                f"ユーザープロファイル:\n{profile_text}"
+  1282	            )
+  1283	            analysis_raw = call_claude(analysis_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
+  1284	            analysis = _parse_claude_response(analysis_raw)
+  1285	            logger.info(
+
+exec
+/bin/bash -lc "nl -ba template.yaml | sed -n '740,805p;1208,1248p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+   740	                - dynamodb:PutItem
+   741	              Resource:
+   742	                - !GetAtt DashboardEventsTable.Arn
+   743	            - Effect: Allow
+   744	              Action:
+   745	                - secretsmanager:GetSecretValue
+   746	              Resource:
+   747	                - !Ref ClaudeOAuthSecretArn
+   748	                - !Ref SlackBotTokenSecretArn
+   749	            - Effect: Allow
+   750	              Action:
+   751	                - secretsmanager:PutSecretValue
+   752	              Resource:
+   753	                - !Ref ClaudeOAuthSecretArn
+   754	
+   755	  # ==============================================================
+   756	  # Dashboard API (Observability Web UI)
+   757	  # ==============================================================
+   758	  DashboardAuthorizerFunction:
+   759	    Type: AWS::Serverless::Function
+   760	    Properties:
+   761	      FunctionName: catch-expander-dashboard-authorizer
+   762	      Handler: authorizer.app.lambda_handler
+   763	      CodeUri: src/dashboard_api/
+   764	      MemorySize: 128
+   765	      Timeout: 5
+   766	      Environment:
+   767	        Variables:
+   768	          JWT_KEY_SECRET_ARN: !Ref DashboardJwtKeySecret
+   769	      Policies:
+   770	        - Version: "2012-10-17"
+   771	          Statement:
+   772	            - Effect: Allow
+   773	              Action:
+   774	                - secretsmanager:GetSecretValue
+   775	              Resource:
+   776	                - !Ref DashboardJwtKeySecret
+   777	
+   778	  DashboardAuthorizerPermission:
+   779	    Type: AWS::Lambda::Permission
+   780	    Properties:
+   781	      FunctionName: !GetAtt DashboardAuthorizerFunction.Arn
+   782	      Action: lambda:InvokeFunction
+   783	      Principal: apigateway.amazonaws.com
+   784	      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/authorizers/*"
+   785	
+   786	  DashboardApi:
+   787	    Type: AWS::Serverless::HttpApi
+   788	    Properties:
+   789	      Description: Dashboard REST API for Catch-Expander observability
+   790	      StageName: $default
+   791	      # CORS は不要: CloudFront が /api/* を proxy するため同一オリジン経路のみ
+   792	      Auth:
+   793	        DefaultAuthorizer: DashboardAuthorizer
+   794	        Authorizers:
+   795	          DashboardAuthorizer:
+   796	            FunctionArn: !GetAtt DashboardAuthorizerFunction.Arn
+   797	            AuthorizerPayloadFormatVersion: "2.0"
+   798	            EnableSimpleResponses: true
+   799	            Identity:
+   800	              ReauthorizeEvery: 300
+   801	              Headers:
+   802	                - Cookie
+   803	
+   804	  DashboardAuthLoginFunction:
+   805	    Type: AWS::Serverless::Function
+  1208	            - Effect: Allow
+  1209	              Action:
+  1210	                - dynamodb:Query
+  1211	              Resource:
+  1212	                - !GetAtt DashboardEventsTable.Arn
+  1213	                - !Sub ${DashboardEventsTable.Arn}/index/gsi_event_type_timestamp
+  1214	
+  1215	  # [F6] User Profile 閲覧 Lambda: UserProfilesTable から本人プロファイルを read-only で返す。
+  1216	  # 編集は src/trigger/app.py の Slack Modal フローで完結 (UpdateItem は付与しない)。
+  1217	  DashboardGetMyProfileFunction:
+  1218	    Type: AWS::Serverless::Function
+  1219	    Properties:
+  1220	      FunctionName: catch-expander-dashboard-get-my-profile
+  1221	      Handler: get_my_profile.app.lambda_handler
+  1222	      CodeUri: src/dashboard_api/
+  1223	      MemorySize: 128
+  1224	      Timeout: 10
+  1225	      Environment:
+  1226	        Variables:
+  1227	          USER_PROFILES_TABLE: !Ref UserProfilesTable
+  1228	      Events:
+  1229	        GetMyProfile:
+  1230	          Type: HttpApi
+  1231	          Properties:
+  1232	            ApiId: !Ref DashboardApi
+  1233	            Path: /api/v1/profile/me
+  1234	            Method: GET
+  1235	      Policies:
+  1236	        - Version: "2012-10-17"
+  1237	          Statement:
+  1238	            - Effect: Allow
+  1239	              Action:
+  1240	                - dynamodb:GetItem
+  1241	              Resource:
+  1242	                - !GetAtt UserProfilesTable.Arn
+  1243	
+  1244	  DashboardGetFeedbackAggregationFunction:
+  1245	    Type: AWS::Serverless::Function
+  1246	    Properties:
+  1247	      FunctionName: catch-expander-dashboard-get-feedback-aggregation
+  1248	      Handler: get_feedback_aggregation.app.lambda_handler
+
+exec
+/bin/bash -lc "nl -ba src/dashboard_api/auth_callback/app.py | sed -n '80,160p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+    80	    if stored_fp and stored_fp != _fingerprint(event):
+    81	        logger.warning("OAuth state fingerprint mismatch")
+    82	        return _error(400, "fingerprint_mismatch")
+    83	
+    84	    # 単一回限り削除
+    85	    table.delete_item(Key={"state": state})
+    86	
+    87	    config = _get_slack_config()
+    88	    host = os.environ.get("FRONTEND_DOMAIN") or \
+    89	           (event.get("headers") or {}).get("host") or \
+    90	           event["requestContext"]["domainName"]
+    91	    redirect_uri = f"https://{host}/api/v1/auth/callback"
+    92	
+    93	    try:
+    94	        token_resp = _slack_post(
+    95	            _SLACK_TOKEN_URL,
+    96	            {
+    97	                "client_id": config["client_id"],
+    98	                "client_secret": config["client_secret"],
+    99	                "code": code,
+   100	                "redirect_uri": redirect_uri,
+   101	            },
+   102	        )
+   103	    except URLError as e:
+   104	        logger.error("Slack token exchange network error: %s", e)
+   105	        return _error(502, "slack_unavailable")
+   106	
+   107	    if not token_resp.get("ok"):
+   108	        logger.error("Slack token exchange failed: %s", token_resp.get("error"))
+   109	        return _error(502, "slack_token_exchange_failed")
+   110	
+   111	    access_token = token_resp.get("authed_user", {}).get("access_token")
+   112	    if not access_token:
+   113	        logger.error("No authed_user.access_token in Slack response")
+   114	        return _error(502, "no_access_token")
+   115	
+   116	    try:
+   117	        user_resp = _slack_post(_SLACK_USERINFO_URL, {}, token=access_token)
+   118	    except URLError as e:
+   119	        logger.error("Slack userInfo network error: %s", e)
+   120	        return _error(502, "slack_unavailable")
+   121	
+   122	    if not user_resp.get("ok"):
+   123	        logger.error("Slack userInfo failed: %s", user_resp.get("error"))
+   124	        return _error(502, "slack_userinfo_failed")
+   125	
+   126	    team_id = user_resp.get("https://slack.com/team_id")
+   127	    if team_id != config.get("workspace_id"):
+   128	        logger.warning("Workspace mismatch: got=%s", team_id)
+   129	        return _error(401, "workspace_mismatch")
+   130	
+   131	    sub = user_resp.get("sub", "")
+   132	    name = user_resp.get("name", "")
+   133	    now = int(time.time())
+   134	    exp = now + _JWT_TTL_SEC
+   135	    session_token = jwt.encode({"sub": sub, "name": name, "exp": exp}, _get_jwt_signing_key(), algorithm="HS256")
+   136	
+   137	    cookie = f"session={session_token}; HttpOnly; Secure; SameSite=Lax; Max-Age={_JWT_TTL_SEC}; Path=/"
+   138	    return {
+   139	        "statusCode": 302,
+   140	        "headers": {
+   141	            "Location": f"https://{host}/",
+   142	            "Set-Cookie": cookie,
+   143	        },
+   144	        "body": "",
+   145	    }
+
+exec
+/bin/bash -lc "rg -n \"learned_preferences.*\\[|\\['text'\\]|\\\"text\\\".*replaces_index|post_feedback_result|put_user_profile|get_user_profile\" src tests | head -120" in /workspaces/Catch-Expander
+exec
+/bin/bash -lc "nl -ba frontend/src/App.tsx frontend/src/components/Layout.tsx | sed -n '1,140p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+     1	import { Routes, Route, Navigate } from "react-router-dom"
+     2	import { Layout } from "@/components/Layout"
+     3	import { DashboardHome } from "@/routes/DashboardHome"
+     4	import { ExecutionList } from "@/routes/ExecutionList"
+     5	import { ExecutionDetail } from "@/routes/ExecutionDetail"
+     6	import { ReviewQuality } from "@/routes/ReviewQuality"
+     7	import { ErrorList } from "@/routes/ErrorList"
+     8	import { FeedbackAnalysis } from "@/routes/FeedbackAnalysis"
+     9	import { MyProfile } from "@/routes/MyProfile"
+    10	
+    11	export default function App() {
+    12	  return (
+    13	    <Routes>
+    14	      <Route path="/" element={<Layout />}>
+    15	        <Route index element={<Navigate to="/dashboard" replace />} />
+    16	        <Route path="dashboard" element={<DashboardHome />} />
+    17	        <Route path="executions" element={<ExecutionList />} />
+    18	        <Route path="executions/:executionId" element={<ExecutionDetail />} />
+    19	        <Route path="review-quality" element={<ReviewQuality />} />
+    20	        <Route path="errors" element={<ErrorList />} />
+    21	        <Route path="feedback" element={<FeedbackAnalysis />} />
+    22	        <Route path="profile" element={<MyProfile />} />
+    23	      </Route>
+    24	    </Routes>
+    25	  )
+    26	}
+    27	import { useState } from "react"
+    28	import { NavLink, Outlet } from "react-router-dom"
+    29	import {
+    30	  LayoutDashboard, List, Star, AlertTriangle, MessageSquare,
+    31	  LogOut, User, UserCircle, Menu, ChevronLeft, ChevronRight,
+    32	} from "lucide-react"
+    33	import { useAuth } from "@/contexts/AuthContext"
+    34	
+    35	const NAV = [
+    36	  { to: "/dashboard",      icon: LayoutDashboard, label: "ダッシュボード"    },
+    37	  { to: "/executions",     icon: List,             label: "実行一覧"          },
+    38	  { to: "/review-quality", icon: Star,             label: "レビュー品質"      },
+    39	  { to: "/errors",         icon: AlertTriangle,    label: "エラー"            },
+    40	  { to: "/feedback",       icon: MessageSquare,    label: "フィードバック分析" },
+    41	  { to: "/profile",        icon: UserCircle,       label: "マイプロファイル"   },
+    42	]
+    43	
+    44	export function Layout() {
+    45	  const { user_name } = useAuth()
+    46	  const [mobileOpen, setMobileOpen] = useState(false)
+    47	  const [collapsed, setCollapsed] = useState(() =>
+    48	    localStorage.getItem("sidebar-collapsed") === "true"
+    49	  )
+    50	
+    51	  function toggleCollapsed() {
+    52	    setCollapsed((v) => {
+    53	      const next = !v
+    54	      localStorage.setItem("sidebar-collapsed", String(next))
+    55	      return next
+    56	    })
+    57	  }
+    58	
+    59	  return (
+    60	    <div className="flex min-h-screen bg-background">
+    61	      <a
+    62	        href="#main-content"
+    63	        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:px-3 focus:py-1.5 focus:rounded focus:bg-primary focus:text-primary-foreground focus:text-xs"
+    64	      >
+    65	        メインコンテンツへスキップ
+    66	      </a>
+    67	
+    68	      {/* Mobile header (below md) */}
+    69	      <div className="md:hidden fixed top-0 left-0 right-0 z-40 flex flex-col bg-sidebar border-b border-sidebar-border">
+    70	        <div className="flex items-center justify-between px-4 py-3">
+    71	          <span className="text-sm font-semibold text-sidebar-foreground">Catch-Expander</span>
+    72	          <button
+    73	            type="button"
+    74	            onClick={() => setMobileOpen((v) => !v)}
+    75	            className="text-muted-foreground hover:text-sidebar-foreground transition-colors"
+    76	            aria-label="メニューを開く"
+    77	          >
+    78	            <Menu size={18} />
+    79	          </button>
+    80	        </div>
+    81	        {mobileOpen && (
+    82	          <nav className="bg-sidebar border-b border-sidebar-border p-2 space-y-0.5">
+    83	            {NAV.map(({ to, icon: Icon, label }) => (
+    84	              <NavLink
+    85	                key={to}
+    86	                to={to}
+    87	                onClick={() => setMobileOpen(false)}
+    88	                className={({ isActive }) =>
+    89	                  `flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors ${
+    90	                    isActive
+    91	                      ? "bg-sidebar-accent text-primary font-medium"
+    92	                      : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground"
+    93	                  }`
+    94	                }
+    95	              >
+    96	                <Icon size={15} className="shrink-0" />
+    97	                {label}
+    98	              </NavLink>
+    99	            ))}
+   100	            <div className="pt-1 mt-1 border-t border-sidebar-border">
+   101	              <a
+   102	                href="/api/v1/auth/logout"
+   103	                className="flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground transition-colors"
+   104	              >
+   105	                <LogOut size={15} className="shrink-0" />
+   106	                ログアウト
+   107	              </a>
+   108	            </div>
+   109	          </nav>
+   110	        )}
+   111	      </div>
+   112	
+   113	      {/* Sidebar (md and above) */}
+   114	      <aside className="hidden md:flex shrink-0 flex-col border-r border-sidebar-border bg-sidebar">
+   115	        {/* Title header — always visible */}
+   116	        <div className="flex items-center justify-between px-4 py-4 border-b border-sidebar-border">
+   117	          <span className="text-sm font-semibold text-sidebar-foreground leading-tight whitespace-nowrap">
+   118	            Catch-Expander
+   119	            <span className="block text-[11px] font-normal text-muted-foreground">監視ダッシュボード</span>
+   120	          </span>
+   121	          <button
+   122	            type="button"
+   123	            onClick={toggleCollapsed}
+   124	            className="ml-3 shrink-0 text-muted-foreground hover:text-sidebar-foreground transition-colors"
+   125	            aria-label={collapsed ? "サイドバーを開く" : "サイドバーを閉じる"}
+   126	          >
+   127	            {collapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
+   128	          </button>
+   129	        </div>
+   130	
+   131	        {/* Collapsible nav + footer */}
+   132	        <div
+   133	          className={`flex flex-col flex-1 overflow-hidden transition-[width] duration-200 ${
+   134	            collapsed ? "w-0" : "w-[220px]"
+   135	          }`}
+   136	        >
+   137	          <nav className="flex-1 p-2 space-y-0.5">
+   138	            {NAV.map(({ to, icon: Icon, label }) => (
+   139	              <NavLink
+   140	                key={to}
+
+ succeeded in 113ms:
+urn_value = None
+tests/unit/agent/test_feedback_processor.py:226:        mock_db.get_user_profile.return_value = None
+tests/unit/agent/test_feedback_processor.py:228:            {"result": json.dumps({"preferences": [{"text": "好み", "replaces_index": None}]})}
+tests/unit/agent/test_feedback_processor.py:230:        mock_db.put_user_profile.side_effect = RuntimeError("DynamoDB error")
+tests/unit/agent/test_feedback_processor.py:247:        mock_db.get_user_profile.return_value = None
+tests/unit/agent/test_feedback_processor.py:262:        mock_db.get_user_profile.return_value = None
+tests/unit/agent/test_feedback_processor.py:268:                            {"text": "好み1", "replaces_index": None},
+tests/unit/agent/test_feedback_processor.py:269:                            {"text": "好み2", "replaces_index": None},
+tests/unit/agent/test_feedback_processor.py:270:                            {"text": "好み3", "replaces_index": None},
+tests/unit/agent/test_feedback_processor.py:271:                            {"text": "好み4（切り捨て）", "replaces_index": None},
+tests/unit/agent/test_feedback_processor.py:282:        saved_prefs = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+tests/unit/agent/test_feedback_processor.py:286:        notified_prefs = mock_slack.post_feedback_result.call_args[0][2]
+tests/unit/agent/test_feedback_processor.py:306:        mock_db.get_user_profile.return_value = None
+tests/unit/agent/test_feedback_processor.py:308:            {"result": json.dumps({"preferences": [{"text": "新しい好み", "replaces_index": None}]})}
+tests/unit/agent/test_feedback_processor.py:335:        mock_db.get_user_profile.return_value = None
+tests/unit/agent/test_feedback_processor.py:356:        mock_db.get_user_profile.return_value = None
+tests/unit/agent/test_feedback_processor.py:376:        mock_db.get_user_profile.return_value = None
+tests/unit/agent/test_slack_client.py:81:    def test_post_feedback_result_single_preference(self):
+tests/unit/agent/test_slack_client.py:84:        prefs = [{"text": "Terraformはmodule分割する", "replaces_index": None}]
+tests/unit/agent/test_slack_client.py:86:        client.post_feedback_result("C1", "ts1", prefs, 1)
+tests/unit/agent/test_slack_client.py:93:    def test_post_feedback_result_multiple_preferences(self):
+tests/unit/agent/test_slack_client.py:97:            {"text": "好み1", "replaces_index": None},
+tests/unit/agent/test_slack_client.py:98:            {"text": "好み2", "replaces_index": None},
+tests/unit/agent/test_slack_client.py:101:        client.post_feedback_result("C1", "ts1", prefs, 5)
+tests/unit/agent/test_orchestrator.py:1283:        db.get_user_profile.return_value = None
+tests/unit/agent/test_orchestrator.py:1337:        db.get_user_profile.return_value = None
+tests/unit/agent/test_orchestrator.py:1390:        db.get_user_profile.return_value = None
+tests/unit/agent/test_orchestrator.py:1439:        db.get_user_profile.return_value = {
+tests/unit/agent/test_orchestrator.py:1442:            "learned_preferences": [
+tests/unit/agent/test_orchestrator.py:1470:        db.get_user_profile.return_value = {
+tests/unit/agent/test_orchestrator.py:1531:        db.get_user_profile.return_value = {"user_id": "U1"}
+tests/unit/agent/test_orchestrator.py:1558:        db.get_user_profile.return_value = {"user_id": "U1"}
+tests/unit/dashboard_api/test_get_my_profile.py:61:            "learned_preferences": ["長めのサマリを好む", "コード例を望む"],
+tests/unit/dashboard_api/test_get_my_profile.py:74:        assert body["learned_preferences"] == ["長めのサマリを好む", "コード例を望む"]
+tests/unit/dashboard_api/test_get_my_profile.py:98:        assert body["learned_preferences"] == []
+tests/unit/dashboard_api/test_get_my_profile.py:123:        assert body["learned_preferences"] == []
+
+codex
+実データの保存形式で重要な不整合が見えました。`learned_preferences` は既存の feedback 経路では文字列配列ではなく `{ text, replaces_index }` の配列として保存されているため、今回の画面は学習履歴ありのユーザーで runtime render error を起こす可能性があります。
+exec
+/bin/bash -lc 'cat frontend/package.json' in /workspaces/Catch-Expander
+ succeeded in 0ms:
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.4.1",
+    "@fontsource-variable/geist": "^5.2.8",
+    "@tanstack/react-query": "^5.100.7",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "react-router-dom": "^7.14.2",
+    "recharts": "^3.8.1",
+    "shadcn": "^4.6.0",
+    "tailwind-merge": "^3.5.0",
+    "tw-animate-css": "^1.4.0",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@tailwindcss/vite": "^4.2.4",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^24.12.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^10.2.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.5.0",
+    "jsdom": "^29.1.1",
+    "tailwindcss": "^4.2.4",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.58.2",
+    "vite": "^8.0.10",
+    "vitest": "^4.1.5"
+  }
+}
+
+exec
+/bin/bash -lc 'uv run pytest tests/unit/dashboard_api/test_get_my_profile.py tests/unit/agent/test_feedback_processor.py::TestFeedbackProcessor::test_preferences_extracted_updates_dynamodb_and_posts -q' in /workspaces/Catch-Expander
+ exited 4 in 32147ms:
+
+no tests ran in 0.50s
+ERROR: not found: /workspaces/Catch-Expander/tests/unit/agent/test_feedback_processor.py::TestFeedbackProcessor::test_preferences_extracted_updates_dynamodb_and_posts
+(no match in any of [<Module test_feedback_processor.py>])
+
+
+2026-05-19T14:01:09.963008Z ERROR codex_core::tools::router: error=write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open
+web search: 
+web search: 
+web search: 
+web search: https://api.slack.com/methods/openid.connect.token
+exec
+/bin/bash -lc 'npm run build' in /workspaces/Catch-Expander/frontend
+ succeeded in 43755ms:
+vite v8.0.10 building client environment for production...
+[2Ktransforming...✓ 2383 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                           0.48 kB │ gzip:   0.32 kB
+dist/assets/geist-cyrillic-wght-normal-CHSlOQsW.woff2    14.69 kB
+dist/assets/geist-latin-ext-wght-normal-DMtmJ5ZE.woff2   15.30 kB
+dist/assets/geist-latin-wght-normal-Dm3htQBi.woff2       28.40 kB
+dist/assets/index-T_KnTH2X.css                           50.43 kB │ gzip:   9.91 kB
+dist/assets/index-BUyv1Qfs.js                           742.82 kB │ gzip: 219.02 kB
+
+[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+[33m[PLUGIN_TIMINGS] Warning:[0m Your build spent significant time in plugin `rolldown:vite-resolve`. See https://rolldown.rs/options/checks#plugintimings for more details.
+
+✓ built in 16.79s
+
+exec
+/bin/bash -lc 'uv run pytest tests/unit/dashboard_api/test_get_my_profile.py -q' in /workspaces/Catch-Expander
+ succeeded in 29450ms:
+.......                                                                  [100%]
+7 passed in 0.39s
+
+web search: 
+web search: https://docs.slack.dev/reference/methods/openid.connect.userInfo/
+codex
+# Codex Review — 2026-05-19 frontend-profile-view (Pass 1)
+
+## サマリ
+- Critical: 0 / High: 1 / Medium: 0 / Low: 2 / Info: 4
+- 総合所感: 設計方向は妥当です。`/me` 固定、authorizer context のみ参照、IAM `GetItem` 限定はいずれも意図と整合しています。
+- ただし、既存実データの `learned_preferences` 形状と今回の API / frontend 型が食い違っており、学習履歴ありユーザーで画面が壊れる可能性があります。
+- それ以外は主に drift 防止・入力検証の補強レベルです。
+- Slack 公式 docs でも `sub` は pure user id 例で、team id は別 claim として示されています: https://docs.slack.dev/reference/methods/openid.connect.userInfo/ / https://docs.slack.dev/reference/methods/openid.connect.token/
+
+## 指摘事項
+
+### [High] [src/dashboard_api/get_my_profile/app.py:64] learned_preferences の実保存形式と API / frontend 型が不一致
+- 問題: 既存の feedback 経路は `learned_preferences` を `{"text": "...", "replaces_index": ...}` の dict 配列として保存しています。例: `src/agent/feedback/feedback_processor.py:51`, `src/agent/feedback/feedback_processor.py:74`, `src/agent/orchestrator.py:1265`。一方、本 PR の API はそのまま返し、frontend は `string[]` として `pref` を React child に渡しています。
+- 影響: 学習履歴が 1 件以上ある実ユーザーで、`Objects are not valid as a React child` 系の runtime error になり、`/profile` 全体が表示不能になる可能性があります。新規テストが文字列配列だけを使っているため、この実データ契約を検知できていません。
+- 推奨修正: read-only 表示用途なら backend で `text` だけに正規化し、API contract を `string[]` に固定するのが最小です。既存形式と将来の壊れたデータも吸収できます。
+
+```python
+def _serialize_learned_preferences(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+
+    result: list[str] = []
+    for pref in raw:
+        if isinstance(pref, str):
+            text = pref
+        elif isinstance(pref, dict):
+            text = pref.get("text")
+        else:
+            continue
+
+        if isinstance(text, str) and text.strip():
+            result.append(text)
+
+    return result
+```
+
+```python
+"learned_preferences": _serialize_learned_preferences(item.get("learned_preferences")),
+```
+
+テストも dict 配列を本命ケースにしてください。
+
+```python
+"learned_preferences": [
+    {"text": "長めのサマリを好む", "replaces_index": None},
+    {"text": "コード例を望む", "replaces_index": None},
+]
+```
+
+期待値:
+
+```python
+assert body["learned_preferences"] == ["長めのサマリを好む", "コード例を望む"]
+```
+
+### [Low] [src/dashboard_api/get_my_profile/app.py:31] user_sub の形式検証がなく、仕様 drift を静かに placeholder 化する
+- 問題: `_extract_slack_user_id()` は空文字以外なら `split("-", 1)[0]` をそのまま採用します。authorizer 由来なので外部入力としての危険度は低いですが、`"abc"`, `"123"`, `"U04*"` なども DynamoDB key として照会されます。
+- 影響: Slack / auth_callback 側の claim 形状が壊れた場合に 401 や明示ログではなく「未設定プロファイル」に見え、原因特定が遅れます。
+- 推奨修正: split 後に Slack user id として最低限の形式検証を入れてください。Slack 公式 userInfo docs は `sub`, `https://slack.com/user_id`, `https://slack.com/team_id` を別 field として示しており、現時点では pure user id 前提が公式例とも整合します。
+
+```python
+import re
+
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
+
+def _extract_slack_user_id(user_sub: str | None) -> str | None:
+    if not user_sub:
+        return None
+    candidate = user_sub.split("-", 1)[0]
+    if not _SLACK_USER_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+```
+
+### [Low] [src/dashboard_api/get_my_profile/app.py:20] 6 軸定義が 3 箇所に分散しており drift 検知が弱い
+- 問題: `PROFILE_FIELDS`、backend `_PROFILE_KEYS`、frontend `AXIS_FIELDS` が手動同期です。今回の分離自体は trigger modal の再発バグ領域に触れない判断として妥当ですが、キー追加・名称変更時の検知が型だけでは足りません。
+- 影響: 将来 6 軸に変更が入ったとき、保存はできるが閲覧に出ない、または frontend だけに幽霊フィールドが残る drift が起きます。
+- 推奨修正: 共有 import までは不要です。まずは軽い単体テストで十分です。
+
+```python
+def test_profile_keys_match_trigger_profile_fields():
+    from src.dashboard_api.get_my_profile.app import _PROFILE_KEYS
+    from src.trigger.app import PROFILE_FIELDS
+
+    assert tuple(k for k, *_ in PROFILE_FIELDS) == _PROFILE_KEYS
+```
+
+frontend 側は `AXIS_FIELDS` のキーが `MyProfile` に存在することは TypeScript で担保されていますが、backend との一致までは担保されません。
+
+### [Info] [template.yaml:1217] `/api/v1/profile/me` 固定と IAM は設計意図どおり
+- 問題: なし。
+- 影響: path parameter を持たず、`requestContext.authorizer.lambda.user_sub` のみから user id を導出しているため、他ユーザー閲覧経路を作らない設計に合っています。IAM も `dynamodb:GetItem` + `UserProfilesTable.Arn` 単一で過不足ありません。
+- 推奨修正: 不要です。
+
+### [Info] [src/dashboard_api/get_my_profile/app.py:53] env 不在の KeyError は IaC 信頼で許容
+- 問題: `USER_PROFILES_TABLE` 未設定時は `KeyError` で Lambda 失敗になります。
+- 影響: template.yaml で注入されているため、本番構成上の実害は低いです。既存 dashboard API も `os.environ[...]` 前提のためパターン整合しています。
+- 推奨修正: 不要です。構成ミスを早く落とす挙動として妥当です。
+
+### [Info] [src/dashboard_api/get_my_profile/app.py:56] DynamoDB 例外の広め捕捉は既存 dashboard API と整合
+- 問題: `except Exception` は広いですが、既存 `get_token_monitor_health` なども同系統です。
+- 影響: read-only API の 500 変換としては許容範囲です。profile 内容をログに出していない点も良いです。
+- 推奨修正: 不要です。より厳密にするなら `botocore.exceptions.ClientError` + 想定外再 raise ですが、本 PR で必須ではありません。
+
+### [Info] [frontend/src/api/client.ts:8] 401 redirect は共通 client で処理済み
+- 問題: `MyProfile.tsx` 単体では 401 を一般エラー文言に見せますが、実際は `api/client.ts` が 401 で `/api/v1/auth/login` に遷移します。
+- 影響: B5 の懸念は既存設計で解消されています。
+- 推奨修正: 不要です。
+
+## 総合評価
+- 設計の妥当性: ✅
+- エッジケース網羅: ⚠️
+- アンチパターン回避: ✅
+- テストカバレッジ: ⚠️
+
+## 結論
+- マージ可否: 条件付き可 (High の `learned_preferences` 形状不一致対応後)
+2026-05-19T14:03:35.665665Z ERROR codex_core::session: failed to record rollout items: thread 019e4088-fe60-7351-9b28-5b9d23c4eb81 not found
+tokens used
+75,868
+# Codex Review — 2026-05-19 frontend-profile-view (Pass 1)
+
+## サマリ
+- Critical: 0 / High: 1 / Medium: 0 / Low: 2 / Info: 4
+- 総合所感: 設計方向は妥当です。`/me` 固定、authorizer context のみ参照、IAM `GetItem` 限定はいずれも意図と整合しています。
+- ただし、既存実データの `learned_preferences` 形状と今回の API / frontend 型が食い違っており、学習履歴ありユーザーで画面が壊れる可能性があります。
+- それ以外は主に drift 防止・入力検証の補強レベルです。
+- Slack 公式 docs でも `sub` は pure user id 例で、team id は別 claim として示されています: https://docs.slack.dev/reference/methods/openid.connect.userInfo/ / https://docs.slack.dev/reference/methods/openid.connect.token/
+
+## 指摘事項
+
+### [High] [src/dashboard_api/get_my_profile/app.py:64] learned_preferences の実保存形式と API / frontend 型が不一致
+- 問題: 既存の feedback 経路は `learned_preferences` を `{"text": "...", "replaces_index": ...}` の dict 配列として保存しています。例: `src/agent/feedback/feedback_processor.py:51`, `src/agent/feedback/feedback_processor.py:74`, `src/agent/orchestrator.py:1265`。一方、本 PR の API はそのまま返し、frontend は `string[]` として `pref` を React child に渡しています。
+- 影響: 学習履歴が 1 件以上ある実ユーザーで、`Objects are not valid as a React child` 系の runtime error になり、`/profile` 全体が表示不能になる可能性があります。新規テストが文字列配列だけを使っているため、この実データ契約を検知できていません。
+- 推奨修正: read-only 表示用途なら backend で `text` だけに正規化し、API contract を `string[]` に固定するのが最小です。既存形式と将来の壊れたデータも吸収できます。
+
+```python
+def _serialize_learned_preferences(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+
+    result: list[str] = []
+    for pref in raw:
+        if isinstance(pref, str):
+            text = pref
+        elif isinstance(pref, dict):
+            text = pref.get("text")
+        else:
+            continue
+
+        if isinstance(text, str) and text.strip():
+            result.append(text)
+
+    return result
+```
+
+```python
+"learned_preferences": _serialize_learned_preferences(item.get("learned_preferences")),
+```
+
+テストも dict 配列を本命ケースにしてください。
+
+```python
+"learned_preferences": [
+    {"text": "長めのサマリを好む", "replaces_index": None},
+    {"text": "コード例を望む", "replaces_index": None},
+]
+```
+
+期待値:
+
+```python
+assert body["learned_preferences"] == ["長めのサマリを好む", "コード例を望む"]
+```
+
+### [Low] [src/dashboard_api/get_my_profile/app.py:31] user_sub の形式検証がなく、仕様 drift を静かに placeholder 化する
+- 問題: `_extract_slack_user_id()` は空文字以外なら `split("-", 1)[0]` をそのまま採用します。authorizer 由来なので外部入力としての危険度は低いですが、`"abc"`, `"123"`, `"U04*"` なども DynamoDB key として照会されます。
+- 影響: Slack / auth_callback 側の claim 形状が壊れた場合に 401 や明示ログではなく「未設定プロファイル」に見え、原因特定が遅れます。
+- 推奨修正: split 後に Slack user id として最低限の形式検証を入れてください。Slack 公式 userInfo docs は `sub`, `https://slack.com/user_id`, `https://slack.com/team_id` を別 field として示しており、現時点では pure user id 前提が公式例とも整合します。
+
+```python
+import re
+
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
+
+def _extract_slack_user_id(user_sub: str | None) -> str | None:
+    if not user_sub:
+        return None
+    candidate = user_sub.split("-", 1)[0]
+    if not _SLACK_USER_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+```
+
+### [Low] [src/dashboard_api/get_my_profile/app.py:20] 6 軸定義が 3 箇所に分散しており drift 検知が弱い
+- 問題: `PROFILE_FIELDS`、backend `_PROFILE_KEYS`、frontend `AXIS_FIELDS` が手動同期です。今回の分離自体は trigger modal の再発バグ領域に触れない判断として妥当ですが、キー追加・名称変更時の検知が型だけでは足りません。
+- 影響: 将来 6 軸に変更が入ったとき、保存はできるが閲覧に出ない、または frontend だけに幽霊フィールドが残る drift が起きます。
+- 推奨修正: 共有 import までは不要です。まずは軽い単体テストで十分です。
+
+```python
+def test_profile_keys_match_trigger_profile_fields():
+    from src.dashboard_api.get_my_profile.app import _PROFILE_KEYS
+    from src.trigger.app import PROFILE_FIELDS
+
+    assert tuple(k for k, *_ in PROFILE_FIELDS) == _PROFILE_KEYS
+```
+
+frontend 側は `AXIS_FIELDS` のキーが `MyProfile` に存在することは TypeScript で担保されていますが、backend との一致までは担保されません。
+
+### [Info] [template.yaml:1217] `/api/v1/profile/me` 固定と IAM は設計意図どおり
+- 問題: なし。
+- 影響: path parameter を持たず、`requestContext.authorizer.lambda.user_sub` のみから user id を導出しているため、他ユーザー閲覧経路を作らない設計に合っています。IAM も `dynamodb:GetItem` + `UserProfilesTable.Arn` 単一で過不足ありません。
+- 推奨修正: 不要です。
+
+### [Info] [src/dashboard_api/get_my_profile/app.py:53] env 不在の KeyError は IaC 信頼で許容
+- 問題: `USER_PROFILES_TABLE` 未設定時は `KeyError` で Lambda 失敗になります。
+- 影響: template.yaml で注入されているため、本番構成上の実害は低いです。既存 dashboard API も `os.environ[...]` 前提のためパターン整合しています。
+- 推奨修正: 不要です。構成ミスを早く落とす挙動として妥当です。
+
+### [Info] [src/dashboard_api/get_my_profile/app.py:56] DynamoDB 例外の広め捕捉は既存 dashboard API と整合
+- 問題: `except Exception` は広いですが、既存 `get_token_monitor_health` なども同系統です。
+- 影響: read-only API の 500 変換としては許容範囲です。profile 内容をログに出していない点も良いです。
+- 推奨修正: 不要です。より厳密にするなら `botocore.exceptions.ClientError` + 想定外再 raise ですが、本 PR で必須ではありません。
+
+### [Info] [frontend/src/api/client.ts:8] 401 redirect は共通 client で処理済み
+- 問題: `MyProfile.tsx` 単体では 401 を一般エラー文言に見せますが、実際は `api/client.ts` が 401 で `/api/v1/auth/login` に遷移します。
+- 影響: B5 の懸念は既存設計で解消されています。
+- 推奨修正: 不要です。
+
+## 総合評価
+- 設計の妥当性: ✅
+- エッジケース網羅: ⚠️
+- アンチパターン回避: ✅
+- テストカバレッジ: ⚠️
+
+## 結論
+- マージ可否: 条件付き可 (High の `learned_preferences` 形状不一致対応後)
