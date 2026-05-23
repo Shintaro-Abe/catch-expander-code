@@ -468,6 +468,8 @@ Slack OAuth アプリの作成手順は `credential-setup.md` 6 を参照。
 ```
 
 > `dynamodb:Query` は F9 履歴コマンド用、`dynamodb:GetItem` / `dynamodb:UpdateItem` は F6 ユーザープロファイル Modal（Slack interactive payload による登録・編集）が `UserProfilesTable` に直接読み書きするために必要。実際の SAM policy は `template.yaml` の `TriggerFunction.Policies` 参照。
+>
+> F6 閲覧 UX 用の `DashboardGetMyProfileFunction`（dashboard API、`GET /api/v1/profile/me`）は別 Lambda として独立し、IAM は `dynamodb:GetItem` のみで `UserProfilesTable.Arn` に限定（UpdateItem は付与しない）。編集 UI を frontend に持たせない設計のため、編集権限を二系統に分散させない。
 
 #### ECSTaskRole
 

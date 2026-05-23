@@ -812,7 +812,7 @@ sequenceDiagram
 > - 保存: 値ありフィールドは SET、空欄フィールドは Item から REMOVE（B 方式・個別フィールドの「削除」を自然に表現）
 > - 既存値: Modal 再表示時に initial_value として注入（編集モード）
 > - F8 で自動累積される `learned_preferences` は本登録経路で上書き / 削除されない（マージ保持）
-> - 閲覧 UX（ダッシュボード可視化 + Slack 専用閲覧コマンド）は別 steering で対応予定
+> - 閲覧 UX はダッシュボード `/profile` で実装済 (`.steering/20260518-frontend-profile-view/`)。`GET /api/v1/profile/me` 経由で 6 軸 + `learned_preferences` を read-only 表示し、編集は本 Modal 経路に一本化（編集 UI を二系統持たない設計）
 
 ```mermaid
 sequenceDiagram
@@ -1060,6 +1060,7 @@ src/agent/feedback/
 | メトリクス | `GET /api/v1/metrics/review-quality?days=` | レビュー合否・未修正コード指摘一覧 |
 | メトリクス | `GET /api/v1/metrics/feedback?period=` | フィードバック受信数・preferences 更新状況 |
 | エラー | `GET /api/v1/errors?days=` | エラーイベント一覧・タイプ別集計 |
+| プロファイル | `GET /api/v1/profile/me` | ログインユーザー自身の 6 軸プロファイル + `learned_preferences`（read-only、F6 閲覧 UX） |
 
 ### データフロー
 
