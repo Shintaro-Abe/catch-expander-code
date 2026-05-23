@@ -28,8 +28,11 @@ _PROFILE_KEYS = (
     "output_preferences",
 )
 
-# Slack user_id は U / W プレフィックス + uppercase alphanumeric。
-# 形状破壊時に「placeholder 表示」で隠れず即 401 で原因特定を早めるためのガード。
+# 現行観測形式の Slack user_id (U / W プレフィックス + 英数字) を許容する防御 regex。
+# Slack 公式は ID 文字集合を固定契約として扱わない方針なので
+# (https://docs.slack.dev/changelog/2016/08/11/user-id-format-changes/)、
+# このパターンは「現在動いているキー形状の早期検証」目的に限定する。
+# 仕様変化時は本ファイルと src/dashboard_api/auth_callback/app.py を両方更新すること。
 _SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
 
 
@@ -39,7 +42,8 @@ def _extract_slack_user_id(user_sub: str | None) -> str | None:
     本番 Slack OIDC は pure user_id 形式 (例: "U0XXXXXXXX") を返すことを
     実機 cookie デコードで確認済 (.steering/20260518-frontend-profile-view/tasklist.md T0-1)。
     将来 "<user_id>-<team_id>" 形式に変わっても壊れないよう split("-")[0] で防御。
-    Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様。
+    現行観測される Slack user_id は U / W プレフィックス + 英数字構成 (hyphen を含まない)。
+    Slack 公式は文字集合を固定契約とせず将来変化の可能性を示唆 (詳細は _SLACK_USER_ID_RE 上のコメント)。
     抽出後に Slack user_id らしさを regex 検証し、形状破壊を 401 で早期 fail させる。
     """
     if not user_sub:

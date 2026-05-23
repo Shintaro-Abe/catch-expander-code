@@ -1775,3 +1775,28 @@ class TestProfileModal:
         assert result["statusCode"] == 200
         # DDB 更新は完了している
         mock_table.update_item.assert_called_once()
+
+
+class TestProfileFieldsStability:
+    """Codex Pass 2 L2 残存対応: dashboard 側 _PROFILE_KEYS との drift を trigger 側でも止める。
+
+    dashboard 側のハードコード比較 (tests/unit/dashboard_api/test_get_my_profile.py::
+    TestGetMyProfile::test_profile_keys_are_stable) と対称になる。
+    両方が同じ tuple を assert することで、片側だけ 6 軸が改名・順序入れ替えされても CI で fail する。
+
+    dashboard test から app (trigger.app) を import しない判断は、boto3 / ECS client の
+    module-level 副作用を dashboard test suite に持ち込まないため (memory:
+    feedback_codex_review_via_audit_dir 配下の Pass 2 監査参照)。
+    """
+
+    def test_profile_fields_keys_are_stable(self):
+        from app import PROFILE_FIELDS
+
+        assert tuple(key for key, *_ in PROFILE_FIELDS) == (
+            "role",
+            "interests",
+            "expertise",
+            "learning_goals",
+            "background",
+            "output_preferences",
+        )

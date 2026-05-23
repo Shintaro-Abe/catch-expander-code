@@ -1,0 +1,2132 @@
+OpenAI Codex v0.125.0 (research preview)
+--------
+workdir: /workspaces/Catch-Expander
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: none
+reasoning summaries: none
+session id: 019e5217-823e-75b0-979f-5d6307c124c1
+--------
+user
+# Codex レビュー依頼 (2 回目): Frontend Profile View 是正
+
+## 役割
+
+あなたは Catch-Expander プロジェクトのシニアレビュアーです。
+**前回 (Pass 1) のレビュー (`.audit/2026-05-19_frontend-profile-view.prompt.md`) で挙がった指摘に対する是正コミット** (`067e53c fix(dashboard): normalize learned_preferences + tighten user_sub validation`) を独立 second-pass でレビューしてください。
+
+`memory/2026-04-29_codex-iterative-review-finds-multilayer-misses.md` の経験則に従い、
+**前 pass の修正で剥がれた次層のミス**がないかを確認してください。
+
+## 前回レビュー結果と対応
+
+### Critical / High — 1 件
+
+- **[High] `learned_preferences` の実保存形式と API / frontend 型が不一致** [`src/dashboard_api/get_my_profile/app.py:64`]
+  - Pass 1 指摘要約: 既存 `feedback_processor.py:199` は `{"text": str, "created_at": str}` の dict 配列で書き込む。本 PR の API は item をそのまま返し、frontend は `string[]` を期待 → 学習履歴 1 件以上で `Objects are not valid as a React child` runtime error 発生 → `/profile` 表示不能
+  - **対応**: `_serialize_learned_preferences(raw) -> list[str]` ヘルパを新規追加し、API 出口で正規化:
+    - dict 要素は `text` フィールドを抽出 (空文字 / whitespace-only / 非 str はスキップ)
+    - 旧 string 要素はそのまま採用
+    - その他型 (int / None / nested list / 非 list raw) は捨てて `[]`
+    - frontend には `string[]` のまま渡る (API contract 維持、frontend 無変更)
+  - テスト fixture を本番形式 `{"text": ..., "created_at": ...}` に更新
+
+### Medium — 0 件
+
+### Low — 2 件
+
+1. **`user_sub` の形式検証がなく仕様 drift を静かに placeholder 化** [`src/dashboard_api/get_my_profile/app.py:31`]
+   - Pass 1 指摘要約: `_extract_slack_user_id()` は空文字以外なら `split("-", 1)[0]` をそのまま採用 → 壊れた sub (`"abc"` 等) でも DDB key 照会して未存在 placeholder を返す → cookie 破損時の原因特定が遅れる
+   - **対応**: `_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")` を追加し、split 後の candidate を `fullmatch` で検証。不一致なら None → 401。新テスト `test_malformed_user_sub_returns_401` (3 ケース: lowercase / 数字始まり / 特殊文字) を追加
+
+2. **6 軸定義が 3 箇所分散で drift 検知が弱い** [`src/dashboard_api/get_my_profile/app.py:20`]
+   - Pass 1 指摘要約: `_PROFILE_KEYS` (backend) / `AXIS_FIELDS` (frontend) / `PROFILE_FIELDS` (`src/trigger/app.py`) が手動同期。Codex 推奨は trigger.app から直接 import するテスト
+   - **対応**: Codex 推奨案ではなく **ハードコード比較案** に変更。`test_profile_keys_are_stable` を新規追加し、`_PROFILE_KEYS == ("role", "interests", ...)` を tuple 比較。trigger 側との同期は trigger テストの責務として境界を保つ (`src.trigger.app` を dashboard test に import すると ECS client 初期化等の副作用が dashboard test suite に侵入するリスクを回避)。意図的な逸脱なので妥当性を再評価してほしい
+
+### Info — 4 件 (全て対応不要、Codex 自身が明示)
+
+- ✅ `/api/v1/profile/me` 固定 + IAM `dynamodb:GetItem` のみは設計意図どおり
+- ✅ env 不在の `KeyError` は IaC 信頼で許容
+- ✅ DynamoDB 例外の `except Exception` 広め捕捉は既存 dashboard API と整合
+- ✅ 401 redirect は `frontend/src/api/client.ts` の interceptor で共通処理済 (B5 懸念は既存設計で解消)
+
+## レビュー対象 (Pass 2)
+
+### 変更 1: `_extract_slack_user_id` に regex 検証追加 (`src/dashboard_api/get_my_profile/app.py:31-50`)
+
+```python
+# Slack user_id は U / W プレフィックス + uppercase alphanumeric。
+# 形状破壊時に「placeholder 表示」で隠れず即 401 で原因特定を早めるためのガード。
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
+
+
+def _extract_slack_user_id(user_sub: str | None) -> str | None:
+    """Slack OIDC sub から Slack user_id を取り出す。
+
+    本番 Slack OIDC は pure user_id 形式 (例: "U0XXXXXXXX") を返すことを
+    実機 cookie デコードで確認済 (.steering/20260518-frontend-profile-view/tasklist.md T0-1)。
+    将来 "<user_id>-<team_id>" 形式に変わっても壊れないよう split("-")[0] で防御。
+    Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様。
+    抽出後に Slack user_id らしさを regex 検証し、形状破壊を 401 で早期 fail させる。
+    """
+    if not user_sub:
+        return None
+    candidate = user_sub.split("-", 1)[0]
+    if not _SLACK_USER_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+```
+
+### 変更 2: `_serialize_learned_preferences` ヘルパ新規追加 (`src/dashboard_api/get_my_profile/app.py:53-74`)
+
+```python
+def _serialize_learned_preferences(raw: object) -> list[str]:
+    """UserProfilesTable の learned_preferences を frontend 用 string[] に正規化する。
+
+    実保存形式は `{"text": str, "created_at": str}` の dict 配列 (feedback_processor.py:199)。
+    将来の互換性のため、文字列要素 / 旧形式 / 想定外型も吸収する:
+    - dict: "text" フィールドを抽出 (空文字や whitespace-only はスキップ)
+    - str: そのまま採用
+    - その他: スキップ
+    """
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for pref in raw:
+        if isinstance(pref, str):
+            text: object = pref
+        elif isinstance(pref, dict):
+            text = pref.get("text")
+        else:
+            continue
+        if isinstance(text, str) and text.strip():
+            result.append(text)
+    return result
+```
+
+### 変更 3: ハンドラ内で正規化ヘルパを呼び出し (`src/dashboard_api/get_my_profile/app.py:97`)
+
+```python
+    item = result.get("Item") or {}
+    body = {
+        "user_id": user_id,
+        **{k: item.get(k) for k in _PROFILE_KEYS},
+        "learned_preferences": _serialize_learned_preferences(item.get("learned_preferences")),
+        "updated_at": item.get("updated_at"),
+    }
+    return json_response(200, {"data": body})
+```
+
+### テスト (前回からの差分のみ)
+
+`tests/unit/dashboard_api/test_get_my_profile.py`:
+
+**既存テスト更新**:
+- `test_returns_full_profile`: fixture を本番形式 `[{"text": str, "created_at": str}]` 配列に変更。期待値は変わらず `["長めのサマリを好む", "コード例を望む"]` (backend で正規化されるため)
+
+**新規追加 3 件**:
+
+1. `test_malformed_user_sub_returns_401` — regex 不一致 3 ケース (lowercase / 数字始まり / 特殊文字)、いずれも 401 + `get_item.assert_not_called`
+
+```python
+def test_malformed_user_sub_returns_401(self):
+    table = MagicMock()
+    # ケース 1: lowercase
+    result = _run(table, _make_event(user_sub="u04jbju88a0"))
+    assert result["statusCode"] == 401
+    # ケース 2: 数字始まり
+    result = _run(table, _make_event(user_sub="0123456789"))  # gitleaks:allow
+    assert result["statusCode"] == 401
+    # ケース 3: 特殊文字含む
+    result = _run(table, _make_event(user_sub="U04*ABC"))
+    assert result["statusCode"] == 401
+    table.get_item.assert_not_called()
+```
+
+2. `test_serialize_learned_preferences_handles_mixed_input` — 6 系統 (dict / str / 混在 / 空 text / 想定外型 / 非 list)
+
+```python
+def test_serialize_learned_preferences_handles_mixed_input(self):
+    from src.dashboard_api.get_my_profile.app import _serialize_learned_preferences
+
+    assert _serialize_learned_preferences(
+        [{"text": "好み A", "created_at": "2026-01-01T00:00:00Z"}]
+    ) == ["好み A"]
+    assert _serialize_learned_preferences(["legacy_pref"]) == ["legacy_pref"]
+    assert _serialize_learned_preferences(
+        [{"text": "A"}, "B", {"text": "C", "created_at": "x"}]
+    ) == ["A", "B", "C"]
+    assert _serialize_learned_preferences(
+        [{"text": ""}, {"text": "   "}, {"text": None}, {}]
+    ) == []
+    assert _serialize_learned_preferences([123, None, ["nested"], "valid"]) == ["valid"]
+    assert _serialize_learned_preferences(None) == []
+    assert _serialize_learned_preferences("not-a-list") == []
+    assert _serialize_learned_preferences({}) == []
+    assert _serialize_learned_preferences(42) == []
+```
+
+3. `test_profile_keys_are_stable` — `_PROFILE_KEYS` の順序・名称をハードコード比較
+
+```python
+def test_profile_keys_are_stable(self):
+    from src.dashboard_api.get_my_profile.app import _PROFILE_KEYS
+
+    assert _PROFILE_KEYS == (
+        "role",
+        "interests",
+        "expertise",
+        "learning_goals",
+        "background",
+        "output_preferences",
+    )
+```
+
+**テスト結果**: 7 件 → 10 件全 pass
+
+```
+$ uv run pytest tests/unit/dashboard_api/test_get_my_profile.py -v
+10 passed in 0.57s
+```
+
+ruff check / format クリーン、gitleaks 検出件数 96 (ベースライン維持)。
+
+### 変更ファイル統計
+
+```
+src/dashboard_api/get_my_profile/app.py         | +37 行 (regex import + RE + 検証分岐 + 新ヘルパ + 呼び出し変更)
+tests/unit/dashboard_api/test_get_my_profile.py | +90 行 / -8 行 (fixture 更新 + 新テスト 3 件 + docstring 更新)
+合計: +127 行 / -8 行
+```
+
+## Pass 2 レビュー観点
+
+### 1. 前回指摘の解消確認
+
+前回 `.audit/2026-05-19_frontend-profile-view.md` で指摘された 3 件 (High 1 + Low 2) が完全に解消されているか:
+
+- **High #1 (learned_preferences 形状不一致)**: 是正実装で `_serialize_learned_preferences` を導入し API 出口で正規化。frontend 型契約 `string[]` を維持。学習履歴あり dict 配列でも React render error にならないか? 旧 string 形式 / dict + str 混在 / 空 text / 想定外型すべて吸収しているか? **特に: `_run_review_loop` パターンの「内部消費者は dict のまま、API 経由は string[]」の境界が正しく機能しているか** (orchestrator.py:1265 は dict 直アクセスを維持)
+- **Low #1 (regex 検証なし)**: `^[UW][A-Z0-9]+$` で防御。pure `U...` / `<U...>-<T...>` どちらも match、malformed は弾く。挙動変更 (placeholder → 401) は意図的だが、本物のユーザーが弾かれる誤検出リスクはないか? regex の `+` 量化子で 1 文字以上を許容している (例: `"U"` 単体も通る) が、これは現実的に問題か?
+- **Low #2 (drift 検知)**: Codex 推奨の **trigger.app import 案を採用せず、ハードコード比較案に変更**。dashboard test の境界保護を理由としたが、これにより trigger 側の `PROFILE_FIELDS` 変更を dashboard test で検知できなくなった。この**意図的逸脱**は妥当か? trigger 側で対称テスト (`PROFILE_FIELDS` の key 部分が `("role", "interests", ...)` であること) を別途追加すべきか?
+
+### 2. 是正により浮上した新規問題
+
+修正コードによって新たに混入した可能性のある問題:
+
+- **a. `_serialize_learned_preferences` の正規化で発生する情報損失**: `created_at` / `replaces_index` 等のメタ情報が API レスポンスから消える。将来 frontend で「いつ学習したか」を表示したくなった場合、API 仕様変更が必要 (現状 `string[]` を期待しているコードは frontend のみで影響範囲は限定的) — この情報損失を許容する設計判断は妥当か?
+- **b. `_SLACK_USER_ID_RE` の規約**: Slack 公式仕様で user_id 文字種は uppercase alphanumeric のみと明記されている前提で書いている。`+` 量化子で 1 文字以上を許容しているため `"U"` 1 文字 sub でも通過する。本来は最低 7-9 文字程度の長さ制約を入れるべきか? あるいは `+` で十分か?
+- **c. `_serialize_learned_preferences` で whitespace-only text をスキップする挙動**: feedback_processor.py:194 が `text = pref.get("text", "").strip()` で empty 排除済だが、過去データに strip 前の whitespace-only が残っているリスク。スキップ判定 (`text.strip()`) は API としての見え方を変えるが、これは妥当か?
+- **d. error_response の context**: regex 失敗時も既存の "Missing or invalid user_sub" メッセージを再利用 (specific code を新設していない)。debug 時に「regex 不一致」と「sub 欠落」を区別できないが、CloudWatch Logs で request_id を辿れば判別可能。これは許容範囲か?
+
+### 3. 前パスで見落としていた次層
+
+前 pass では Info 扱い or 指摘なしだった次層:
+
+- **e. `_serialize_learned_preferences` の同型バグ**: 6 軸 (`role` / `interests` 等) 本体も「string 期待だが実は dict や他型が混入」リスクはないか? `feedback_processor.py` を読む限り 6 軸自体は Slack Modal が string でしか書き込まないが、Modal 経由でない書き込みパス (移行スクリプト等) で型契約が破れる可能性は? `**{k: item.get(k) for k in _PROFILE_KEYS}` で何でもそのまま返している現状は H1 と対称的な脆弱性か?
+- **f. テストカバレッジの非対称**: `test_serialize_learned_preferences_handles_mixed_input` は手厚いが、`test_extract_slack_user_id` を分離した unit test がない (lambda_handler 経由でしかテストしていない)。分離テストを追加すべきか?
+- **g. `test_returns_full_profile` の fixture 変更**: 既存テスト 1 件で fixture 型変更を行った。これは「以前は string 配列を返していた挙動が事実上の bug だった」ことを暗黙に認める変更。テスト変更が事実認定として明示的か? (テスト追加した方が安全だったか?)
+- **h. ハードコード比較案の見落とし**: trigger.app 側に対称テストを追加していない。`tests/unit/trigger/test_app.py` (存在するなら) に `PROFILE_FIELDS` の key 部分を ハードコード比較する対称テストを追加するのが完全な drift 検知になる。Pass 2 で追加すべきか後続 PR で良いか?
+- **i. ECS client 初期化リスクの再考**: 「dashboard test に trigger.app を import すると ECS client が初期化される」を回避理由とした。だが現状でも他経路 (例: 統合テスト) で import される可能性。「テスト隔離違反」の判断基準は妥当か? それとも案 C (ハードコード比較) は過剰な防御で、Codex 推奨案 (trigger.app 直 import) でも問題なかったか?
+
+## 出力フォーマット
+
+```markdown
+# Codex Review Pass 2 — 2026-05-19 frontend-profile-view
+
+## サマリ
+- Critical: N / High: N / Medium: N / Low: N / Info: N
+- 前回指摘の解消確認: ✅ N/3 解消、⚠️ N/3 部分、❌ N/3 残存
+- 多層ミス検出: N 件
+- 総合所感 (5 行以内)
+
+## 指摘事項 (新規発生分 + 残存分)
+
+### [severity] [path:line] 短いタイトル
+- 区分: 新規 / 残存 / リグレッション
+- 問題: ...
+- 影響: ...
+- 推奨修正: ...
+
+(severity 順、severity は Critical / High / Medium / Low / Info)
+
+## 前回指摘の解消状況
+- High #1 (learned_preferences): 解消 ✅ / 部分解消 ⚠️ / 未解消 ❌ / リグレッション 🔴
+- Low #1 (user_sub regex): 解消 ✅ / ...
+- Low #2 (drift 検知 案 C 採用): 解消 ✅ / 妥当 / ⚠️ Codex 推奨と異なる判断の妥当性評価
+
+## 結論
+- 収束判定: 収束 (新規 Critical/High ゼロ) / Pass 3 要 (新規指摘あり) / 不可
+- マージ可否: 可 / 条件付き可 (指摘対応後) / 不可
+```
+
+注意:
+- 前回 Info 扱いだった項目で今回も未着手のものは、別 issue としてスコープ外扱いで OK (再指摘可)
+- 「対応が完全 / 不要修正なし」も明示してほしい
+- 公式仕様への引用があれば URL 付きで (例: Slack OIDC user_id 文字種仕様)
+- 推奨修正は具体的なコードスニペットで示してほしい
+- **Codex 推奨案 (trigger.app 直 import) からの逸脱 (ハードコード比較案採用) の妥当性を明示的に評価してほしい**
+codex
+レビュー対象の実コードと周辺の書き込み経路を確認します。あわせて Slack user ID 形式については、引用できる一次情報があるか確認します。
+exec
+/bin/bash -lc "sed -n '1,180p' src/dashboard_api/get_my_profile/app.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+"""F6 User Profile 閲覧用 Lambda。
+
+JWT 由来の user_sub から Slack user_id を導出し、UserProfilesTable から
+本人プロファイル (6 軸 + learned_preferences) を read-only で取得する。
+
+設計: .steering/20260518-frontend-profile-view/design.md
+"""
+
+import logging
+import os
+import re
+
+import boto3
+from _common import error_response, json_response
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+_dynamodb = boto3.resource("dynamodb")
+
+# 5W1H 6 軸キー (src/trigger/app.py:PROFILE_FIELDS と整合)
+_PROFILE_KEYS = (
+    "role",
+    "interests",
+    "expertise",
+    "learning_goals",
+    "background",
+    "output_preferences",
+)
+
+# Slack user_id は U / W プレフィックス + uppercase alphanumeric。
+# 形状破壊時に「placeholder 表示」で隠れず即 401 で原因特定を早めるためのガード。
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
+
+
+def _extract_slack_user_id(user_sub: str | None) -> str | None:
+    """Slack OIDC sub から Slack user_id を取り出す。
+
+    本番 Slack OIDC は pure user_id 形式 (例: "U0XXXXXXXX") を返すことを
+    実機 cookie デコードで確認済 (.steering/20260518-frontend-profile-view/tasklist.md T0-1)。
+    将来 "<user_id>-<team_id>" 形式に変わっても壊れないよう split("-")[0] で防御。
+    Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様。
+    抽出後に Slack user_id らしさを regex 検証し、形状破壊を 401 で早期 fail させる。
+    """
+    if not user_sub:
+        return None
+    candidate = user_sub.split("-", 1)[0]
+    if not _SLACK_USER_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _serialize_learned_preferences(raw: object) -> list[str]:
+    """UserProfilesTable の learned_preferences を frontend 用 string[] に正規化する。
+
+    実保存形式は `{"text": str, "created_at": str}` の dict 配列 (feedback_processor.py:199)。
+    将来の互換性のため、文字列要素 / 旧形式 / 想定外型も吸収する:
+    - dict: "text" フィールドを抽出 (空文字や whitespace-only はスキップ)
+    - str: そのまま採用
+    - その他: スキップ
+    """
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for pref in raw:
+        if isinstance(pref, str):
+            text: object = pref
+        elif isinstance(pref, dict):
+            text = pref.get("text")
+        else:
+            continue
+        if isinstance(text, str) and text.strip():
+            result.append(text)
+    return result
+
+
+def lambda_handler(event: dict, context: object) -> dict:
+    request_id = getattr(context, "aws_request_id", "")
+
+    auth_ctx = event.get("requestContext", {}).get("authorizer", {}).get("lambda", {})
+    user_sub = auth_ctx.get("user_sub")
+    user_id = _extract_slack_user_id(user_sub)
+    if not user_id:
+        return error_response(401, "UNAUTHORIZED", "Missing or invalid user_sub", request_id)
+
+    table = _dynamodb.Table(os.environ["USER_PROFILES_TABLE"])
+    try:
+        result = table.get_item(Key={"user_id": user_id})
+    except Exception as e:  # noqa: BLE001
+        logger.error("DDB get_item failed for request %s: %s", request_id, type(e).__name__)
+        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+
+    item = result.get("Item") or {}
+    body = {
+        "user_id": user_id,
+        **{k: item.get(k) for k in _PROFILE_KEYS},
+        "learned_preferences": _serialize_learned_preferences(item.get("learned_preferences")),
+        "updated_at": item.get("updated_at"),
+    }
+    return json_response(200, {"data": body})
+
+exec
+/bin/bash -lc "sed -n '1,260p' tests/unit/dashboard_api/test_get_my_profile.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+"""DashboardGetMyProfileFunction 単体テスト。
+
+design.md §5.1 の 6 ケース + Codex Pass 1 是正で追加した 4 ケース:
+1. 正常: 全フィールド設定済み (dict 配列の learned_preferences を string[] へ正規化)
+2. 正常: レコード未存在 (新規ユーザー)
+3. 正常: 一部フィールド REMOVE 済み
+4. 正常: sub 形式が <user>-<team> (防御的 split + regex 検証)
+5. 異常: user_sub 欠落 → 401
+6. 異常: sub が空文字 → 401
+7. 異常: sub が Slack user_id 形式に合わない → 401 (Codex L1)
+8. 異常: DDB raise → 500
+9. ヘルパ: _serialize_learned_preferences の混在入力吸収 (Codex H1)
+10. drift: _PROFILE_KEYS の順序・名称が固定されている (Codex L2)
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+_USER_SUB = "U04JBJU88A0"
+
+
+def _make_event(user_sub: str | None = _USER_SUB) -> dict:
+    """authorizer 経由の HttpApi event を模擬する。"""
+    auth_lambda: dict = {}
+    if user_sub is not None:
+        auth_lambda["user_sub"] = user_sub
+    return {
+        "requestContext": {
+            "authorizer": {"lambda": auth_lambda},
+        },
+    }
+
+
+def _run(table_mock: MagicMock, event: dict) -> dict:
+    resource = MagicMock()
+    resource.Table.return_value = table_mock
+    with patch("src.dashboard_api.get_my_profile.app._dynamodb", resource):
+        from src.dashboard_api.get_my_profile.app import lambda_handler
+
+        return lambda_handler(event, None)
+
+
+class TestGetMyProfile:
+    @pytest.fixture(autouse=True)
+    def set_env(self, monkeypatch):
+        monkeypatch.setenv("USER_PROFILES_TABLE", "test-user-profiles")
+
+    # ------------------------------------------------------------------
+    # 正常系
+    # ------------------------------------------------------------------
+
+    def test_returns_full_profile(self):
+        item = {
+            "user_id": _USER_SUB,
+            "role": "クラウドエンジニア",
+            "interests": "AI / 料理",
+            "expertise": "Python / SQL",
+            "learning_goals": "副業案件獲得",
+            "background": "30代後半 / 子育て中",
+            "output_preferences": "箇条書き重視",
+            # 本番形式: feedback_processor.py:199 が書き込む {"text": str, "created_at": str} dict
+            "learned_preferences": [
+                {"text": "長めのサマリを好む", "created_at": "2026-05-10T00:00:00.000Z"},
+                {"text": "コード例を望む", "created_at": "2026-05-12T00:00:00.000Z"},
+            ],
+            "updated_at": "2026-05-18T10:00:00.000Z",
+        }
+        table = MagicMock()
+        table.get_item.return_value = {"Item": item}
+
+        result = _run(table, _make_event())
+
+        assert result["statusCode"] == 200
+        body = json.loads(result["body"])["data"]
+        assert body["user_id"] == _USER_SUB
+        assert body["role"] == "クラウドエンジニア"
+        assert body["background"] == "30代後半 / 子育て中"
+        # backend が dict 配列を string[] に正規化する (H1 対応)
+        assert body["learned_preferences"] == ["長めのサマリを好む", "コード例を望む"]
+        assert body["updated_at"] == "2026-05-18T10:00:00.000Z"
+        # GetItem は本人 PK のみで呼ばれる
+        table.get_item.assert_called_once_with(Key={"user_id": _USER_SUB})
+
+    def test_returns_placeholder_when_record_missing(self):
+        table = MagicMock()
+        table.get_item.return_value = {}  # 新規ユーザー
+
+        result = _run(table, _make_event())
+
+        assert result["statusCode"] == 200
+        body = json.loads(result["body"])["data"]
+        assert body["user_id"] == _USER_SUB
+        # 6 軸全部 null、learned_preferences は空配列、updated_at は null
+        for key in (
+            "role",
+            "interests",
+            "expertise",
+            "learning_goals",
+            "background",
+            "output_preferences",
+        ):
+            assert body[key] is None, f"{key} should be None"
+        assert body["learned_preferences"] == []
+        assert body["updated_at"] is None
+
+    def test_partial_fields_missing(self):
+        """Slack Modal で空欄保存された軸は DDB から REMOVE され、GetItem 後に該当キーが存在しない。"""
+        item = {
+            "user_id": _USER_SUB,
+            "role": "エンジニア",
+            # interests / expertise / learning_goals / output_preferences は REMOVE 済み
+            "background": "リモートワーカー",
+            "updated_at": "2026-05-18T11:00:00.000Z",
+        }
+        table = MagicMock()
+        table.get_item.return_value = {"Item": item}
+
+        result = _run(table, _make_event())
+
+        assert result["statusCode"] == 200
+        body = json.loads(result["body"])["data"]
+        assert body["role"] == "エンジニア"
+        assert body["background"] == "リモートワーカー"
+        assert body["interests"] is None
+        assert body["expertise"] is None
+        assert body["learning_goals"] is None
+        assert body["output_preferences"] is None
+        assert body["learned_preferences"] == []
+
+    def test_strips_team_suffix_from_sub_defensive(self):
+        """将来 Slack OIDC が "<user_id>-<team_id>" 形式を返した場合の防御挙動。"""
+        table = MagicMock()
+        table.get_item.return_value = {"Item": {"user_id": "U04JBJU88A0", "role": "Eng"}}
+
+        result = _run(table, _make_event(user_sub="U04JBJU88A0-T0123456789"))  # gitleaks:allow
+
+        assert result["statusCode"] == 200
+        body = json.loads(result["body"])["data"]
+        assert body["user_id"] == "U04JBJU88A0"
+        # GetItem は "-" 抽出後の pure user_id で呼ばれる
+        table.get_item.assert_called_once_with(Key={"user_id": "U04JBJU88A0"})
+
+    # ------------------------------------------------------------------
+    # 異常系
+    # ------------------------------------------------------------------
+
+    def test_missing_user_sub_returns_401(self):
+        table = MagicMock()
+        result = _run(table, _make_event(user_sub=None))
+
+        assert result["statusCode"] == 401
+        body = json.loads(result["body"])
+        assert body["error"]["code"] == "UNAUTHORIZED"
+        table.get_item.assert_not_called()
+
+    def test_empty_user_sub_returns_401(self):
+        table = MagicMock()
+        result = _run(table, _make_event(user_sub=""))
+
+        assert result["statusCode"] == 401
+        body = json.loads(result["body"])
+        assert body["error"]["code"] == "UNAUTHORIZED"
+        table.get_item.assert_not_called()
+
+    def test_malformed_user_sub_returns_401(self):
+        """Codex L1: sub が Slack user_id 形式 (^[UW][A-Z0-9]+$) に合わなければ早期 401。
+
+        従来は黙って placeholder 表示になり、cookie 破損時の原因特定が遅れていた。
+        regex 追加で形状破壊を即 fail させる。
+        """
+        table = MagicMock()
+        # ケース 1: lowercase
+        result = _run(table, _make_event(user_sub="u04jbju88a0"))
+        assert result["statusCode"] == 401
+        # ケース 2: 数字始まり
+        result = _run(table, _make_event(user_sub="0123456789"))  # gitleaks:allow
+        assert result["statusCode"] == 401
+        # ケース 3: 特殊文字含む
+        result = _run(table, _make_event(user_sub="U04*ABC"))
+        assert result["statusCode"] == 401
+        # GetItem は 3 回とも呼ばれていない (regex 段階で fail)
+        table.get_item.assert_not_called()
+
+    def test_ddb_failure_returns_500(self):
+        table = MagicMock()
+        table.get_item.side_effect = RuntimeError("simulated DDB outage")
+
+        result = _run(table, _make_event())
+
+        assert result["statusCode"] == 500
+        body = json.loads(result["body"])
+        assert body["error"]["code"] == "INTERNAL_ERROR"
+
+    # ------------------------------------------------------------------
+    # ヘルパ単体テスト (Codex H1: dict / str / 想定外型の吸収)
+    # ------------------------------------------------------------------
+
+    def test_serialize_learned_preferences_handles_mixed_input(self):
+        from src.dashboard_api.get_my_profile.app import _serialize_learned_preferences
+
+        # 本番形式 (dict with text + created_at)
+        assert _serialize_learned_preferences([{"text": "好み A", "created_at": "2026-01-01T00:00:00Z"}]) == ["好み A"]
+
+        # 旧データ互換 (素の文字列)
+        assert _serialize_learned_preferences(["legacy_pref"]) == ["legacy_pref"]
+
+        # 混在
+        assert _serialize_learned_preferences([{"text": "A"}, "B", {"text": "C", "created_at": "x"}]) == ["A", "B", "C"]
+
+        # 空文字 / whitespace-only / None text はスキップ
+        assert _serialize_learned_preferences([{"text": ""}, {"text": "   "}, {"text": None}, {}]) == []
+
+        # 想定外型 (int / None / list of list 等) はスキップ
+        assert _serialize_learned_preferences([123, None, ["nested"], "valid"]) == ["valid"]
+
+        # 非 list は空配列
+        assert _serialize_learned_preferences(None) == []
+        assert _serialize_learned_preferences("not-a-list") == []
+        assert _serialize_learned_preferences({}) == []
+        assert _serialize_learned_preferences(42) == []
+
+    # ------------------------------------------------------------------
+    # drift 検知 (Codex L2: _PROFILE_KEYS の意図せぬ改変を防ぐ)
+    # ------------------------------------------------------------------
+
+    def test_profile_keys_are_stable(self):
+        """6 軸キーの順序・名称が固定されていることを検証する。
+
+        変更時は **src/trigger/app.py:PROFILE_FIELDS も同期更新すること**。
+        本テストは dashboard_api 側の意図せぬ改変 (リファクタ事故 / typo / 順序入れ替え) を
+        検知する。trigger 側との同期は trigger テストの責務。
+        """
+        from src.dashboard_api.get_my_profile.app import _PROFILE_KEYS
+
+        assert _PROFILE_KEYS == (
+            "role",
+            "interests",
+            "expertise",
+            "learning_goals",
+            "background",
+            "output_preferences",
+        )
+
+exec
+/bin/bash -lc 'git status --short && git show --stat --oneline --decorate --no-renames 067e53c' in /workspaces/Catch-Expander
+exec
+/bin/bash -lc "rg -n \"learned_preferences|PROFILE_FIELDS|_PROFILE_KEYS|AXIS_FIELDS|user_sub|sub\" src tests -g '"'!node_modules'"'" in /workspaces/Catch-Expander
+ succeeded in 240ms:
+src/agent/orchestrator.py:7:import subprocess
+src/agent/orchestrator.py:456:    # T1-2b (Codex 2 回目 P2 対応): claude CLI は subprocess なので HTTP status を取得できない。
+src/agent/orchestrator.py:457:    # exit code 0 = success、非 0 = failure として扱い、subtype="anthropic" で emit する。
+src/agent/orchestrator.py:465:        last_error: subprocess.CalledProcessError | None = None
+src/agent/orchestrator.py:468:                result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
+src/agent/orchestrator.py:473:            except subprocess.CalledProcessError as e:
+src/agent/orchestrator.py:482:                        subtype="anthropic_429",
+src/agent/orchestrator.py:506:                result = subprocess.run(advisor_cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
+src/agent/orchestrator.py:511:            except subprocess.CalledProcessError:
+src/agent/orchestrator.py:523:            subtype="anthropic",
+src/agent/orchestrator.py:777:        last_error: subprocess.CalledProcessError | None = None
+src/agent/orchestrator.py:781:                result = subprocess.run(  # noqa: S603
+src/agent/orchestrator.py:794:            except subprocess.CalledProcessError as e:
+src/agent/orchestrator.py:801:                        subtype="anthropic_429",
+src/agent/orchestrator.py:827:                    result = subprocess.run(  # noqa: S603
+src/agent/orchestrator.py:839:                except subprocess.CalledProcessError:
+src/agent/orchestrator.py:856:            subtype="anthropic",
+src/agent/orchestrator.py:926:        last_error: subprocess.CalledProcessError | None = None
+src/agent/orchestrator.py:930:                result = subprocess.run(  # noqa: S603
+src/agent/orchestrator.py:943:            except subprocess.CalledProcessError as e:
+src/agent/orchestrator.py:950:                        subtype="anthropic_429",
+src/agent/orchestrator.py:975:                    result = subprocess.run(  # noqa: S603
+src/agent/orchestrator.py:987:                except subprocess.CalledProcessError:
+src/agent/orchestrator.py:1047:            subtype="anthropic",
+src/agent/orchestrator.py:1059:class CodexInvocationError(subprocess.CalledProcessError):
+src/agent/orchestrator.py:1062:    subprocess.CalledProcessError を継承するため
+src/agent/orchestrator.py:1102:        last_error: subprocess.CalledProcessError | None = None
+src/agent/orchestrator.py:1105:                subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
+src/agent/orchestrator.py:1109:            except subprocess.CalledProcessError as e:
+src/agent/orchestrator.py:1134:            subtype="openai",
+src/agent/orchestrator.py:1263:            learned_prefs = profile.get("learned_preferences", [])
+src/agent/orchestrator.py:1323:            # ワークフロー設計完了 (T1-2 観測ポイント): planned_subagents は本実装の固定構成。
+src/agent/orchestrator.py:1333:                    "planned_subagents": ["researcher", "generator", "reviewer"],
+src/agent/orchestrator.py:1364:                "subagent_started",
+src/agent/orchestrator.py:1365:                {"subagent": "researcher", "input_summary": f"{len(research_steps)} research steps"},
+src/agent/orchestrator.py:1373:                    "subagent_failed",
+src/agent/orchestrator.py:1375:                        "subagent": "researcher",
+src/agent/orchestrator.py:1388:                "subagent_completed",
+src/agent/orchestrator.py:1390:                    "subagent": "researcher",
+src/agent/orchestrator.py:1427:            generator_subagent_name = "generator_text" if workspace_text_gen else "generator"
+src/agent/orchestrator.py:1429:                "subagent_started",
+src/agent/orchestrator.py:1430:                {"subagent": generator_subagent_name, "input_summary": f"category={category}"},
+src/agent/orchestrator.py:1447:                        "subagent_failed",
+src/agent/orchestrator.py:1449:                            "subagent": "generator",
+src/agent/orchestrator.py:1479:                    # CalledProcessError 等を捕捉し、subagent_failed をペアで emit してから再 raise する
+src/agent/orchestrator.py:1480:                    # (既存挙動 = 上位 try でも捕捉されるが、subagent_started/failed 対応を維持するため明示)。
+src/agent/orchestrator.py:1495:                            "subagent_failed",
+src/agent/orchestrator.py:1497:                                "subagent": "generator",
+src/agent/orchestrator.py:1555:            # 2026-05-13: subagent_started/failed と整合させる (Codex 1 回目 P2-1 対応)。
+src/agent/orchestrator.py:1558:                "subagent_completed",
+src/agent/orchestrator.py:1560:                    "subagent": generator_subagent_name,
+src/agent/orchestrator.py:1578:            self._emitter.emit("subagent_started", {"subagent": "reviewer"})
+src/agent/orchestrator.py:1591:                    "subagent_failed",
+src/agent/orchestrator.py:1593:                        "subagent": "reviewer",
+src/agent/orchestrator.py:1604:                "subagent_completed",
+src/agent/orchestrator.py:1606:                    "subagent": "reviewer",
+src/agent/orchestrator.py:1788:            futures = {executor.submit(_execute_research, step): step for step in steps}
+src/agent/orchestrator.py:1842:                ``subagent_failed`` event 経由で dashboard / Slack 失敗通知に流れる。
+src/agent/orchestrator.py:1913:            "subagent_failed",
+src/agent/orchestrator.py:1915:                "subagent": "generator_text",
+src/trigger/app.py:34:PROFILE_FIELDS: list[tuple[str, str, str, bool]] = [
+src/trigger/app.py:223:    learned_preferences など他キーは UpdateExpression に含めないため自動的に保持される。
+src/trigger/app.py:309:    for key, label, placeholder, multiline in PROFILE_FIELDS:
+src/trigger/app.py:328:        "callback_id": "profile_submit",
+src/trigger/app.py:330:        "submit": {"type": "plain_text", "text": "保存"},
+src/trigger/app.py:344:    label_map = {k: lbl for k, lbl, _, _ in PROFILE_FIELDS}
+src/trigger/app.py:389:def _handle_view_submission(payload: dict, slack_token: str) -> dict:
+src/trigger/app.py:390:    """view_submission ペイロードを処理。profile_submit callback のみハンドル。"""
+src/trigger/app.py:392:    if not isinstance(view, dict) or view.get("callback_id") != "profile_submit":
+src/trigger/app.py:414:    for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
+src/trigger/app.py:417:            continue  # Modal block 自体が無い → no-op (フィールド追加直後の古い submit を防御)
+src/trigger/app.py:421:        # Slack 仕様: optional な plain_text_input を空欄で submit すると
+src/trigger/app.py:423:        # block / action が存在する以上ユーザーが Modal を submit した明示的意図なので、
+src/trigger/app.py:473:    if payload_type == "view_submission":
+src/trigger/app.py:474:        return _handle_view_submission(payload, slack_token)
+src/trigger/app.py:532:    event_subtype = event_data.get("subtype")
+src/trigger/app.py:536:    elif event_type == "message" and event_data.get("channel_type") == "im" and event_subtype is None:
+src/trigger/app.py:537:        pass  # DM（ボット自身のメッセージやsubtypeありを除外）
+src/trigger/app.py:605:                            "subnets": [
+src/trigger/app.py:676:                "subnets": [
+src/agent/main.py:4:import subprocess
+src/agent/main.py:192:    elif isinstance(exc, subprocess.CalledProcessError):
+src/observability/prompt_recorder.py:14:- S3 キー形式: prompts/{execution_id}/{subagent}_{index}.json
+src/observability/prompt_recorder.py:44:        subagent: str,
+src/observability/prompt_recorder.py:54:            subagent: サブエージェント種別。
+src/observability/prompt_recorder.py:75:        key = f"prompts/{self.execution_id}/{subagent}_{index}.json"
+src/observability/prompt_recorder.py:77:            "subagent": subagent,
+src/observability/prompt_recorder.py:97:                subagent,
+src/agent/notify/slack_client.py:66:                            subtype="slack_rate_limit",
+src/agent/notify/slack_client.py:83:                subtype="slack",
+tests/unit/observability/test_prompt_recorder.py:44:        assert body["subagent"] == "generator"
+tests/unit/observability/test_prompt_recorder.py:51:    def test_record_key_format_for_all_subagent_types(self, mock_boto3, monkeypatch):
+tests/unit/observability/test_prompt_recorder.py:65:        for subagent, index, expected_key in cases:
+tests/unit/observability/test_prompt_recorder.py:67:            recorder.record(subagent, index, "p", "o")
+tests/unit/observability/test_prompt_recorder.py:69:            assert actual_key == expected_key, f"{subagent}: expected {expected_key}, got {actual_key}"
+tests/unit/observability/test_prompt_recorder.py:112:        assert body["subagent"] == "generator_text"
+src/agent/feedback/feedback_processor.py:51:            existing_prefs: list[dict] = profile.get("learned_preferences", [])
+src/agent/feedback/feedback_processor.py:72:            # 5. プロファイル更新（learned_preferences と updated_at のみ）
+src/agent/feedback/feedback_processor.py:74:            profile["learned_preferences"] = merged
+src/agent/feedback/feedback_processor.py:89:            # emoji_reaction subtype は将来拡張のため、現状は mention_reply 固定。
+src/agent/feedback/feedback_processor.py:103:                        "subtype": "mention_reply",
+src/agent/feedback/feedback_processor.py:106:                        "learned_preferences_updated": bool(new_preferences),
+src/agent/storage/notion_client.py:175:                                subtype="cloudflare_block",
+src/agent/storage/notion_client.py:191:                                subtype="notion_429",
+src/agent/storage/notion_client.py:223:                subtype="notion",
+tests/unit/trigger/test_app.py:16:    monkeypatch.setenv("ECS_SUBNET_1", "subnet-111")
+tests/unit/trigger/test_app.py:17:    monkeypatch.setenv("ECS_SUBNET_2", "subnet-222")
+tests/unit/trigger/test_app.py:142:    def test_message_with_subtype_ignored(self, mock_secrets):
+tests/unit/trigger/test_app.py:143:        """subtypeありのmessageイベントは無視する"""
+tests/unit/trigger/test_app.py:153:                "subtype": "bot_message",
+tests/unit/trigger/test_app.py:1382:        assert view["callback_id"] == "profile_submit"
+tests/unit/trigger/test_app.py:1425:    def test_view_submission_writes_set_and_remove(
+tests/unit/trigger/test_app.py:1445:            "type": "view_submission",
+tests/unit/trigger/test_app.py:1448:                "callback_id": "profile_submit",
+tests/unit/trigger/test_app.py:1476:    def test_view_submission_does_not_touch_learned_preferences(
+tests/unit/trigger/test_app.py:1479:        """UpdateExpression に learned_preferences が一切登場しない (B 方式・AC-3)。"""
+tests/unit/trigger/test_app.py:1491:            "type": "view_submission",
+tests/unit/trigger/test_app.py:1494:                "callback_id": "profile_submit",
+tests/unit/trigger/test_app.py:1502:        assert "learned_preferences" not in str(kw)
+tests/unit/trigger/test_app.py:1507:    def test_view_submission_returns_errors_for_long_fields(
+tests/unit/trigger/test_app.py:1510:        """501 文字以上を含む submit に response_action:errors が返り、update_item は呼ばれない。"""
+tests/unit/trigger/test_app.py:1527:            "type": "view_submission",
+tests/unit/trigger/test_app.py:1530:                "callback_id": "profile_submit",
+tests/unit/trigger/test_app.py:1591:    def test_view_submission_skips_missing_blocks(
+tests/unit/trigger/test_app.py:1594:        """PROFILE_FIELDS の block が完全に欠落 → 何も更新せず 200 を返す (no-op)。"""
+tests/unit/trigger/test_app.py:1602:            "type": "view_submission",
+tests/unit/trigger/test_app.py:1605:                "callback_id": "profile_submit",
+tests/unit/trigger/test_app.py:1617:    def test_view_submission_uses_ephemeral_for_save_confirmation(
+tests/unit/trigger/test_app.py:1638:            "type": "view_submission",
+tests/unit/trigger/test_app.py:1641:                "callback_id": "profile_submit",
+tests/unit/trigger/test_app.py:1683:    def test_view_submission_removes_field_when_slack_sends_value_null(
+tests/unit/trigger/test_app.py:1708:            "type": "view_submission",
+tests/unit/trigger/test_app.py:1711:                "callback_id": "profile_submit",
+tests/unit/trigger/test_app.py:1737:    def test_view_submission_succeeds_even_when_ephemeral_post_fails(
+tests/unit/trigger/test_app.py:1764:            "type": "view_submission",
+tests/unit/trigger/test_app.py:1767:                "callback_id": "profile_submit",
+src/agent/storage/github_client.py:66:                            subtype="github_429",
+src/agent/storage/github_client.py:84:                subtype="github",
+src/agent/storage/github_client.py:121:                    subtype="github_429",
+src/agent/storage/github_client.py:132:                subtype="github",
+tests/unit/observability/test_event_emitter.py:48:            {"topic_category": "技術", "planned_subagents": ["researcher"]},
+tests/unit/observability/test_event_emitter.py:208:            subtype="notion",
+tests/unit/observability/test_event_emitter.py:222:            subtype="github",
+tests/unit/observability/test_event_emitter.py:233:            "subtype": "github",
+tests/unit/observability/test_event_emitter.py:245:            subtype="slack_rate_limit",
+tests/unit/observability/test_event_emitter.py:256:            subtype="cloudflare_block",
+tests/unit/observability/test_event_emitter.py:265:        assert payload["subtype"] == "cloudflare_block"
+tests/unit/observability/test_event_emitter.py:277:            subtype="anthropic_429",
+src/observability/event_emitter.py:13:        "planned_subagents": ["researcher", "generator", "reviewer"],
+src/observability/event_emitter.py:126:    subtype: str,
+src/observability/event_emitter.py:140:        subtype: "notion" / "github" / "slack" / "anthropic" 等の API 種別。
+src/observability/event_emitter.py:152:        "subtype": subtype,
+src/observability/event_emitter.py:170:    subtype: str,
+src/observability/event_emitter.py:179:        subtype: "anthropic_429" / "slack_rate_limit" / "github_429" /
+src/observability/event_emitter.py:188:        "subtype": subtype,
+tests/unit/agent/test_slack_client.py:143:        assert payload["subtype"] == "slack"
+tests/unit/agent/test_slack_client.py:163:        assert emitted["rate_limit_hit"]["subtype"] == "slack_rate_limit"
+tests/unit/agent/test_github_client.py:116:        assert api_payload["subtype"] == "github"
+tests/unit/agent/test_github_client.py:137:        assert emitted["rate_limit_hit"]["subtype"] == "github_429"
+tests/unit/agent/test_github_client.py:159:        # 全て github subtype
+tests/unit/agent/test_github_client.py:160:        assert all(e["subtype"] == "github" for e in api_events)
+tests/unit/agent/test_github_client.py:185:        assert rate_limit_events[0]["subtype"] == "github_429"
+tests/unit/dashboard_api/test_get_my_profile.py:4:1. 正常: 全フィールド設定済み (dict 配列の learned_preferences を string[] へ正規化)
+tests/unit/dashboard_api/test_get_my_profile.py:7:4. 正常: sub 形式が <user>-<team> (防御的 split + regex 検証)
+tests/unit/dashboard_api/test_get_my_profile.py:8:5. 異常: user_sub 欠落 → 401
+tests/unit/dashboard_api/test_get_my_profile.py:9:6. 異常: sub が空文字 → 401
+tests/unit/dashboard_api/test_get_my_profile.py:10:7. 異常: sub が Slack user_id 形式に合わない → 401 (Codex L1)
+tests/unit/dashboard_api/test_get_my_profile.py:12:9. ヘルパ: _serialize_learned_preferences の混在入力吸収 (Codex H1)
+tests/unit/dashboard_api/test_get_my_profile.py:13:10. drift: _PROFILE_KEYS の順序・名称が固定されている (Codex L2)
+tests/unit/dashboard_api/test_get_my_profile.py:26:def _make_event(user_sub: str | None = _USER_SUB) -> dict:
+tests/unit/dashboard_api/test_get_my_profile.py:29:    if user_sub is not None:
+tests/unit/dashboard_api/test_get_my_profile.py:30:        auth_lambda["user_sub"] = user_sub
+tests/unit/dashboard_api/test_get_my_profile.py:66:            "learned_preferences": [
+tests/unit/dashboard_api/test_get_my_profile.py:83:        assert body["learned_preferences"] == ["長めのサマリを好む", "コード例を望む"]
+tests/unit/dashboard_api/test_get_my_profile.py:97:        # 6 軸全部 null、learned_preferences は空配列、updated_at は null
+tests/unit/dashboard_api/test_get_my_profile.py:107:        assert body["learned_preferences"] == []
+tests/unit/dashboard_api/test_get_my_profile.py:132:        assert body["learned_preferences"] == []
+tests/unit/dashboard_api/test_get_my_profile.py:134:    def test_strips_team_suffix_from_sub_defensive(self):
+tests/unit/dashboard_api/test_get_my_profile.py:139:        result = _run(table, _make_event(user_sub="U04JBJU88A0-T0123456789"))  # gitleaks:allow
+tests/unit/dashboard_api/test_get_my_profile.py:151:    def test_missing_user_sub_returns_401(self):
+tests/unit/dashboard_api/test_get_my_profile.py:153:        result = _run(table, _make_event(user_sub=None))
+tests/unit/dashboard_api/test_get_my_profile.py:160:    def test_empty_user_sub_returns_401(self):
+tests/unit/dashboard_api/test_get_my_profile.py:162:        result = _run(table, _make_event(user_sub=""))
+tests/unit/dashboard_api/test_get_my_profile.py:169:    def test_malformed_user_sub_returns_401(self):
+tests/unit/dashboard_api/test_get_my_profile.py:170:        """Codex L1: sub が Slack user_id 形式 (^[UW][A-Z0-9]+$) に合わなければ早期 401。
+tests/unit/dashboard_api/test_get_my_profile.py:177:        result = _run(table, _make_event(user_sub="u04jbju88a0"))
+tests/unit/dashboard_api/test_get_my_profile.py:180:        result = _run(table, _make_event(user_sub="0123456789"))  # gitleaks:allow
+tests/unit/dashboard_api/test_get_my_profile.py:183:        result = _run(table, _make_event(user_sub="U04*ABC"))
+tests/unit/dashboard_api/test_get_my_profile.py:202:    def test_serialize_learned_preferences_handles_mixed_input(self):
+tests/unit/dashboard_api/test_get_my_profile.py:203:        from src.dashboard_api.get_my_profile.app import _serialize_learned_preferences
+tests/unit/dashboard_api/test_get_my_profile.py:206:        assert _serialize_learned_preferences([{"text": "好み A", "created_at": "2026-01-01T00:00:00Z"}]) == ["好み A"]
+tests/unit/dashboard_api/test_get_my_profile.py:209:        assert _serialize_learned_preferences(["legacy_pref"]) == ["legacy_pref"]
+tests/unit/dashboard_api/test_get_my_profile.py:212:        assert _serialize_learned_preferences([{"text": "A"}, "B", {"text": "C", "created_at": "x"}]) == ["A", "B", "C"]
+tests/unit/dashboard_api/test_get_my_profile.py:215:        assert _serialize_learned_preferences([{"text": ""}, {"text": "   "}, {"text": None}, {}]) == []
+tests/unit/dashboard_api/test_get_my_profile.py:218:        assert _serialize_learned_preferences([123, None, ["nested"], "valid"]) == ["valid"]
+tests/unit/dashboard_api/test_get_my_profile.py:221:        assert _serialize_learned_preferences(None) == []
+tests/unit/dashboard_api/test_get_my_profile.py:222:        assert _serialize_learned_preferences("not-a-list") == []
+tests/unit/dashboard_api/test_get_my_profile.py:223:        assert _serialize_learned_preferences({}) == []
+tests/unit/dashboard_api/test_get_my_profile.py:224:        assert _serialize_learned_preferences(42) == []
+tests/unit/dashboard_api/test_get_my_profile.py:227:    # drift 検知 (Codex L2: _PROFILE_KEYS の意図せぬ改変を防ぐ)
+tests/unit/dashboard_api/test_get_my_profile.py:233:        変更時は **src/trigger/app.py:PROFILE_FIELDS も同期更新すること**。
+tests/unit/dashboard_api/test_get_my_profile.py:237:        from src.dashboard_api.get_my_profile.app import _PROFILE_KEYS
+tests/unit/dashboard_api/test_get_my_profile.py:239:        assert _PROFILE_KEYS == (
+tests/unit/agent/test_orchestrator.py:11:    @patch("orchestrator.subprocess.run")
+tests/unit/agent/test_orchestrator.py:24:    @patch("orchestrator.subprocess.run")
+tests/unit/agent/test_orchestrator.py:36:    @patch("orchestrator.subprocess.run")
+tests/unit/agent/test_orchestrator.py:38:        import subprocess
+tests/unit/agent/test_orchestrator.py:43:            subprocess.CalledProcessError(1, "claude"),
+tests/unit/agent/test_orchestrator.py:44:            subprocess.CalledProcessError(1, "claude"),
+tests/unit/agent/test_orchestrator.py:53:    @patch("orchestrator.subprocess.run")
+tests/unit/agent/test_orchestrator.py:55:        import subprocess
+tests/unit/agent/test_orchestrator.py:59:        mock_run.side_effect = subprocess.CalledProcessError(1, "claude")
+tests/unit/agent/test_orchestrator.py:60:        with pytest.raises(subprocess.CalledProcessError):
+tests/unit/agent/test_orchestrator.py:1409:    """learned_preferences が profile_text に反映されるテスト"""
+tests/unit/agent/test_orchestrator.py:1432:    def test_learned_preferences_included_in_prompts(self, mock_call_claude, _mock_load):
+tests/unit/agent/test_orchestrator.py:1433:        """learned_preferences が1件以上ある場合、最初の call_claude 呼び出しに好みが含まれる"""
+tests/unit/agent/test_orchestrator.py:1442:            "learned_preferences": [
+tests/unit/agent/test_orchestrator.py:1463:    def test_empty_learned_preferences_not_included_in_prompts(self, mock_call_claude, _mock_load):
+tests/unit/agent/test_orchestrator.py:1464:        """learned_preferences が空の場合、profile_text に好みセクションが含まれない"""
+tests/unit/agent/test_orchestrator.py:1473:            # learned_preferences なし（既存ユーザー）
+tests/unit/agent/test_orchestrator.py:1845:    def test_handles_subdirectory(self, tmp_path):
+tests/unit/agent/test_orchestrator.py:1848:        sub = tmp_path / "modules" / "cloudfront"
+tests/unit/agent/test_orchestrator.py:1849:        sub.mkdir(parents=True)
+tests/unit/agent/test_orchestrator.py:1850:        (sub / "main.tf").write_text("resource ...")
+tests/unit/agent/test_orchestrator.py:1911:    def _fake_subprocess_run(self, files_to_write: dict[str, str] | None = None, stdout: str = "ok"):
+tests/unit/agent/test_orchestrator.py:1912:        """Claude CLI の subprocess.run を差し替える fake。cwd を見て指定ファイルを書く。"""
+tests/unit/agent/test_orchestrator.py:1939:        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+tests/unit/agent/test_orchestrator.py:1948:    def test_passes_cwd_to_subprocess(self):
+tests/unit/agent/test_orchestrator.py:1960:        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+tests/unit/agent/test_orchestrator.py:1977:        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+tests/unit/agent/test_orchestrator.py:1988:        runner = self._fake_subprocess_run(
+tests/unit/agent/test_orchestrator.py:1993:        with patch("orchestrator.subprocess.run", side_effect=runner):
+tests/unit/agent/test_orchestrator.py:2000:    def test_retries_on_subprocess_error(self):
+tests/unit/agent/test_orchestrator.py:2001:        import subprocess
+tests/unit/agent/test_orchestrator.py:2010:                raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="err")
+tests/unit/agent/test_orchestrator.py:2016:            patch("orchestrator.subprocess.run", side_effect=fake_run),
+tests/unit/agent/test_orchestrator.py:2024:        import subprocess
+tests/unit/agent/test_orchestrator.py:2032:            raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="")
+tests/unit/agent/test_orchestrator.py:2035:            patch("orchestrator.subprocess.run", side_effect=fake_run),
+tests/unit/agent/test_orchestrator.py:2037:            pytest.raises(subprocess.CalledProcessError),
+tests/unit/agent/test_orchestrator.py:2380:        # subagent_failed emit が呼ばれ、error_type は NonDictGeneratorResponse
+tests/unit/agent/test_orchestrator.py:2382:        assert failed_emit_call.args[0] == "subagent_failed"
+tests/unit/agent/test_orchestrator.py:2384:        assert payload["subagent"] == "generator_text"
+tests/unit/agent/test_orchestrator.py:2425:    def test_generator_emits_subagent_completed_with_generator_text_subagent_name(
+tests/unit/agent/test_orchestrator.py:2428:        """成功時の subagent_completed emit が "generator_text" subagent 名で呼ばれる。
+tests/unit/agent/test_orchestrator.py:2433:        注: subagent_completed は `_run_text_generator_with_retries` の **外側** (run() メソッド内)
+tests/unit/agent/test_orchestrator.py:2436:        本テストは run() の generator_subagent_name 変数が正しく "generator_text" になることを
+tests/unit/agent/test_orchestrator.py:2438:        subagent 引数が "generator_text" であることを以て、後段の subagent_completed emit も
+tests/unit/agent/test_orchestrator.py:2448:        # PromptRecorder 経由で subagent 名が "generator_text" であることを確認
+tests/unit/agent/test_orchestrator.py:2449:        # (run() 内 generator_subagent_name 変数の整合性を間接検証)
+tests/unit/agent/test_orchestrator.py:2460:    CodexInvocationError(subprocess.CalledProcessError) サブクラス + __str__ オーバーライドで
+tests/unit/agent/test_orchestrator.py:2465:        """全 retry を CalledProcessError で失敗させる subprocess.run mock を返す"""
+tests/unit/agent/test_orchestrator.py:2466:        import subprocess
+tests/unit/agent/test_orchestrator.py:2469:            raise subprocess.CalledProcessError(
+tests/unit/agent/test_orchestrator.py:2478:            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+tests/unit/agent/test_orchestrator.py:2486:        import subprocess
+tests/unit/agent/test_orchestrator.py:2491:            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+tests/unit/agent/test_orchestrator.py:2493:            pytest.raises(subprocess.CalledProcessError),
+tests/unit/agent/test_orchestrator.py:2507:            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run(marker)),
+tests/unit/agent/test_orchestrator.py:2528:            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run(stderr_text)),
+tests/unit/agent/test_orchestrator.py:2544:        import subprocess
+tests/unit/agent/test_orchestrator.py:2549:            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+tests/unit/agent/test_orchestrator.py:2555:                assert isinstance(e.__cause__, subprocess.CalledProcessError)
+tests/unit/agent/test_orchestrator.py:2564:            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run("err")),
+tests/unit/agent/test_orchestrator.py:2583:            patch("orchestrator.subprocess.run", side_effect=self._make_failure_run(long_stderr)),
+tests/unit/agent/test_feedback_processor.py:166:        assert len(saved_profile["learned_preferences"]) == 1
+tests/unit/agent/test_feedback_processor.py:167:        assert saved_profile["learned_preferences"][0]["text"] == "Terraformはmodule分割する"
+tests/unit/agent/test_feedback_processor.py:282:        saved_prefs = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+tests/unit/agent/test_feedback_processor.py:303:        """好みが抽出された場合、learned_preferences_updated=True で emit される"""
+tests/unit/agent/test_feedback_processor.py:321:        assert payload["subtype"] == "mention_reply"
+tests/unit/agent/test_feedback_processor.py:323:        assert payload["learned_preferences_updated"] is True
+tests/unit/agent/test_feedback_processor.py:330:    def test_feedback_received_marks_learned_preferences_false_when_no_extraction(
+tests/unit/agent/test_feedback_processor.py:336:        # parse_error → preferences 空配列 → learned_preferences_updated False
+tests/unit/agent/test_feedback_processor.py:347:        assert payload["learned_preferences_updated"] is False
+tests/unit/agent/test_notion_client.py:259:        assert api_payload["subtype"] == "notion"
+tests/unit/agent/test_notion_client.py:279:        assert emitted["rate_limit_hit"]["subtype"] == "notion_429"
+tests/unit/agent/test_notion_client.py:302:        assert emitted["rate_limit_hit"]["subtype"] == "cloudflare_block"
+tests/unit/dashboard_api/test_extended_metrics.py:155:            _make_event("api_call_completed", payload={"subtype": "notion", "success": True, "duration_ms": 200}),
+tests/unit/dashboard_api/test_extended_metrics.py:157:                        payload={"subtype": "notion", "success": False, "duration_ms": 100}),
+tests/unit/dashboard_api/test_extended_metrics.py:159:                        payload={"subtype": "github", "success": True, "duration_ms": 300}),
+tests/unit/dashboard_api/test_extended_metrics.py:174:            _make_event("api_call_completed", payload={"subtype": "anthropic", "success": True, "duration_ms": 500}),
+tests/unit/dashboard_api/test_extended_metrics.py:177:            _make_event("rate_limit_hit", payload={"subtype": "anthropic_429", "endpoint_path": "/v1/messages"}),
+tests/unit/dashboard_api/test_extended_metrics.py:179:                        payload={"subtype": "anthropic_429", "endpoint_path": "/v1/messages"}),
+tests/unit/dashboard_api/test_extended_metrics.py:190:            _make_event("rate_limit_hit", payload={"subtype": "cloudflare_block"}),
+tests/unit/dashboard_api/test_extended_metrics.py:394:                "learned_preferences_updated": True,
+tests/unit/dashboard_api/test_extended_metrics.py:399:                "learned_preferences_updated": False,
+tests/unit/dashboard_api/test_extended_metrics.py:442:                "subtype": "mention_reply",
+tests/unit/dashboard_api/test_extended_metrics.py:444:                "learned_preferences_updated": True,
+tests/unit/dashboard_api/test_extended_metrics.py:454:        assert e["subtype"] == "mention_reply"
+tests/unit/dashboard_api/test_extended_metrics.py:456:        assert e["learned_preferences_updated"] is True
+tests/unit/dashboard_api/test_authorizer.py:25:    sub: str = _USER_SUB,
+tests/unit/dashboard_api/test_authorizer.py:30:    payload = {"sub": sub, "name": name, "exp": int(time.time()) + exp_offset}
+tests/unit/dashboard_api/test_authorizer.py:61:        assert result["context"]["user_sub"] == _USER_SUB
+tests/unit/agent/test_main.py:1:import subprocess
+tests/unit/agent/test_main.py:490:        exc = subprocess.CalledProcessError(1, ["claude", "-p", "-"], stderr="Error: rate limit exceeded")
+tests/unit/agent/test_main.py:507:        exc = subprocess.CalledProcessError(1, ["claude", "-p", "-"], stderr="some other error")
+tests/unit/agent/test_main.py:524:        exc = subprocess.CalledProcessError(1, ["codex", "exec", "--model", "gpt-5.5"], stderr="exit 1")
+src/dashboard_api/get_api_health/app.py:37:    # subtype → { total_calls, success_count, duration_ms_list }
+src/dashboard_api/get_api_health/app.py:42:        svc = p.get("subtype", "unknown")
+src/dashboard_api/get_api_health/app.py:59:        raw_svc = p.get("subtype", "unknown")
+src/dashboard_api/get_feedback_aggregation/app.py:31:        1 for i in items if (i.get("payload") or {}).get("learned_preferences_updated")
+src/dashboard_api/get_feedback_aggregation/app.py:63:            "subtype": payload.get("subtype", "mention_reply"),
+src/dashboard_api/get_feedback_aggregation/app.py:65:            "learned_preferences_updated": bool(payload.get("learned_preferences_updated")),
+tests/unit/dashboard_api/test_auth_callback.py:33:    "sub": "U01234567",
+tests/unit/dashboard_api/test_auth_callback.py:146:        assert claims["sub"] == _USER_INFO["sub"]
+src/dashboard_api/get_my_profile/app.py:3:JWT 由来の user_sub から Slack user_id を導出し、UserProfilesTable から
+src/dashboard_api/get_my_profile/app.py:4:本人プロファイル (6 軸 + learned_preferences) を read-only で取得する。
+src/dashboard_api/get_my_profile/app.py:21:# 5W1H 6 軸キー (src/trigger/app.py:PROFILE_FIELDS と整合)
+src/dashboard_api/get_my_profile/app.py:22:_PROFILE_KEYS = (
+src/dashboard_api/get_my_profile/app.py:36:def _extract_slack_user_id(user_sub: str | None) -> str | None:
+src/dashboard_api/get_my_profile/app.py:37:    """Slack OIDC sub から Slack user_id を取り出す。
+src/dashboard_api/get_my_profile/app.py:45:    if not user_sub:
+src/dashboard_api/get_my_profile/app.py:47:    candidate = user_sub.split("-", 1)[0]
+src/dashboard_api/get_my_profile/app.py:53:def _serialize_learned_preferences(raw: object) -> list[str]:
+src/dashboard_api/get_my_profile/app.py:54:    """UserProfilesTable の learned_preferences を frontend 用 string[] に正規化する。
+src/dashboard_api/get_my_profile/app.py:81:    user_sub = auth_ctx.get("user_sub")
+src/dashboard_api/get_my_profile/app.py:82:    user_id = _extract_slack_user_id(user_sub)
+src/dashboard_api/get_my_profile/app.py:84:        return error_response(401, "UNAUTHORIZED", "Missing or invalid user_sub", request_id)
+src/dashboard_api/get_my_profile/app.py:96:        **{k: item.get(k) for k in _PROFILE_KEYS},
+src/dashboard_api/get_my_profile/app.py:97:        "learned_preferences": _serialize_learned_preferences(item.get("learned_preferences")),
+src/dashboard_api/auth_callback/app.py:131:    sub = user_resp.get("sub", "")
+src/dashboard_api/auth_callback/app.py:135:    session_token = jwt.encode({"sub": sub, "name": name, "exp": exp}, _get_jwt_signing_key(), algorithm="HS256")
+src/dashboard_api/authorizer/app.py:44:    - 成功: {"isAuthorized": True, "context": {"user_sub": ..., "user_name": ...}}
+src/dashboard_api/authorizer/app.py:58:                "user_sub": claims["sub"],
+src/dashboard_api/auth_me/app.py:13:        "user_sub": auth_ctx.get("user_sub"),
+src/dashboard_api/get_subagent_io/app.py:57:        futures = {executor.submit(_fetch_record, bucket, key): key for key in keys}
+src/dashboard_api/get_subagent_io/app.py:62:        _SUBAGENT_ORDER.get(r.get("subagent", ""), 99),
+
+ succeeded in 4257ms:
+?? .audit/2026-05-19_frontend-profile-view-2nd.md
+?? .audit/2026-05-19_frontend-profile-view-2nd.prompt.md
+?? .audit/2026-05-19_frontend-profile-view-2nd.raw.txt
+067e53c (HEAD -> main, origin/main, origin/HEAD) fix(dashboard): normalize learned_preferences + tighten user_sub validation
+ .audit/2026-05-19_frontend-profile-view.md        |  128 ++
+ .audit/2026-05-19_frontend-profile-view.prompt.md |  407 ++++
+ .audit/2026-05-19_frontend-profile-view.raw.txt   | 2340 +++++++++++++++++++++
+ src/dashboard_api/get_my_profile/app.py           |   37 +-
+ tests/unit/dashboard_api/test_get_my_profile.py   |   90 +-
+ 5 files changed, 2994 insertions(+), 8 deletions(-)
+
+codex
+実装上の主要な境界は見えました。次に、保存側と frontend 側の型、trigger 側の副作用有無を確認して、今回の修正が API 境界だけで閉じているかを見ます。
+exec
+/bin/bash -lc "sed -n '1,130p' src/agent/feedback/feedback_processor.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+import logging
+from datetime import UTC, datetime
+
+from notify.slack_client import SlackClient
+from orchestrator import _parse_claude_response, call_claude
+from state.dynamodb_client import DynamoDbClient
+
+# T1-2b (Tier 2.4): F8 フィードバック受信 → feedback_received イベントを emit。
+# Lambda zip / ECS image で `src/observability/` 未配置時は graceful skip。
+try:
+    from src.observability import EventEmitter as _EventEmitter
+except ImportError:  # pragma: no cover
+    _EventEmitter = None
+
+logger = logging.getLogger("catch-expander-agent")
+
+MAX_PREFERENCES_PER_FEEDBACK = 3
+MAX_TOTAL_PREFERENCES = 10
+_FEEDBACK_REPLY_SUMMARY_MAX_CHARS = 200
+
+
+class FeedbackProcessor:
+    """フィードバックを解析しユーザープロファイルを更新する"""
+
+    def __init__(self, slack_client: SlackClient, db_client: DynamoDbClient) -> None:
+        self.slack = slack_client
+        self.db = db_client
+
+    def process(
+        self,
+        user_id: str,
+        feedback_text: str,
+        execution_id: str,
+        slack_channel: str,
+        slack_thread_ts: str,
+    ) -> None:
+        """フィードバックを解析しプロファイルを更新する"""
+        try:
+            # 1. 実行レコード取得（コンテキスト用）
+            try:
+                execution = self.db.get_execution(execution_id)
+                topic = execution.get("topic", "不明")
+                category = execution.get("category", "不明")
+            except (KeyError, Exception):
+                logger.warning("Execution not found, proceeding without context", extra={"execution_id": execution_id})
+                topic = "不明"
+                category = "不明"
+
+            # 2. ユーザープロファイル取得
+            profile = self.db.get_user_profile(user_id) or {}
+            existing_prefs: list[dict] = profile.get("learned_preferences", [])
+
+            # T1-2b (Codex 2 回目 P2 対応): emitter を Claude / Slack 呼び出しの **前** に作成し、
+            # それぞれの API call が api_call_completed として観測されるようにする。
+            emitter = _EventEmitter(execution_id) if _EventEmitter is not None else None
+            if emitter is not None:
+                self.slack._emitter = emitter
+
+            # 3. Claude による好み抽出
+            prompt = self._build_extraction_prompt(topic, category, existing_prefs, feedback_text)
+            raw = call_claude(prompt, allowed_tools=None, emitter=emitter)
+            parsed = _parse_claude_response(raw)
+
+            if parsed.get("parse_error"):
+                new_preferences: list[dict] = []
+            else:
+                new_preferences = parsed.get("preferences", [])[:MAX_PREFERENCES_PER_FEEDBACK]
+
+            # 4. マージ
+            merged = self._merge_preferences(existing_prefs, new_preferences)
+
+            # 5. プロファイル更新（learned_preferences と updated_at のみ）
+            profile["user_id"] = user_id
+            profile["learned_preferences"] = merged
+            profile["updated_at"] = datetime.now(tz=UTC).isoformat()
+            self.db.put_user_profile(profile)
+
+            logger.info(
+                "Preferences updated",
+                extra={
+                    "user_id": user_id,
+                    "new_count": len(new_preferences),
+                    "total_count": len(merged),
+                },
+            )
+
+            # 6. T1-2b: feedback_received イベント emit (Tier 2.4)。
+            # F8 はメンション必須経路のみ実装済み (project_slack_feedback_requires_mention)。
+            # emoji_reaction subtype は将来拡張のため、現状は mention_reply 固定。
+            # PII 配慮: feedback_text は raw 保存せず先頭 200 文字 + 「…」のサマリのみ。
+            #
+            # Codex 3 回目 P2 対応: Slack 通知前に emit する。Slack post が retry exhaust
+            # で失敗した場合、後続の self.slack.post_feedback_result が例外を投げて
+            # outer except に飛んでも、フィードバックを受信・処理した事実は events に
+            # 残る (DB 更新は成功している)。
+            if emitter is not None:
+                reply_summary = feedback_text[:_FEEDBACK_REPLY_SUMMARY_MAX_CHARS]
+                if len(feedback_text) > _FEEDBACK_REPLY_SUMMARY_MAX_CHARS:
+                    reply_summary += "…"
+                emitter.emit(
+                    "feedback_received",
+                    {
+                        "subtype": "mention_reply",
+                        "execution_id": execution_id,
+                        "reply_text_summary": reply_summary,
+                        "learned_preferences_updated": bool(new_preferences),
+                        "new_preferences_count": len(new_preferences),
+                        "total_preferences_count": len(merged),
+                    },
+                )
+
+            # 7. Slack 応答 (emitter は step 2 直後で作成済み、self.slack._emitter も伝搬済み)
+            if new_preferences:
+                self.slack.post_feedback_result(
+                    slack_channel,
+                    slack_thread_ts,
+                    new_preferences,
+                    len(merged),
+                )
+            else:
+                self.slack.post_feedback_unextracted(slack_channel, slack_thread_ts)
+
+        except Exception:
+            logger.exception("Feedback processing failed", extra={"user_id": user_id, "execution_id": execution_id})
+            self.slack.post_error(
+                slack_channel,
+                slack_thread_ts,
+                "フィードバックの反映中にエラーが発生しました。ご不便をおかけします。",
+            )
+            raise
+
+exec
+/bin/bash -lc "sed -n '1240,1285p' src/agent/orchestrator.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+
+        # _NoOpEmitter (__init__) を本物に差し替え。ECS image で src.observability が
+        # 未配置の場合 (_EventEmitter is None) は _NoOpEmitter のままで継続する。
+        if _EventEmitter is not None:
+            self._emitter = _EventEmitter(execution_id)
+            # T1-2b: storage / notify クライアントにも EventEmitter を伝搬し、
+            # 各クライアントの `_request_with_retry` / `_post_with_retry` から
+            # api_call_completed / rate_limit_hit を emit させる。
+            self.notion._emitter = self._emitter
+            self.github._emitter = self._emitter
+            self.slack._emitter = self._emitter
+        if _PromptRecorder is not None:
+            self._prompt_recorder = _PromptRecorder(execution_id)
+
+        overall_start_ns = time.monotonic_ns()
+        final_status = "in_progress"
+        notion_url: str | None = None
+        github_url: str | None = None
+
+        try:
+            # 1. プロファイル取得
+            profile = self.db.get_user_profile(user_id) or {}
+            profile_text_base = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
+            learned_prefs = profile.get("learned_preferences", [])
+            if learned_prefs:
+                prefs_lines = "\n".join(f"- {p['text']}" for p in learned_prefs)
+                profile_text = (
+                    f"{profile_text_base}\n\n"
+                    "## ユーザーの蓄積された好み（学習済み）\n"
+                    "以下の好みを成果物の生成方針に必ず反映してください：\n"
+                    f"{prefs_lines}"
+                )
+            else:
+                profile_text = profile_text_base
+
+            # 2. トピック解析
+            orchestrator_prompt = _load_prompt("orchestrator")
+            analysis_prompt = (
+                f"{orchestrator_prompt}\n\n"
+                f"## トピック解析を実行してください\n\n"
+                f"トピック: {topic}\n\n"
+                f"ユーザープロファイル:\n{profile_text}"
+            )
+            analysis_raw = call_claude(analysis_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
+            analysis = _parse_claude_response(analysis_raw)
+            logger.info(
+
+exec
+/bin/bash -lc "sed -n '1,80p' src/trigger/app.py && sed -n '390,440p' src/trigger/app.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+import hashlib
+import json
+import os
+import uuid
+from datetime import UTC, datetime
+
+import boto3
+from aws_lambda_powertools import Logger
+from boto3.dynamodb.conditions import Attr, Key
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from slack_verify import verify_slack_signature
+
+# events DDB への構造化イベント書き込み (T1-3、design.md §7.3)。
+# Lambda zip packaging (`CodeUri: src/trigger/`) では `src/observability/` が同梱されない。
+# SAM Layer 化等の根本解決は別タスク (T1-12 / T1-2b 周辺) で対応するため、
+# 現状は ImportError を graceful skip して既存挙動を維持する。
+try:
+    from src.observability import EventEmitter as _EventEmitter
+except ImportError:  # pragma: no cover - Lambda zip 内でのみ発生
+    _EventEmitter = None
+
+logger = Logger(service="catch-expander-trigger")
+
+secrets_client = boto3.client("secretsmanager")
+dynamodb = boto3.resource("dynamodb")
+ecs_client = boto3.client("ecs")
+
+_cached_secrets: dict[str, str] = {}
+
+
+# User Profile Modal フィールド定義（F6、5W1H 直交フレーム）
+# (key, label, placeholder, multiline)
+PROFILE_FIELDS: list[tuple[str, str, str, bool]] = [
+    ("role", "役割・職業",
+     "クラウドエンジニア（AWS 中心、SRE 担当） / マーケター（B2B SaaS）", False),
+    ("interests", "関心分野",
+     "AI（LLM のビジネス活用）、料理（時短レシピ）、投資（インデックス中心）", True),
+    ("expertise", "専門・得意領域",
+     "インフラ設計（5 年）、Python・SQL は実務レベル、統計は基礎のみ", True),
+    ("learning_goals", "学習の目的",
+     "副業として Web 制作で案件獲得したい。HTML/CSS は理解しているが営業ノウハウが弱い", True),
+    ("background", "背景・状況",
+     "30 代後半、子育て中、SaaS 企業のインフラチーム所属、転職活動準備中", False),
+    ("output_preferences", "受け取り方の好み",
+     "箇条書き重視、実例 3 つ必須、専門用語は注釈付き、英語ソース引用 OK", True),
+]
+
+
+def _find_completed_execution(user_id: str, thread_ts: str, table_prefix: str) -> dict | None:
+    """workflow-executions テーブルを user-id-index GSI でクエリし、
+    指定 thread_ts に一致する実行レコードを返す。
+    見つからない場合は None を返す。status の判定は呼び出し側で行う。
+    """
+    table = dynamodb.Table(f"{table_prefix}-workflow-executions")
+    response = table.query(
+        IndexName="user-id-index",
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        FilterExpression=Attr("slack_thread_ts").eq(thread_ts),
+    )
+    items = response.get("Items", [])
+    return items[0] if items else None
+
+
+def _get_secret(arn: str) -> str:
+    """Secrets Managerからシークレットを取得（キャッシュ付��）"""
+    if arn not in _cached_secrets:
+        response = secrets_client.get_secret_value(SecretId=arn)
+        _cached_secrets[arn] = response["SecretString"]
+    return _cached_secrets[arn]
+
+
+# ---------------------------------------------------------------------------
+# F9 成果物履歴管理
+# ---------------------------------------------------------------------------
+
+
+def _is_history_command(text: str) -> bool:
+    """テキストが履歴コマンドかどうかを判定する。
+    「履歴」または「history」（大文字小文字不問）で始まる場合に True を返す。
+    """view_submission ペイロードを処理。profile_submit callback のみハンドル。"""
+    view = payload.get("view")
+    if not isinstance(view, dict) or view.get("callback_id") != "profile_submit":
+        return {"statusCode": 200, "body": ""}
+
+    user = payload.get("user")
+    user_id = user.get("id") if isinstance(user, dict) else None
+    if not user_id:
+        return {"statusCode": 200, "body": ""}
+
+    try:
+        metadata = json.loads(view.get("private_metadata") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    channel_id = metadata.get("channel_id", "")
+
+    state = view.get("state")
+    values = state.get("values") if isinstance(state, dict) else {}
+    if not isinstance(values, dict):
+        values = {}
+
+    new_fields: dict[str, str] = {}
+    for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
+        block = values.get(f"block_{key}")
+        if not isinstance(block, dict):
+            continue  # Modal block 自体が無い → no-op (フィールド追加直後の古い submit を防御)
+        action = block.get(f"input_{key}")
+        if not isinstance(action, dict):
+            continue
+        # Slack 仕様: optional な plain_text_input を空欄で submit すると
+        # `value: null` (Python では None) で届く。空文字 `""` で届くとは限らない。
+        # block / action が存在する以上ユーザーが Modal を submit した明示的意図なので、
+        # None も「空欄保存 = REMOVE 対象」として扱う。想定外型 (int 等) のみ no-op。
+        raw = action.get("value")
+        if raw is None:
+            new_fields[key] = ""
+        elif isinstance(raw, str):
+            new_fields[key] = raw.strip()
+        else:
+            continue
+
+    long_keys = [k for k, v in new_fields.items() if len(v) > 500]
+    if long_keys:
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "response_action": "errors",
+                "errors": {f"block_{k}": "500 文字以内で入力してください" for k in long_keys},
+
+exec
+/bin/bash -lc "rg -n \"learned_preferences|Profile|AXIS_FIELDS|role|output_preferences\" frontend src -g '"'!node_modules'"' -g '"'!dist'"'" in /workspaces/Catch-Expander
+ succeeded in 148ms:
+frontend/src/components/ui/table.tsx:71:        "h-10 px-2 text-left align-middle font-medium whitespace-nowrap text-foreground [&:has([role=checkbox])]:pr-0",
+frontend/src/components/ui/table.tsx:84:        "p-2 align-middle whitespace-nowrap [&:has([role=checkbox])]:pr-0",
+frontend/src/routes/FeedbackAnalysis.tsx:232:                      {e.learned_preferences_updated
+src/dashboard_api/get_feedback_aggregation/app.py:31:        1 for i in items if (i.get("payload") or {}).get("learned_preferences_updated")
+src/dashboard_api/get_feedback_aggregation/app.py:65:            "learned_preferences_updated": bool(payload.get("learned_preferences_updated")),
+src/agent/prompts/generator.md:52:| ロール（role） | 技術者には設計詳細を、非技術者にはビジネス視点の説明を重視 |
+
+web search: 
+web search: Slack API user ID format U W uppercase alphanumeric
+web search: 
+web search: https://docs.slack.dev/changelog/2016/08/11/user-id-format-changes
+codex
+Slack 公式は U/W 始まりは確認できますが、「任意長の大文字英数字だけ」とまでは固定しないよう警告しています。これは今回の regex を即バグとは見ませんが、レビューでは長さ制約を入れない判断のほうが保守的だと扱います。
+exec
+/bin/bash -lc "sed -n '130,160p' frontend/src/api/types.ts" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+
+export interface AuthMeResponse {
+  user_sub: string
+  user_name: string
+  expires_at: number
+}
+
+// F6 User Profile 閲覧用: dashboard_api/get_my_profile が返す本人プロファイル。
+// 値が REMOVE 済 / 未設定の軸は null で返る。learned_preferences は要素なしなら空配列。
+export interface MyProfile {
+  user_id: string
+  role: string | null
+  interests: string | null
+  expertise: string | null
+  learning_goals: string | null
+  background: string | null
+  output_preferences: string | null
+  learned_preferences: string[]
+  updated_at: string | null
+}
+
+export interface MyProfileResponse {
+  data: MyProfile
+}
+
+export type Period = "24h" | "7d" | "30d"
+
+export interface FeedbackEvent {
+  execution_id: string
+  timestamp: string
+  subtype: string
+
+exec
+/bin/bash -lc "sed -n '1380,1515p' tests/unit/trigger/test_app.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+        mock_client.views_open.assert_called_once()
+        view = mock_client.views_open.call_args.kwargs["view"]
+        assert view["callback_id"] == "profile_submit"
+
+        role_block = next(b for b in view["blocks"] if b.get("block_id") == "block_role")
+        assert role_block["element"]["initial_value"] == "クラウドエンジニア"
+
+        expertise_block = next(b for b in view["blocks"] if b.get("block_id") == "block_expertise")
+        assert "initial_value" not in expertise_block["element"]
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_block_actions_opens_empty_modal_when_no_profile(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """既存プロファイル無し → views.open は呼ばれるが initial_value は全て無い。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {}
+        mock_dynamodb.Table.return_value = mock_table
+        mock_client = MagicMock()
+        mock_webclient_cls.return_value = mock_client
+
+        payload = {
+            "type": "block_actions",
+            "user": {"id": "U_NEW"},
+            "channel": {"id": "C_CH"},
+            "trigger_id": "trig_456",
+            "actions": [{"action_id": "open_profile_modal"}],
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        view = mock_client.views_open.call_args.kwargs["view"]
+        input_blocks = [b for b in view["blocks"] if b["type"] == "input"]
+        assert len(input_blocks) == 6
+        for b in input_blocks:
+            assert "initial_value" not in b["element"]
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_writes_set_and_remove(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """空欄あり/値ありの mix で update_item が SET + REMOVE 両方を含む式を発行する。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+        state_values = {
+            "block_role": {"input_role": {"value": "クラウドエンジニア"}},
+            "block_interests": {"input_interests": {"value": "AI, 料理"}},
+            "block_expertise": {"input_expertise": {"value": ""}},
+            "block_learning_goals": {"input_learning_goals": {"value": "  "}},  # trim 後空 → REMOVE
+            # Slack の optional input は空欄で value: null を送るため、None も明示的空欄として REMOVE
+            "block_background": {"input_background": {"value": None}},
+            "block_output_preferences": {"input_output_preferences": {"value": ""}},
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_CH"}),
+                "state": {"values": state_values},
+            },
+        }
+        result = lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+        assert result["statusCode"] == 200
+
+        mock_table.update_item.assert_called_once()
+        kw = mock_table.update_item.call_args.kwargs
+        update_expr = kw["UpdateExpression"]
+        attr_names = kw["ExpressionAttributeNames"]
+
+        assert "SET" in update_expr and "REMOVE" in update_expr
+
+        # SET 部分のフィールド名集合: role, interests, updated_at, created_at
+        set_part = update_expr.split("REMOVE", 1)[0]
+        set_names = {attr_names[alias] for alias in attr_names if alias in set_part}
+        assert {"role", "interests", "updated_at", "created_at"} <= set_names
+
+        # REMOVE 部分: 空文字 / trim 後空 / value: null すべて REMOVE
+        remove_part = update_expr.split("REMOVE", 1)[1]
+        remove_names = {attr_names[alias.strip()] for alias in remove_part.split(",")}
+        assert remove_names == {"expertise", "learning_goals", "background", "output_preferences"}
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_does_not_touch_learned_preferences(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """UpdateExpression に learned_preferences が一切登場しない (B 方式・AC-3)。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+        state_values = {
+            f"block_{k}": {f"input_{k}": {"value": "x"}}
+            for k in ["role", "interests", "expertise", "learning_goals", "background", "output_preferences"]
+        }
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U_USER"},
+            "view": {
+                "callback_id": "profile_submit",
+                "private_metadata": json.dumps({"channel_id": "C_CH"}),
+                "state": {"values": state_values},
+            },
+        }
+        lambda_handler(_make_interactive_event(payload), _make_lambda_context())
+
+        kw = mock_table.update_item.call_args.kwargs
+        assert "learned_preferences" not in str(kw)
+
+    @patch("app.dynamodb")
+    @patch("app.WebClient")
+    @patch("app.secrets_client")
+    def test_view_submission_returns_errors_for_long_fields(
+        self, mock_secrets, mock_webclient_cls, mock_dynamodb
+    ):
+        """501 文字以上を含む submit に response_action:errors が返り、update_item は呼ばれない。"""
+        from app import lambda_handler
+
+        mock_secrets.get_secret_value.return_value = {"SecretString": SIGNING_SECRET}
+        mock_table = MagicMock()
+        mock_dynamodb.Table.return_value = mock_table
+
+exec
+/bin/bash -lc "sed -n '1,125p' frontend/src/routes/MyProfile.tsx" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+import { useQuery } from "@tanstack/react-query"
+import { Info } from "lucide-react"
+
+import { endpoints } from "@/api/endpoints"
+import type { MyProfile } from "@/api/types"
+import { fmtRelative } from "@/lib/time"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Skeleton } from "@/components/ui/skeleton"
+
+// 5W1H 6 軸キーとラベルの対応 (backend get_my_profile.app._PROFILE_KEYS と整合)
+const AXIS_FIELDS: ReadonlyArray<{ key: keyof Omit<MyProfile, "user_id" | "learned_preferences" | "updated_at">; label: string }> = [
+  { key: "role",                label: "役割・職業" },
+  { key: "interests",           label: "関心分野" },
+  { key: "expertise",           label: "専門・得意領域" },
+  { key: "learning_goals",      label: "学習の目的" },
+  { key: "background",          label: "背景・状況" },
+  { key: "output_preferences",  label: "受け取り方の好み" },
+]
+
+function AxisRow({ label, value }: { label: string; value: string | null }) {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-[200px_1fr] gap-2 py-3 border-b border-border last:border-b-0">
+      <div className="text-sm font-medium text-foreground">{label}</div>
+      {value ? (
+        <div className="text-sm text-foreground whitespace-pre-wrap break-words">{value}</div>
+      ) : (
+        <div className="text-sm italic text-muted-foreground">未設定</div>
+      )}
+    </div>
+  )
+}
+
+export function MyProfile() {
+  const q = useQuery({
+    queryKey: ["my-profile"],
+    queryFn: () => endpoints.myProfile().then((r) => r.data),
+    staleTime: 60_000,
+  })
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold">マイプロファイル</h1>
+        <p className="text-sm text-muted-foreground mt-1">
+          AI に伝わっているあなたの 5W1H 6 軸プロファイル (read-only) と、自動学習された好みの一覧です。
+        </p>
+      </div>
+
+      {/* 編集導線 banner */}
+      <div className="flex items-start gap-3 p-4 rounded-md border border-border bg-muted/30">
+        <Info size={16} className="shrink-0 mt-0.5 text-muted-foreground" />
+        <div className="text-sm">
+          編集は Slack で <code className="px-1.5 py-0.5 rounded bg-muted text-foreground font-mono text-xs">@CatchExpander profile</code> を実行してください。
+        </div>
+      </div>
+
+      {q.isLoading && (
+        <Card>
+          <CardContent className="pt-6 space-y-3">
+            {AXIS_FIELDS.map((f) => (
+              <Skeleton key={f.key} className="h-16 w-full" />
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {q.isError && (
+        <Card>
+          <CardContent className="pt-6">
+            <div className="text-sm text-destructive">
+              プロファイルの取得に失敗しました。時間を置いて再読み込みしてください。
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {q.data && (
+        <>
+          <Card>
+            <CardHeader>
+              <CardTitle>プロファイル</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {AXIS_FIELDS.map((f) => (
+                <AxisRow key={f.key} label={f.label} value={q.data[f.key]} />
+              ))}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>学習履歴 (learned_preferences)</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {q.data.learned_preferences.length === 0 ? (
+                <div className="text-sm italic text-muted-foreground">
+                  学習履歴はまだありません。フィードバックを送ると AI が自動で好みを学習します。
+                </div>
+              ) : (
+                <ul className="space-y-2 list-disc list-inside text-sm">
+                  {q.data.learned_preferences.map((pref, i) => (
+                    <li key={i} className="text-foreground break-words">{pref}</li>
+                  ))}
+                </ul>
+              )}
+            </CardContent>
+          </Card>
+
+          {q.data.updated_at && (
+            <div className="text-xs text-muted-foreground text-right">
+              最終更新: {fmtRelative(q.data.updated_at)}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+exec
+/bin/bash -lc "sed -n '130,190p' tests/unit/agent/test_feedback_processor.py && sed -n '1428,1455p' tests/unit/agent/test_orchestrator.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+        existing = [{"text": "古い", "created_at": old_ts}]
+        new_prefs = [{"text": "新しい", "replaces_index": 0}]
+
+        result = processor._merge_preferences(existing, new_prefs)
+
+        assert result[0]["created_at"] != old_ts
+
+
+class TestFeedbackProcessorProcess:
+    """FeedbackProcessor.process メソッドの統合テスト"""
+
+    def _make_processor(self, mock_slack=None, mock_db=None):
+        from feedback.feedback_processor import FeedbackProcessor
+
+        slack = mock_slack or MagicMock()
+        db = mock_db or MagicMock()
+        return FeedbackProcessor(slack_client=slack, db_client=db)
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_extracts_preferences_and_updates_profile(self, mock_call_claude):
+        """好みが抽出できた場合: DynamoDB更新 + post_feedback_result"""
+        mock_db = MagicMock()
+        mock_db.get_execution.return_value = {"topic": "Terraform", "category": "技術"}
+        mock_db.get_user_profile.return_value = {"user_id": "U1", "role": "エンジニア"}
+
+        mock_call_claude.return_value = json.dumps(
+            {"result": json.dumps({"preferences": [{"text": "Terraformはmodule分割する", "replaces_index": None}]})}
+        )
+
+        mock_slack = MagicMock()
+        processor = self._make_processor(mock_slack=mock_slack, mock_db=mock_db)
+        processor.process("U1", "コードが良かった", "exec-001", "C1", "ts1")
+
+        # DynamoDB に保存された内容を確認
+        mock_db.put_user_profile.assert_called_once()
+        saved_profile = mock_db.put_user_profile.call_args[0][0]
+        assert len(saved_profile["learned_preferences"]) == 1
+        assert saved_profile["learned_preferences"][0]["text"] == "Terraformはmodule分割する"
+        assert "role" in saved_profile  # 既存フィールドが保持されている
+
+        # Slack 通知
+        mock_slack.post_feedback_result.assert_called_once()
+        mock_slack.post_feedback_unextracted.assert_not_called()
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_no_preferences_extracted_posts_unextracted_message(self, mock_call_claude):
+        """好みが0件の場合: post_feedback_unextracted を呼ぶ"""
+        mock_db = MagicMock()
+        mock_db.get_execution.return_value = {"topic": "topic", "category": "cat"}
+        mock_db.get_user_profile.return_value = None
+
+        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+
+        mock_slack = MagicMock()
+        processor = self._make_processor(mock_slack=mock_slack, mock_db=mock_db)
+        processor.process("U1", "良かった", "exec-001", "C1", "ts1")
+
+        mock_slack.post_feedback_unextracted.assert_called_once_with("C1", "ts1")
+        mock_slack.post_feedback_result.assert_not_called()
+
+    @patch("feedback.feedback_processor.call_claude")
+        ]
+
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_claude")
+    def test_learned_preferences_included_in_prompts(self, mock_call_claude, _mock_load):
+        """learned_preferences が1件以上ある場合、最初の call_claude 呼び出しに好みが含まれる"""
+        from orchestrator import Orchestrator
+
+        mock_call_claude.side_effect = self._make_minimal_responses()
+
+        db = MagicMock()
+        db.get_user_profile.return_value = {
+            "user_id": "U1",
+            "role": "エンジニア",
+            "learned_preferences": [
+                {"text": "Terraformはmodule分割する", "created_at": "2026-01-01T00:00:00Z"},
+            ],
+        }
+        db._table.return_value = MagicMock()
+
+        slack = MagicMock()
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+
+        orch.run("exec-1", "U1", "Terraform入門", "C1", "ts1")
+
+
+codex
+保存側の 6 軸は Slack Modal の `str.strip()` 経由で書かれており、今回の H1 と同型の dict 配列バグは見当たりません。残る論点は drift テストの境界設計と、regex の厳しさをどの severity で扱うかです。
+exec
+/bin/bash -lc "nl -ba src/dashboard_api/get_my_profile/app.py | sed -n '20,110p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+    20	
+    21	# 5W1H 6 軸キー (src/trigger/app.py:PROFILE_FIELDS と整合)
+    22	_PROFILE_KEYS = (
+    23	    "role",
+    24	    "interests",
+    25	    "expertise",
+    26	    "learning_goals",
+    27	    "background",
+    28	    "output_preferences",
+    29	)
+    30	
+    31	# Slack user_id は U / W プレフィックス + uppercase alphanumeric。
+    32	# 形状破壊時に「placeholder 表示」で隠れず即 401 で原因特定を早めるためのガード。
+    33	_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]+$")
+    34	
+    35	
+    36	def _extract_slack_user_id(user_sub: str | None) -> str | None:
+    37	    """Slack OIDC sub から Slack user_id を取り出す。
+    38	
+    39	    本番 Slack OIDC は pure user_id 形式 (例: "U0XXXXXXXX") を返すことを
+    40	    実機 cookie デコードで確認済 (.steering/20260518-frontend-profile-view/tasklist.md T0-1)。
+    41	    将来 "<user_id>-<team_id>" 形式に変わっても壊れないよう split("-")[0] で防御。
+    42	    Slack user_id は uppercase alphanumeric のみで hyphen を含まない仕様。
+    43	    抽出後に Slack user_id らしさを regex 検証し、形状破壊を 401 で早期 fail させる。
+    44	    """
+    45	    if not user_sub:
+    46	        return None
+    47	    candidate = user_sub.split("-", 1)[0]
+    48	    if not _SLACK_USER_ID_RE.fullmatch(candidate):
+    49	        return None
+    50	    return candidate
+    51	
+    52	
+    53	def _serialize_learned_preferences(raw: object) -> list[str]:
+    54	    """UserProfilesTable の learned_preferences を frontend 用 string[] に正規化する。
+    55	
+    56	    実保存形式は `{"text": str, "created_at": str}` の dict 配列 (feedback_processor.py:199)。
+    57	    将来の互換性のため、文字列要素 / 旧形式 / 想定外型も吸収する:
+    58	    - dict: "text" フィールドを抽出 (空文字や whitespace-only はスキップ)
+    59	    - str: そのまま採用
+    60	    - その他: スキップ
+    61	    """
+    62	    if not isinstance(raw, list):
+    63	        return []
+    64	    result: list[str] = []
+    65	    for pref in raw:
+    66	        if isinstance(pref, str):
+    67	            text: object = pref
+    68	        elif isinstance(pref, dict):
+    69	            text = pref.get("text")
+    70	        else:
+    71	            continue
+    72	        if isinstance(text, str) and text.strip():
+    73	            result.append(text)
+    74	    return result
+    75	
+    76	
+    77	def lambda_handler(event: dict, context: object) -> dict:
+    78	    request_id = getattr(context, "aws_request_id", "")
+    79	
+    80	    auth_ctx = event.get("requestContext", {}).get("authorizer", {}).get("lambda", {})
+    81	    user_sub = auth_ctx.get("user_sub")
+    82	    user_id = _extract_slack_user_id(user_sub)
+    83	    if not user_id:
+    84	        return error_response(401, "UNAUTHORIZED", "Missing or invalid user_sub", request_id)
+    85	
+    86	    table = _dynamodb.Table(os.environ["USER_PROFILES_TABLE"])
+    87	    try:
+    88	        result = table.get_item(Key={"user_id": user_id})
+    89	    except Exception as e:  # noqa: BLE001
+    90	        logger.error("DDB get_item failed for request %s: %s", request_id, type(e).__name__)
+    91	        return error_response(500, "INTERNAL_ERROR", "Database query failed", request_id)
+    92	
+    93	    item = result.get("Item") or {}
+    94	    body = {
+    95	        "user_id": user_id,
+    96	        **{k: item.get(k) for k in _PROFILE_KEYS},
+    97	        "learned_preferences": _serialize_learned_preferences(item.get("learned_preferences")),
+    98	        "updated_at": item.get("updated_at"),
+    99	    }
+   100	    return json_response(200, {"data": body})
+
+exec
+/bin/bash -lc "nl -ba tests/unit/dashboard_api/test_get_my_profile.py | sed -n '160,255p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+   160	    def test_empty_user_sub_returns_401(self):
+   161	        table = MagicMock()
+   162	        result = _run(table, _make_event(user_sub=""))
+   163	
+   164	        assert result["statusCode"] == 401
+   165	        body = json.loads(result["body"])
+   166	        assert body["error"]["code"] == "UNAUTHORIZED"
+   167	        table.get_item.assert_not_called()
+   168	
+   169	    def test_malformed_user_sub_returns_401(self):
+   170	        """Codex L1: sub が Slack user_id 形式 (^[UW][A-Z0-9]+$) に合わなければ早期 401。
+   171	
+   172	        従来は黙って placeholder 表示になり、cookie 破損時の原因特定が遅れていた。
+   173	        regex 追加で形状破壊を即 fail させる。
+   174	        """
+   175	        table = MagicMock()
+   176	        # ケース 1: lowercase
+   177	        result = _run(table, _make_event(user_sub="u04jbju88a0"))
+   178	        assert result["statusCode"] == 401
+   179	        # ケース 2: 数字始まり
+   180	        result = _run(table, _make_event(user_sub="0123456789"))  # gitleaks:allow
+   181	        assert result["statusCode"] == 401
+   182	        # ケース 3: 特殊文字含む
+   183	        result = _run(table, _make_event(user_sub="U04*ABC"))
+   184	        assert result["statusCode"] == 401
+   185	        # GetItem は 3 回とも呼ばれていない (regex 段階で fail)
+   186	        table.get_item.assert_not_called()
+   187	
+   188	    def test_ddb_failure_returns_500(self):
+   189	        table = MagicMock()
+   190	        table.get_item.side_effect = RuntimeError("simulated DDB outage")
+   191	
+   192	        result = _run(table, _make_event())
+   193	
+   194	        assert result["statusCode"] == 500
+   195	        body = json.loads(result["body"])
+   196	        assert body["error"]["code"] == "INTERNAL_ERROR"
+   197	
+   198	    # ------------------------------------------------------------------
+   199	    # ヘルパ単体テスト (Codex H1: dict / str / 想定外型の吸収)
+   200	    # ------------------------------------------------------------------
+   201	
+   202	    def test_serialize_learned_preferences_handles_mixed_input(self):
+   203	        from src.dashboard_api.get_my_profile.app import _serialize_learned_preferences
+   204	
+   205	        # 本番形式 (dict with text + created_at)
+   206	        assert _serialize_learned_preferences([{"text": "好み A", "created_at": "2026-01-01T00:00:00Z"}]) == ["好み A"]
+   207	
+   208	        # 旧データ互換 (素の文字列)
+   209	        assert _serialize_learned_preferences(["legacy_pref"]) == ["legacy_pref"]
+   210	
+   211	        # 混在
+   212	        assert _serialize_learned_preferences([{"text": "A"}, "B", {"text": "C", "created_at": "x"}]) == ["A", "B", "C"]
+   213	
+   214	        # 空文字 / whitespace-only / None text はスキップ
+   215	        assert _serialize_learned_preferences([{"text": ""}, {"text": "   "}, {"text": None}, {}]) == []
+   216	
+   217	        # 想定外型 (int / None / list of list 等) はスキップ
+   218	        assert _serialize_learned_preferences([123, None, ["nested"], "valid"]) == ["valid"]
+   219	
+   220	        # 非 list は空配列
+   221	        assert _serialize_learned_preferences(None) == []
+   222	        assert _serialize_learned_preferences("not-a-list") == []
+   223	        assert _serialize_learned_preferences({}) == []
+   224	        assert _serialize_learned_preferences(42) == []
+   225	
+   226	    # ------------------------------------------------------------------
+   227	    # drift 検知 (Codex L2: _PROFILE_KEYS の意図せぬ改変を防ぐ)
+   228	    # ------------------------------------------------------------------
+   229	
+   230	    def test_profile_keys_are_stable(self):
+   231	        """6 軸キーの順序・名称が固定されていることを検証する。
+   232	
+   233	        変更時は **src/trigger/app.py:PROFILE_FIELDS も同期更新すること**。
+   234	        本テストは dashboard_api 側の意図せぬ改変 (リファクタ事故 / typo / 順序入れ替え) を
+   235	        検知する。trigger 側との同期は trigger テストの責務。
+   236	        """
+   237	        from src.dashboard_api.get_my_profile.app import _PROFILE_KEYS
+   238	
+   239	        assert _PROFILE_KEYS == (
+   240	            "role",
+   241	            "interests",
+   242	            "expertise",
+   243	            "learning_goals",
+   244	            "background",
+   245	            "output_preferences",
+   246	        )
+
+exec
+/bin/bash -lc "nl -ba src/trigger/app.py | sed -n '28,50p;400,432p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+    28	
+    29	_cached_secrets: dict[str, str] = {}
+    30	
+    31	
+    32	# User Profile Modal フィールド定義（F6、5W1H 直交フレーム）
+    33	# (key, label, placeholder, multiline)
+    34	PROFILE_FIELDS: list[tuple[str, str, str, bool]] = [
+    35	    ("role", "役割・職業",
+    36	     "クラウドエンジニア（AWS 中心、SRE 担当） / マーケター（B2B SaaS）", False),
+    37	    ("interests", "関心分野",
+    38	     "AI（LLM のビジネス活用）、料理（時短レシピ）、投資（インデックス中心）", True),
+    39	    ("expertise", "専門・得意領域",
+    40	     "インフラ設計（5 年）、Python・SQL は実務レベル、統計は基礎のみ", True),
+    41	    ("learning_goals", "学習の目的",
+    42	     "副業として Web 制作で案件獲得したい。HTML/CSS は理解しているが営業ノウハウが弱い", True),
+    43	    ("background", "背景・状況",
+    44	     "30 代後半、子育て中、SaaS 企業のインフラチーム所属、転職活動準備中", False),
+    45	    ("output_preferences", "受け取り方の好み",
+    46	     "箇条書き重視、実例 3 つ必須、専門用語は注釈付き、英語ソース引用 OK", True),
+    47	]
+    48	
+    49	
+    50	def _find_completed_execution(user_id: str, thread_ts: str, table_prefix: str) -> dict | None:
+   400	    try:
+   401	        metadata = json.loads(view.get("private_metadata") or "{}")
+   402	    except (json.JSONDecodeError, TypeError):
+   403	        metadata = {}
+   404	    if not isinstance(metadata, dict):
+   405	        metadata = {}
+   406	    channel_id = metadata.get("channel_id", "")
+   407	
+   408	    state = view.get("state")
+   409	    values = state.get("values") if isinstance(state, dict) else {}
+   410	    if not isinstance(values, dict):
+   411	        values = {}
+   412	
+   413	    new_fields: dict[str, str] = {}
+   414	    for key, _label, _placeholder, _multiline in PROFILE_FIELDS:
+   415	        block = values.get(f"block_{key}")
+   416	        if not isinstance(block, dict):
+   417	            continue  # Modal block 自体が無い → no-op (フィールド追加直後の古い submit を防御)
+   418	        action = block.get(f"input_{key}")
+   419	        if not isinstance(action, dict):
+   420	            continue
+   421	        # Slack 仕様: optional な plain_text_input を空欄で submit すると
+   422	        # `value: null` (Python では None) で届く。空文字 `""` で届くとは限らない。
+   423	        # block / action が存在する以上ユーザーが Modal を submit した明示的意図なので、
+   424	        # None も「空欄保存 = REMOVE 対象」として扱う。想定外型 (int 等) のみ no-op。
+   425	        raw = action.get("value")
+   426	        if raw is None:
+   427	            new_fields[key] = ""
+   428	        elif isinstance(raw, str):
+   429	            new_fields[key] = raw.strip()
+   430	        else:
+   431	            continue
+   432	
+
+exec
+/bin/bash -lc "nl -ba src/agent/orchestrator.py | sed -n '1258,1274p'" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+  1258	
+  1259	        try:
+  1260	            # 1. プロファイル取得
+  1261	            profile = self.db.get_user_profile(user_id) or {}
+  1262	            profile_text_base = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
+  1263	            learned_prefs = profile.get("learned_preferences", [])
+  1264	            if learned_prefs:
+  1265	                prefs_lines = "\n".join(f"- {p['text']}" for p in learned_prefs)
+  1266	                profile_text = (
+  1267	                    f"{profile_text_base}\n\n"
+  1268	                    "## ユーザーの蓄積された好み（学習済み）\n"
+  1269	                    "以下の好みを成果物の生成方針に必ず反映してください：\n"
+  1270	                    f"{prefs_lines}"
+  1271	                )
+  1272	            else:
+  1273	                profile_text = profile_text_base
+  1274	
+
+codex
+確認結果として、High の再発はありません。念のため対象ユニットテストをこちらでも実行し、実行結果とレビュー上の残論点を切り分けます。
+exec
+/bin/bash -lc 'uv run pytest tests/unit/dashboard_api/test_get_my_profile.py -v' in /workspaces/Catch-Expander
+ succeeded in 58996ms:
+============================= test session starts ==============================
+platform linux -- Python 3.14.4, pytest-8.3.0, pluggy-1.6.0 -- /workspaces/Catch-Expander/.venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /workspaces/Catch-Expander
+configfile: pyproject.toml
+plugins: cov-6.0.0
+collecting ... collected 10 items
+
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_returns_full_profile PASSED [ 10%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_returns_placeholder_when_record_missing PASSED [ 20%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_partial_fields_missing PASSED [ 30%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_strips_team_suffix_from_sub_defensive PASSED [ 40%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_missing_user_sub_returns_401 PASSED [ 50%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_empty_user_sub_returns_401 PASSED [ 60%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_malformed_user_sub_returns_401 PASSED [ 70%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_ddb_failure_returns_500 PASSED [ 80%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_serialize_learned_preferences_handles_mixed_input PASSED [ 90%]
+tests/unit/dashboard_api/test_get_my_profile.py::TestGetMyProfile::test_profile_keys_are_stable PASSED [100%]
+
+============================== 10 passed in 0.76s ==============================
+
+exec
+/bin/bash -lc "sed -n '1,30p' tests/unit/trigger/test_app.py" in /workspaces/Catch-Expander
+ succeeded in 0ms:
+import hashlib
+import hmac
+import json
+import time
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture()
+def _env_vars(monkeypatch):
+    """Lambda環境変数を設定し、シークレットキャッシュをクリアする"""
+    monkeypatch.setenv("DYNAMODB_TABLE_PREFIX", "test-prefix")
+    monkeypatch.setenv("ECS_CLUSTER_ARN", "arn:aws:ecs:ap-northeast-1:123456789012:cluster/test")
+    monkeypatch.setenv("ECS_TASK_DEFINITION_ARN", "arn:aws:ecs:ap-northeast-1:123456789012:task-definition/test:1")
+    monkeypatch.setenv("ECS_SUBNET_1", "subnet-111")
+    monkeypatch.setenv("ECS_SUBNET_2", "subnet-222")
+    monkeypatch.setenv("ECS_SECURITY_GROUP", "sg-333")
+    monkeypatch.setenv("SLACK_BOT_TOKEN_SECRET_ARN", "arn:aws:secretsmanager:ap-northeast-1:123:secret:bot-token")
+    monkeypatch.setenv("SLACK_SIGNING_SECRET_ARN", "arn:aws:secretsmanager:ap-northeast-1:123:secret:signing")
+    # テスト間のキャッシュ汚染を防ぐ
+    from app import _cached_secrets
+
+    _cached_secrets.clear()
+
+
+SIGNING_SECRET = "test_signing_secret"
+
+
+def _make_lambda_context():
+
+codex
+# Codex Review Pass 2 — 2026-05-19 frontend-profile-view
+
+## サマリ
+- Critical: 0 / High: 0 / Medium: 0 / Low: 1 / Info: 1
+- 前回指摘の解消確認: ✅ 2/3 解消、⚠️ 1/3 部分
+- 多層ミス検出: 1 件
+- 総合所感: H1 の runtime error は API 境界で正しく収束。`learned_preferences` は内部 dict / API string[] の境界が成立しています。`user_sub` の 401 化も妥当。残るのは 6 軸 drift 検知が dashboard 側だけで、trigger/frontend 側変更を捕まえない点です。
+
+## 指摘事項 (新規発生分 + 残存分)
+
+### [Low] [tests/unit/dashboard_api/test_get_my_profile.py:230] drift 検知が dashboard 側の固定化に留まっている
+- 区分: 残存
+- 問題: `test_profile_keys_are_stable` は `_PROFILE_KEYS` 自体の typo / 順序変更は検知できますが、[src/trigger/app.py:34](/workspaces/Catch-Expander/src/trigger/app.py:34) の `PROFILE_FIELDS` が変わった場合は dashboard test では検知できません。Pass 1 の「3 箇所分散 drift」への対策としては半分だけです。
+- 影響: trigger 側で 6 軸が追加・改名されても、dashboard API / frontend 表示が追随しないまま通る可能性があります。
+- 推奨修正: dashboard test から `src.trigger.app` を import しない判断は妥当です。代わりに trigger test suite 側へ対称テストを追加してください。
+
+```python
+def test_profile_fields_keys_are_stable(_env_vars):
+    from app import PROFILE_FIELDS
+
+    assert tuple(key for key, *_ in PROFILE_FIELDS) == (
+        "role",
+        "interests",
+        "expertise",
+        "learning_goals",
+        "background",
+        "output_preferences",
+    )
+```
+
+### [Info] [src/dashboard_api/get_my_profile/app.py:31] Slack user_id コメントは公式仕様としては少し強い
+- 区分: 新規
+- 問題: Slack 公式は user ID が `U` または `W` で始まることは明記していますが、文字集合を固定前提にしないよう案内しています。Slack changelog も “business logic shouldn’t contain assumptions about the specific characters composing an ID” としています。参考: Slack changelog「User ID format changes」および SCIM API reference。  
+  https://docs.slack.dev/changelog/2016/08/11/user-id-format-changes/  
+  https://docs.slack.dev/reference/scim-api/
+- 影響: 現在の実機 cookie 形式を前提にした防御としては許容範囲です。ただしコメントの「uppercase alphanumeric のみで hyphen を含まない仕様」は公式仕様断定としてはやや強いです。
+- 推奨修正: 必須ではありませんが、コメントを「現行の観測形式 / 保存キーとして許容する形式」に寄せるとよいです。長さ制約追加は推奨しません。Slack は ID 長や文字集合を固定契約として扱わないほうが安全です。
+
+## 前回指摘の解消状況
+- High #1 (`learned_preferences`): 解消 ✅  
+  [src/dashboard_api/get_my_profile/app.py:53](/workspaces/Catch-Expander/src/dashboard_api/get_my_profile/app.py:53) で dict / str / 混在 / 空 text / 想定外型を吸収し、[app.py:97](/workspaces/Catch-Expander/src/dashboard_api/get_my_profile/app.py:97) で API 出口のみ `string[]` 化。frontend の React child error は解消。内部の [src/agent/orchestrator.py:1265](/workspaces/Catch-Expander/src/agent/orchestrator.py:1265) は dict 直アクセスのままで境界も正しいです。
+- Low #1 (`user_sub` regex): 解消 ✅  
+  malformed sub を 401 に倒す修正は妥当です。`"U"` 単体が通る点は理論上ありますが、実 DDB key として存在しないため placeholder になるだけで、現実的な認証 bypass ではありません。長さ制約は Slack ID の将来変化に弱くなるため不要です。
+- Low #2 (drift 検知 案 C 採用): 部分解消 ⚠️ / 判断自体は妥当  
+  `trigger.app` 直 import を避ける判断は妥当です。top-level で `boto3.client/resource` と `ecs_client` が初期化されるため、dashboard test に副作用を持ち込まないほうがよいです。ただし案 C を完結させるには trigger 側の対称テストが必要です。
+
+## 補足評価
+- `created_at` / `replaces_index` を API で落とす情報損失: 現行 frontend contract が `string[]` なので妥当。将来表示するなら `learned_preferences_v2` 等で別 contract 化が自然です。
+- whitespace-only text のスキップ: 妥当。保存側も trim / empty 排除の意図があり、表示 API で空項目を出さないほうが安全です。
+- regex 失敗時の error message 共通化: 許容範囲。401 の利用者向けレスポンスで詳細分岐する必要は薄いです。
+- 6 軸本体の dict 混入リスク: 現状の主要書き込み経路は Slack Modal の string 保存なので H1 と同型の高リスクは見当たりません。
+
+## 結論
+- 収束判定: 収束 (新規 Critical/High ゼロ)
+- マージ可否: 可。Low の trigger 対称テストは後続または同 PR で追加推奨です。
+- 確認: `uv run pytest tests/unit/dashboard_api/test_get_my_profile.py -v` は 10 passed。
+2026-05-22T23:51:38.768048Z ERROR codex_core::session: failed to record rollout items: thread 019e5217-823e-75b0-979f-5d6307c124c1 not found
+tokens used
+62,009
+# Codex Review Pass 2 — 2026-05-19 frontend-profile-view
+
+## サマリ
+- Critical: 0 / High: 0 / Medium: 0 / Low: 1 / Info: 1
+- 前回指摘の解消確認: ✅ 2/3 解消、⚠️ 1/3 部分
+- 多層ミス検出: 1 件
+- 総合所感: H1 の runtime error は API 境界で正しく収束。`learned_preferences` は内部 dict / API string[] の境界が成立しています。`user_sub` の 401 化も妥当。残るのは 6 軸 drift 検知が dashboard 側だけで、trigger/frontend 側変更を捕まえない点です。
+
+## 指摘事項 (新規発生分 + 残存分)
+
+### [Low] [tests/unit/dashboard_api/test_get_my_profile.py:230] drift 検知が dashboard 側の固定化に留まっている
+- 区分: 残存
+- 問題: `test_profile_keys_are_stable` は `_PROFILE_KEYS` 自体の typo / 順序変更は検知できますが、[src/trigger/app.py:34](/workspaces/Catch-Expander/src/trigger/app.py:34) の `PROFILE_FIELDS` が変わった場合は dashboard test では検知できません。Pass 1 の「3 箇所分散 drift」への対策としては半分だけです。
+- 影響: trigger 側で 6 軸が追加・改名されても、dashboard API / frontend 表示が追随しないまま通る可能性があります。
+- 推奨修正: dashboard test から `src.trigger.app` を import しない判断は妥当です。代わりに trigger test suite 側へ対称テストを追加してください。
+
+```python
+def test_profile_fields_keys_are_stable(_env_vars):
+    from app import PROFILE_FIELDS
+
+    assert tuple(key for key, *_ in PROFILE_FIELDS) == (
+        "role",
+        "interests",
+        "expertise",
+        "learning_goals",
+        "background",
+        "output_preferences",
+    )
+```
+
+### [Info] [src/dashboard_api/get_my_profile/app.py:31] Slack user_id コメントは公式仕様としては少し強い
+- 区分: 新規
+- 問題: Slack 公式は user ID が `U` または `W` で始まることは明記していますが、文字集合を固定前提にしないよう案内しています。Slack changelog も “business logic shouldn’t contain assumptions about the specific characters composing an ID” としています。参考: Slack changelog「User ID format changes」および SCIM API reference。  
+  https://docs.slack.dev/changelog/2016/08/11/user-id-format-changes/  
+  https://docs.slack.dev/reference/scim-api/
+- 影響: 現在の実機 cookie 形式を前提にした防御としては許容範囲です。ただしコメントの「uppercase alphanumeric のみで hyphen を含まない仕様」は公式仕様断定としてはやや強いです。
+- 推奨修正: 必須ではありませんが、コメントを「現行の観測形式 / 保存キーとして許容する形式」に寄せるとよいです。長さ制約追加は推奨しません。Slack は ID 長や文字集合を固定契約として扱わないほうが安全です。
+
+## 前回指摘の解消状況
+- High #1 (`learned_preferences`): 解消 ✅  
+  [src/dashboard_api/get_my_profile/app.py:53](/workspaces/Catch-Expander/src/dashboard_api/get_my_profile/app.py:53) で dict / str / 混在 / 空 text / 想定外型を吸収し、[app.py:97](/workspaces/Catch-Expander/src/dashboard_api/get_my_profile/app.py:97) で API 出口のみ `string[]` 化。frontend の React child error は解消。内部の [src/agent/orchestrator.py:1265](/workspaces/Catch-Expander/src/agent/orchestrator.py:1265) は dict 直アクセスのままで境界も正しいです。
+- Low #1 (`user_sub` regex): 解消 ✅  
+  malformed sub を 401 に倒す修正は妥当です。`"U"` 単体が通る点は理論上ありますが、実 DDB key として存在しないため placeholder になるだけで、現実的な認証 bypass ではありません。長さ制約は Slack ID の将来変化に弱くなるため不要です。
+- Low #2 (drift 検知 案 C 採用): 部分解消 ⚠️ / 判断自体は妥当  
+  `trigger.app` 直 import を避ける判断は妥当です。top-level で `boto3.client/resource` と `ecs_client` が初期化されるため、dashboard test に副作用を持ち込まないほうがよいです。ただし案 C を完結させるには trigger 側の対称テストが必要です。
+
+## 補足評価
+- `created_at` / `replaces_index` を API で落とす情報損失: 現行 frontend contract が `string[]` なので妥当。将来表示するなら `learned_preferences_v2` 等で別 contract 化が自然です。
+- whitespace-only text のスキップ: 妥当。保存側も trim / empty 排除の意図があり、表示 API で空項目を出さないほうが安全です。
+- regex 失敗時の error message 共通化: 許容範囲。401 の利用者向けレスポンスで詳細分岐する必要は薄いです。
+- 6 軸本体の dict 混入リスク: 現状の主要書き込み経路は Slack Modal の string 保存なので H1 と同型の高リスクは見当たりません。
+
+## 結論
+- 収束判定: 収束 (新規 Critical/High ゼロ)
+- マージ可否: 可。Low の trigger 対称テストは後続または同 PR で追加推奨です。
+- 確認: `uv run pytest tests/unit/dashboard_api/test_get_my_profile.py -v` は 10 passed。
