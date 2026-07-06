@@ -106,6 +106,34 @@ class TestSlackClient:
         assert "好み2" in text
         assert "5 件" in text
 
+    def test_post_feedback_result_shows_scope_labels(self):
+        """20260706-preference-scope: 各好みにスコープラベル + 訂正案内行"""
+        client = self._make_client()
+        client.client = MagicMock()
+        prefs = [
+            {"text": "module分割する", "scope": {"categories": [], "deliverables": ["code"]}},
+            {"text": "出典を併記する", "scope": {"categories": ["時事"], "deliverables": ["research_report"]}},
+            {"text": "結論を先に書く", "scope": {"categories": [], "deliverables": []}},
+        ]
+
+        client.post_feedback_result("C1", "ts1", prefs, 3)
+
+        text = client.client.chat_postMessage.call_args[1]["text"]
+        assert "• [コード] module分割する" in text
+        assert "• [時事・調査レポート] 出典を併記する" in text
+        assert "• [汎用] 結論を先に書く" in text
+        assert "訂正できます" in text
+
+    def test_post_feedback_result_scope_missing_shows_general(self):
+        client = self._make_client()
+        client.client = MagicMock()
+        prefs = [{"text": "好み", "replaces_index": None}]
+
+        client.post_feedback_result("C1", "ts1", prefs, 1)
+
+        text = client.client.chat_postMessage.call_args[1]["text"]
+        assert "• [汎用] 好み" in text
+
     def test_post_feedback_unextracted(self):
         client = self._make_client()
         client.client = MagicMock()

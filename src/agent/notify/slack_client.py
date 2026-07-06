@@ -2,6 +2,7 @@ import contextlib
 import logging
 import time
 
+from feedback.scope import format_scope_label
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -119,11 +120,16 @@ class SlackClient:
         preferences: list[dict],
         total_count: int,
     ) -> None:
-        """フィードバック記録完了通知をスレッドに投稿"""
+        """フィードバック記録完了通知をスレッドに投稿
+
+        20260706-preference-scope: 各好みに適用スコープラベルを付ける。
+        スコープの訂正チャネルは F8 フィードバック自体（同スレッドへの返信）に一本化。
+        """
         lines = ["✅ フィードバックを記録しました。次回から以下の好みを反映します："]
         for p in preferences:
-            lines.append(f"• {p['text']}")
+            lines.append(f"• [{format_scope_label(p)}] {p['text']}")
         lines.append(f"（現在 {total_count} 件の好みが登録されています）")
+        lines.append("適用範囲が意図と違う場合は、このスレッドに返信すれば訂正できます。")
         self._post_with_retry(channel, thread_ts, "\n".join(lines))
 
     def post_feedback_unextracted(self, channel: str, thread_ts: str) -> None:

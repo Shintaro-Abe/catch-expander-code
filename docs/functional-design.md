@@ -133,7 +133,7 @@ erDiagram
         string[] expertise "専門領域"
         string[] interests "関心領域"
         string org_context "組織コンテキスト"
-        list learned_preferences "学習済み好み（最大10件）"
+        list learned_preferences "学習済み好み（最大20件、適用スコープ付き）"
         datetime created_at
         datetime updated_at
     }
@@ -840,13 +840,13 @@ sequenceDiagram
       ↓
 [Lambda] thread_ts で完了済み実行を特定 → ECS起動（TASK_TYPE=feedback）
       ↓
-[ECS / FeedbackProcessor] Claude がフィードバックを解析 → preferences 抽出
+[ECS / FeedbackProcessor] Claude がフィードバックを解析 → preferences 抽出 + 適用スコープ付与
       ↓
-[DynamoDB] user-profiles の learned_preferences を更新（最大10件）
+[DynamoDB] user-profiles の learned_preferences を更新（最大20件）
       ↓
-[Slack] 記録された好みの一覧を同スレッドに通知
+[Slack] 記録された好みの一覧をスコープラベル付きで同スレッドに通知
       ↓
-[次回トピック処理] オーケストレーターが learned_preferences を読んでプロンプトに反映
+[次回トピック処理] オーケストレーターが適用スコープで決定的フィルタし、関連する好みだけをプロンプトに注入
 ```
 
 ### フィードバック検出ロジック（Lambda）
@@ -864,10 +864,14 @@ sequenceDiagram
 
 ```
 src/agent/feedback/
-└── feedback_processor.py
-    ├── process()               # メインエントリーポイント
-    ├── _build_extraction_prompt()  # Claude への入力プロンプト構築
-    └── _merge_preferences()    # 好みリストのマージ（最大10件、古い順削除）
+├── feedback_processor.py
+│   ├── process()               # メインエントリーポイント
+│   ├── _build_extraction_prompt()  # Claude への入力プロンプト構築（スコープ出力を含む）
+│   └── _merge_preferences()    # 好みリストのマージ（最大20件、古い順削除）
+└── scope.py                    # 適用スコープの enum / 決定的フィルタ / バリデーション
+    ├── preference_applies()    # カテゴリ × 成果物区分の一致判定
+    ├── validate_scope()        # 抽出 LLM 出力の enum 検証 + 非対称フォールバック
+    └── format_scope_label()    # Slack / 抽出プロンプト用ラベル整形
 ```
 
 `FeedbackProcessor` は `call_claude` / `_parse_claude_response`（`orchestrator.py`）を再利用する。
@@ -879,28 +883,47 @@ src/agent/feedback/
 ```json
 "learned_preferences": [
   {
-    "text": "Terraformコードはmoduleを分割してディレクトリ構造で管理する",
-    "created_at": "2026-04-12T12:34:56.789Z"
+    "text": "コードはmoduleを分割してディレクトリ構造で管理する",
+    "created_at": "2026-04-12T12:34:56.789Z",
+    "scope": {
+      "categories": [],
+      "deliverables": ["code"]
+    }
   }
 ]
 ```
 
-- 最大10件。超過時は先頭（最古）から削除
+- **適用スコープ (`scope`)**: 好みがプロンプトに注入される条件（ADR 0002）
+  - `categories`: トピックカテゴリ 5 値のリスト（技術 / 時事 / ビジネス / 学術 / カルチャー）
+  - `deliverables`: 成果物区分 6 値のリスト（`code` / `research_report` / `architecture_design` / `comparison_table` / `cost_estimate` / `procedure_guide`）。`code` はフィルタ時に `iac_code` + `program_code` へ展開
+  - 両リスト空（または `scope` 欠損）= 汎用好み（全プロンプト注入対象）
+  - 抽出時に LLM が付与。enum 外の値は破棄し、検証失敗で次元が空になった場合は元実行の
+    category / deliverable_types に縮退する（迷ったら狭く）
+- 最大20件。超過時は先頭（最古）から削除
 - スキーマレスのため既存レコードへの影響なし（未存在フィールドは空リストとして扱う）
 
-### 生成プロンプトへの反映（Orchestrator）
+### 生成プロンプトへの反映（Orchestrator: 段階的絞り込み）
 
-`Orchestrator.run()` の `profile_text` 構築時に `learned_preferences` を末尾に追記する。
-この1ヶ所の変更でトピック解析・ワークフロー設計・生成の3プロンプトすべてに反映される。
+`Orchestrator.run()` は段階ごとに適用スコープの決定的フィルタを通した好みセクションを構築する
+（`profile_text` への全件一括埋め込みは 20260706-preference-scope で廃止。プロファイル JSON からも
+`learned_preferences` を除外し、フィルタの素通りを防ぐ）。
+
+| 段階 | 注入対象 | 文言 |
+|------|---------|------|
+| ① トピック解析 | 汎用のみ | 「必ず反映してください」 |
+| ② ワークフロー設計 | 汎用 + カテゴリ一致。成果物スコープ付きはラベル付き別小節 | 「反映してください」/ 成果物スコープ付きは「該当する成果物を選ぶ場合はこの好みを考慮してください」 |
+| ③ 生成（text / code とも） | カテゴリ + 成果物区分の完全フィルタ | 「必ず反映してください（[ ] は適用範囲）」 |
 
 ```
 ## ユーザーの蓄積された好み（学習済み）
-以下の好みを成果物の生成方針に必ず反映してください：
-- Terraformコードはmoduleを分割してディレクトリ構造で管理する
-- 説明は箇条書きで要点のみ、本文を長くしない
+以下の好みを成果物の生成方針に必ず反映してください（[ ] は適用範囲、汎用は全成果物対象）：
+- [コード] コードはmoduleを分割してディレクトリ構造で管理する
+- [汎用] 説明は箇条書きで要点のみ、本文を長くしない
 ```
 
-`learned_preferences` が空の場合はセクション自体を追記しない（既存動作を維持）。
+該当する好みが 0 件の段階ではセクション自体を追記しない（既存動作を維持）。
+スコープの訂正は F8 フィードバック（同スレッドへの返信）に一本化し、/profile 画面は read-only の
+スコープバッジ表示のみ。
 
 ## 7. F9 成果物履歴管理
 

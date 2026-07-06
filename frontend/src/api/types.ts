@@ -134,6 +134,17 @@ export interface AuthMeResponse {
   expires_at: number
 }
 
+// 20260706-preference-scope: 学習済み好みの適用スコープ。
+// 両リスト空 = 汎用（全プロンプト注入対象）。categories はトピックカテゴリ 5 値、
+// deliverables は成果物区分 6 値 (code は iac_code + program_code に展開される)。
+export interface LearnedPreference {
+  text: string
+  scope: {
+    categories: string[]
+    deliverables: string[]
+  }
+}
+
 // F6 User Profile 閲覧用: dashboard_api/get_my_profile が返す本人プロファイル。
 // 値が REMOVE 済 / 未設定の軸は null で返る。learned_preferences は要素なしなら空配列。
 export interface MyProfile {
@@ -144,7 +155,7 @@ export interface MyProfile {
   learning_goals: string | null
   background: string | null
   output_preferences: string | null
-  learned_preferences: string[]
+  learned_preferences: LearnedPreference[]
   updated_at: string | null
 }
 

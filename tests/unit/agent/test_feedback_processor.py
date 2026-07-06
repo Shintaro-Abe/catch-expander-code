@@ -32,8 +32,59 @@ class TestBuildExtractionPrompt:
         ]
         prompt = processor._build_extraction_prompt("topic", "cat", existing, "feedback")
 
-        assert "0: 箇条書きにする" in prompt
-        assert "1: コードを短くする" in prompt
+        # scope 未付与（移行前レコード）は [汎用] ラベルで提示される
+        assert "0: [汎用] 箇条書きにする" in prompt
+        assert "1: [汎用] コードを短くする" in prompt
+
+    def test_prompt_shows_scope_labels_for_existing_prefs(self):
+        processor = self._make_processor()
+        existing = [
+            {
+                "text": "module分割する",
+                "created_at": "2026-01-01T00:00:00Z",
+                "scope": {"categories": [], "deliverables": ["code"]},
+            },
+        ]
+        prompt = processor._build_extraction_prompt("topic", "cat", existing, "feedback")
+
+        assert "0: [コード] module分割する" in prompt
+
+    def test_prompt_contains_scope_instructions_and_enums(self):
+        processor = self._make_processor()
+        prompt = processor._build_extraction_prompt("t", "c", [], "f")
+
+        assert '"scope"' in prompt
+        assert "categories" in prompt
+        assert "deliverables" in prompt
+        # 両 enum の値が提示される
+        for cat in ["技術", "時事", "ビジネス", "学術", "カルチャー"]:
+            assert cat in prompt
+        for kind in [
+            "code",
+            "research_report",
+            "architecture_design",
+            "comparison_table",
+            "cost_estimate",
+            "procedure_guide",
+        ]:
+            assert kind in prompt
+        # 迷ったら狭くの指示
+        assert "狭く" in prompt
+
+    def test_prompt_shows_source_deliverables_as_scope_kinds(self):
+        processor = self._make_processor()
+        prompt = processor._build_extraction_prompt(
+            "t", "技術", [], "f", ["iac_code", "program_code", "research_report"]
+        )
+
+        # workflow 語彙は scope 区分の日本語ラベルに逆マップ（iac/program → コード に収束）
+        assert "生成した成果物: コード、調査レポート" in prompt
+
+    def test_prompt_shows_unknown_when_no_source_deliverables(self):
+        processor = self._make_processor()
+        prompt = processor._build_extraction_prompt("t", "c", [], "f")
+
+        assert "生成した成果物: 不明" in prompt
 
     def test_prompt_instructs_json_only_output(self):
         processor = self._make_processor()
@@ -133,6 +184,53 @@ class TestMergePreferences:
         result = processor._merge_preferences(existing, new_prefs)
 
         assert result[0]["created_at"] != old_ts
+
+    def test_replace_overwrites_scope(self):
+        """置換時は text だけでなく scope も新しい値で上書きされる（スコープ訂正の経路）"""
+        processor = self._make_processor()
+        existing = [
+            {
+                "text": "module分割する",
+                "created_at": "2026-01-01T00:00:00Z",
+                "scope": {"categories": ["技術"], "deliverables": ["code"]},
+            }
+        ]
+        new_prefs = [
+            {
+                "text": "module分割する",
+                "replaces_index": 0,
+                "scope": {"categories": [], "deliverables": ["code"]},
+            }
+        ]
+
+        result = processor._merge_preferences(existing, new_prefs)
+
+        assert len(result) == 1
+        assert result[0]["scope"] == {"categories": [], "deliverables": ["code"]}
+
+    def test_new_item_without_scope_gets_general_scope(self):
+        processor = self._make_processor()
+        result = processor._merge_preferences([], [{"text": "好み", "replaces_index": None}])
+
+        assert result[0]["scope"] == {"categories": [], "deliverables": []}
+
+    def test_default_max_items_is_twenty(self):
+        """20260706-preference-scope: 保存上限は 10 → 20（FIFO 維持）"""
+        processor = self._make_processor()
+        existing = [{"text": f"好み{i}", "created_at": "2026-01-01T00:00:00Z"} for i in range(20)]
+        new_prefs = [{"text": "21件目", "replaces_index": None}]
+
+        result = processor._merge_preferences(existing, new_prefs)
+
+        assert len(result) == 20
+        assert result[0]["text"] == "好み1"  # 最古が削除される
+        assert result[-1]["text"] == "21件目"
+
+    def test_non_string_text_is_skipped(self):
+        processor = self._make_processor()
+        result = processor._merge_preferences([], [{"text": None, "replaces_index": None}])
+
+        assert result == []
 
 
 class TestFeedbackProcessorProcess:
@@ -287,6 +385,122 @@ class TestFeedbackProcessorProcess:
         assert len(notified_prefs) == 3
 
 
+class TestProcessScopeValidation:
+    """process() での適用スコープ検証（design §3.4 非対称フォールバック）"""
+
+    def _make_processor(self, mock_slack=None, mock_db=None):
+        from feedback.feedback_processor import FeedbackProcessor
+
+        slack = mock_slack or MagicMock()
+        db = mock_db or MagicMock()
+        return FeedbackProcessor(slack_client=slack, db_client=db)
+
+    def _make_db(self):
+        mock_db = MagicMock()
+        mock_db.get_execution.return_value = {
+            "topic": "AIパイプライン構築",
+            "category": "技術",
+            "deliverable_types": ["research_report", "iac_code"],
+        }
+        mock_db.get_user_profile.return_value = None
+        return mock_db
+
+    @staticmethod
+    def _claude_response(preferences):
+        return json.dumps({"result": json.dumps({"preferences": preferences})})
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_valid_scope_is_saved(self, mock_call_claude):
+        mock_db = self._make_db()
+        mock_call_claude.return_value = self._claude_response(
+            [
+                {
+                    "text": "コードはmodule分割する",
+                    "scope": {"categories": [], "deliverables": ["code"]},
+                    "replaces_index": None,
+                }
+            ]
+        )
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "コードが良かった", "exec-001", "C1", "ts1")
+
+        saved = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+        assert saved[0]["scope"] == {"categories": [], "deliverables": ["code"]}
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_intentional_empty_scope_saved_as_general(self, mock_call_claude):
+        mock_db = self._make_db()
+        mock_call_claude.return_value = self._claude_response(
+            [
+                {
+                    "text": "結論を先に簡潔に書く",
+                    "scope": {"categories": [], "deliverables": []},
+                    "replaces_index": None,
+                }
+            ]
+        )
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "簡潔で良かった", "exec-001", "C1", "ts1")
+
+        saved = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+        assert saved[0]["scope"] == {"categories": [], "deliverables": []}
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_missing_scope_falls_back_to_source_execution(self, mock_call_claude):
+        """LLM が scope を出さなかった場合は元実行のカテゴリ・成果物区分に縮退（迷ったら狭く）"""
+        mock_db = self._make_db()
+        mock_call_claude.return_value = self._claude_response(
+            [{"text": "好み", "replaces_index": None}]
+        )
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "feedback", "exec-001", "C1", "ts1")
+
+        saved = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+        assert saved[0]["scope"]["categories"] == ["技術"]
+        assert saved[0]["scope"]["deliverables"] == ["code", "research_report"]
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_invalid_enum_values_fall_back_to_source(self, mock_call_claude):
+        mock_db = self._make_db()
+        mock_call_claude.return_value = self._claude_response(
+            [
+                {
+                    "text": "好み",
+                    "scope": {"categories": ["でたらめ"], "deliverables": ["iac_code"]},
+                    "replaces_index": None,
+                }
+            ]
+        )
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "feedback", "exec-001", "C1", "ts1")
+
+        saved = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+        assert saved[0]["scope"]["categories"] == ["技術"]
+        assert saved[0]["scope"]["deliverables"] == ["code", "research_report"]
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_non_dict_preference_entries_are_filtered(self, mock_call_claude):
+        mock_db = self._make_db()
+        mock_call_claude.return_value = self._claude_response(
+            [
+                "文字列ゴミ",
+                {"text": "有効な好み", "scope": {"categories": [], "deliverables": []}, "replaces_index": None},
+            ]
+        )
+
+        mock_slack = MagicMock()
+        processor = self._make_processor(mock_slack=mock_slack, mock_db=mock_db)
+        processor.process("U1", "feedback", "exec-001", "C1", "ts1")
+
+        saved = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+        assert len(saved) == 1
+        assert saved[0]["text"] == "有効な好み"
+
+
 class TestFeedbackReceivedEmit:
     """T1-2b (Tier 2.4): feedback_received イベントが Slack 応答後に emit される。"""
 
@@ -324,6 +538,9 @@ class TestFeedbackReceivedEmit:
         assert payload["new_preferences_count"] == 1
         assert payload["total_preferences_count"] == 1
         assert payload["reply_text_summary"] == "コードが良かった"
+        # 20260706-preference-scope: scope 欠損 → 元実行値に縮退するのでスコープ付き扱い
+        assert payload["new_general_count"] == 0
+        assert payload["new_scoped_count"] == 1
 
     @patch("feedback.feedback_processor._EventEmitter")
     @patch("feedback.feedback_processor.call_claude")

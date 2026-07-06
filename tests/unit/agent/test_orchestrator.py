@@ -1409,7 +1409,11 @@ class TestLearnedPreferencesInProfileText:
     """learned_preferences が profile_text に反映されるテスト"""
 
     def _make_minimal_responses(self):
-        """run() を最後まで通すための最小限の Claude 応答列"""
+        """run() を最後まで通すための最小限の Claude 応答列
+
+        20260706-preference-scope: reviewer は call_codex 経由のため review 応答は
+        ここに含めない (feedback_test_patches_call_codex_and_claude)。
+        """
         analysis = {"category": "技術", "intent": "学習", "perspectives": [], "deliverable_types": ["research_report"]}
         workflow = {
             "research_steps": [{"step_id": "r-1", "step_name": "概要", "description": "概要調査", "search_hints": []}],
@@ -1418,22 +1422,23 @@ class TestLearnedPreferencesInProfileText:
         }
         research = {"step_id": "r-1", "summary": "概要", "sources": []}
         deliverables = {"content_blocks": [], "code_files": None, "summary": "完成"}
-        review = {"passed": True, "issues": [], "quality_metadata": {}}
         return [
             json.dumps({"result": json.dumps(analysis)}),
             json.dumps({"result": json.dumps(workflow)}),
             json.dumps({"result": json.dumps(research)}),
             json.dumps({"result": json.dumps(deliverables)}),
-            json.dumps({"result": json.dumps(review)}),
         ]
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude")
-    def test_learned_preferences_included_in_prompts(self, mock_call_claude, _mock_load):
+    def test_learned_preferences_included_in_prompts(self, mock_call_claude, mock_call_codex, _mock_load, _mock_ws):
         """learned_preferences が1件以上ある場合、最初の call_claude 呼び出しに好みが含まれる"""
         from orchestrator import Orchestrator
 
         mock_call_claude.side_effect = self._make_minimal_responses()
+        mock_call_codex.return_value = json.dumps({"passed": True, "issues": [], "quality_metadata": {}})
 
         db = MagicMock()
         db.get_user_profile.return_value = {
@@ -1458,13 +1463,18 @@ class TestLearnedPreferencesInProfileText:
         assert "Terraformはmodule分割する" in first_prompt
         assert "蓄積された好み" in first_prompt
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude")
-    def test_empty_learned_preferences_not_included_in_prompts(self, mock_call_claude, _mock_load):
+    def test_empty_learned_preferences_not_included_in_prompts(
+        self, mock_call_claude, mock_call_codex, _mock_load, _mock_ws
+    ):
         """learned_preferences が空の場合、profile_text に好みセクションが含まれない"""
         from orchestrator import Orchestrator
 
         mock_call_claude.side_effect = self._make_minimal_responses()
+        mock_call_codex.return_value = json.dumps({"passed": True, "issues": [], "quality_metadata": {}})
 
         db = MagicMock()
         db.get_user_profile.return_value = {
@@ -1484,6 +1494,192 @@ class TestLearnedPreferencesInProfileText:
 
         first_prompt = mock_call_claude.call_args_list[0][0][0]
         assert "蓄積された好み" not in first_prompt
+
+
+class TestRenderPrefsSections:
+    """20260706-preference-scope: 段階的絞り込みの各レンダラー (design §3.1)"""
+
+    GENERAL = {"text": "結論を先に簡潔に書く", "created_at": "2026-01-01T00:00:00Z"}
+    CODE_SCOPED = {
+        "text": "コードはmodule分割する",
+        "created_at": "2026-01-01T00:00:00Z",
+        "scope": {"categories": [], "deliverables": ["code"]},
+    }
+    JIJI_SCOPED = {
+        "text": "複数の政治的立場の出典を併記する",
+        "created_at": "2026-01-01T00:00:00Z",
+        "scope": {"categories": ["時事"], "deliverables": []},
+    }
+
+    def test_analysis_includes_general_only(self):
+        from orchestrator import _render_prefs_for_analysis
+
+        section = _render_prefs_for_analysis([self.GENERAL, self.CODE_SCOPED, self.JIJI_SCOPED])
+        assert "結論を先に簡潔に書く" in section
+        assert "module分割" not in section
+        assert "政治的立場" not in section
+        assert "必ず反映" in section
+
+    def test_analysis_empty_when_no_general(self):
+        from orchestrator import _render_prefs_for_analysis
+
+        assert _render_prefs_for_analysis([self.CODE_SCOPED]) == ""
+
+    def test_workflow_splits_deliverable_scoped_into_soft_section(self):
+        from orchestrator import _render_prefs_for_workflow
+
+        section = _render_prefs_for_workflow([self.GENERAL, self.CODE_SCOPED, self.JIJI_SCOPED], "時事")
+        # 汎用 + カテゴリ一致は反映指示
+        assert "結論を先に簡潔に書く" in section
+        assert "政治的立場" in section
+        # 成果物スコープ付きはラベル + 緩和文言の別小節
+        assert "[コード] コードはmodule分割する" in section
+        assert "該当する成果物を選ぶ場合" in section
+
+    def test_workflow_drops_category_mismatch(self):
+        from orchestrator import _render_prefs_for_workflow
+
+        section = _render_prefs_for_workflow([self.JIJI_SCOPED], "技術")
+        assert section == ""
+
+    def test_workflow_unknown_category_falls_back_to_general_only(self):
+        from orchestrator import _render_prefs_for_workflow
+
+        section = _render_prefs_for_workflow([self.GENERAL, self.JIJI_SCOPED], "不明カテゴリ")
+        assert "結論を先に簡潔に書く" in section
+        assert "政治的立場" not in section
+
+    def test_generation_full_filter_excludes_code_scope_for_report(self):
+        """受け入れ条件 1: 時事 research_report の生成に code スコープ好みが混入しない"""
+        from orchestrator import _render_prefs_for_generation
+
+        section = _render_prefs_for_generation(
+            [self.GENERAL, self.CODE_SCOPED, self.JIJI_SCOPED], "時事", ["research_report"]
+        )
+        assert "module分割" not in section
+        # 汎用 + カテゴリ一致はラベル付きで注入され、強い命令を維持
+        assert "[汎用] 結論を先に簡潔に書く" in section
+        assert "[時事] 複数の政治的立場の出典を併記する" in section
+        assert "必ず反映" in section
+
+    def test_generation_code_scope_applies_to_both_code_types(self):
+        from orchestrator import _render_prefs_for_generation
+
+        for code_type in ("iac_code", "program_code"):
+            section = _render_prefs_for_generation([self.CODE_SCOPED], "技術", [code_type])
+            assert "[コード] コードはmodule分割する" in section
+
+    def test_generation_category_mismatch_drops_pref(self):
+        from orchestrator import _render_prefs_for_generation
+
+        section = _render_prefs_for_generation([self.JIJI_SCOPED], "技術", ["research_report"])
+        assert section == ""
+
+    def test_generation_empty_types_yields_general_nothing(self):
+        from orchestrator import _render_prefs_for_generation
+
+        assert _render_prefs_for_generation([self.GENERAL], "技術", []) == ""
+
+
+class TestProgressiveNarrowingInRun:
+    """run() 全体での段階的絞り込み配線テスト（受け入れ条件 1〜3）"""
+
+    def _make_responses(self, category="時事"):
+        analysis = {
+            "category": category,
+            "intent": "調査",
+            "perspectives": [],
+            "deliverable_types": ["research_report"],
+        }
+        workflow = {
+            "research_steps": [{"step_id": "r-1", "step_name": "概要", "description": "概要調査", "search_hints": []}],
+            "generate_steps": [{"step_id": "g-1", "step_name": "レポート", "deliverable_type": "research_report"}],
+            "storage_targets": ["notion"],
+        }
+        research = {"step_id": "r-1", "summary": "概要", "sources": []}
+        deliverables = {"content_blocks": [], "code_files": None, "summary": "完成"}
+        return [
+            json.dumps({"result": json.dumps(analysis)}),
+            json.dumps({"result": json.dumps(workflow)}),
+            json.dumps({"result": json.dumps(research)}),
+            json.dumps({"result": json.dumps(deliverables)}),
+        ]
+
+    def _run_orchestrator(self, mock_call_claude, mock_call_codex, prefs, category="時事"):
+        from orchestrator import Orchestrator
+
+        mock_call_claude.side_effect = self._make_responses(category)
+        # reviewer は call_codex（生 JSON）経由 (feedback_test_patches_call_codex_and_claude)
+        mock_call_codex.return_value = json.dumps({"passed": True, "issues": [], "quality_metadata": {}})
+        db = MagicMock()
+        db.get_user_profile.return_value = {
+            "user_id": "U1",
+            "role": "エンジニア",
+            "learned_preferences": prefs,
+        }
+        db._table.return_value = MagicMock()
+        slack = MagicMock()
+        orch = Orchestrator(slack, db, "token", "db_id", "gh_token", "owner/repo")
+        orch.notion = MagicMock()
+        orch.notion.create_page.return_value = ("https://notion.so/page", "page-id")
+        orch.github = MagicMock()
+        orch.run("exec-1", "U1", "国際情勢まとめ", "C1", "ts1")
+        return mock_call_claude.call_args_list
+
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_codex")
+    @patch("orchestrator.call_claude")
+    def test_code_scoped_pref_never_reaches_report_generation(  # gitleaks:allow (テスト名の "rt_generation" 部分文字列誤検知)
+        self, mock_call_claude, mock_call_codex, _mock_load, _mock_ws
+    ):
+        """本障害の再現テスト: code スコープ好みは時事レポートの ① と ③ に混入しない"""
+        prefs = [
+            {
+                "text": "コードはmodule分割する",
+                "created_at": "2026-01-01T00:00:00Z",
+                "scope": {"categories": [], "deliverables": ["code"]},
+            },
+            {"text": "結論を先に簡潔に書く", "created_at": "2026-01-01T00:00:00Z"},
+        ]
+        calls = self._run_orchestrator(mock_call_claude, mock_call_codex, prefs)
+
+        analysis_prompt = calls[0][0][0]
+        wf_prompt = calls[1][0][0]
+        gen_prompt = calls[3][0][0]
+
+        # ① 汎用のみ
+        assert "module分割" not in analysis_prompt
+        assert "結論を先に簡潔に書く" in analysis_prompt
+        # ② 成果物スコープ付きは緩和文言付きで提示（成果物選択の材料）
+        assert "module分割" in wf_prompt
+        assert "該当する成果物を選ぶ場合" in wf_prompt
+        # ③ 完全フィルタ: research_report 生成に code スコープは混入しない
+        assert "module分割" not in gen_prompt
+        assert "結論を先に簡潔に書く" in gen_prompt
+
+        # プロファイル JSON 経由の素通り（フィルタ無効化）が起きていないことを保証
+        assert "learned_preferences" not in gen_prompt
+
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
+    @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_codex")
+    @patch("orchestrator.call_claude")
+    def test_category_scoped_pref_in_matching_category_generation(
+        self, mock_call_claude, mock_call_codex, _mock_load, _mock_ws
+    ):
+        prefs = [
+            {
+                "text": "複数の政治的立場の出典を併記する",
+                "created_at": "2026-01-01T00:00:00Z",
+                "scope": {"categories": ["時事"], "deliverables": []},
+            },
+        ]
+        calls = self._run_orchestrator(mock_call_claude, mock_call_codex, prefs, category="時事")
+
+        assert "政治的立場" not in calls[0][0][0]  # ① カテゴリ未確定なので入らない
+        assert "政治的立場" in calls[1][0][0]  # ② カテゴリ一致
+        assert "政治的立場" in calls[3][0][0]  # ③ カテゴリ一致
 
 
 class TestPutDeliverableGitHubUrl:

@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query"
 import { Info } from "lucide-react"
 
 import { endpoints } from "@/api/endpoints"
-import type { MyProfile } from "@/api/types"
+import type { LearnedPreference, MyProfile } from "@/api/types"
 import { fmtRelative } from "@/lib/time"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -16,6 +16,42 @@ const AXIS_FIELDS: ReadonlyArray<{ key: keyof Omit<MyProfile, "user_id" | "learn
   { key: "background",          label: "背景・状況" },
   { key: "output_preferences",  label: "受け取り方の好み" },
 ]
+
+// 成果物区分 6 値の表示名 (backend feedback/scope.py:SCOPE_DELIVERABLE_LABELS_JA と整合)
+const SCOPE_DELIVERABLE_LABELS: Record<string, string> = {
+  code: "コード",
+  research_report: "調査レポート",
+  architecture_design: "アーキテクチャ設計書",
+  comparison_table: "比較表",
+  cost_estimate: "料金見積もり",
+  procedure_guide: "手順書",
+}
+
+function ScopeBadges({ scope }: { scope: LearnedPreference["scope"] }) {
+  const labels = [
+    ...scope.categories,
+    ...scope.deliverables.map((d) => SCOPE_DELIVERABLE_LABELS[d] ?? d),
+  ]
+  if (labels.length === 0) {
+    return (
+      <span className="inline-block px-1.5 py-0.5 mr-2 rounded text-xs bg-muted text-muted-foreground align-middle">
+        汎用
+      </span>
+    )
+  }
+  return (
+    <>
+      {labels.map((label) => (
+        <span
+          key={label}
+          className="inline-block px-1.5 py-0.5 mr-1 last:mr-2 rounded text-xs bg-primary/10 text-primary align-middle"
+        >
+          {label}
+        </span>
+      ))}
+    </>
+  )
+}
 
 function AxisRow({ label, value }: { label: string; value: string | null }) {
   return (
@@ -97,9 +133,12 @@ export function MyProfile() {
                   学習履歴はまだありません。フィードバックを送ると AI が自動で好みを学習します。
                 </div>
               ) : (
-                <ul className="space-y-2 list-disc list-inside text-sm">
+                <ul className="space-y-2 text-sm">
                   {q.data.learned_preferences.map((pref, i) => (
-                    <li key={i} className="text-foreground break-words">{pref}</li>
+                    <li key={i} className="text-foreground break-words">
+                      <ScopeBadges scope={pref.scope} />
+                      {pref.text}
+                    </li>
                   ))}
                 </ul>
               )}

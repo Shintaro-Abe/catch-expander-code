@@ -13,6 +13,24 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from feedback.scope import (
+    SCOPE_CATEGORIES as _SCOPE_CATEGORIES,
+)
+from feedback.scope import (
+    category_matches as _pref_category_matches,
+)
+from feedback.scope import (
+    format_scope_label as _format_scope_label,
+)
+from feedback.scope import (
+    has_deliverable_constraint as _pref_has_deliverable_constraint,
+)
+from feedback.scope import (
+    is_general as _pref_is_general,
+)
+from feedback.scope import (
+    preference_applies as _pref_applies,
+)
 from notify.slack_client import SlackClient
 from state.dynamodb_client import DynamoDbClient
 from storage.github_client import GitHubClient
@@ -1195,6 +1213,96 @@ def _build_code_generation_prompt(
     )
 
 
+# --- 20260706-preference-scope: 学習済み好みの段階的絞り込み (design §3.1, §3.2) ---
+# profile_text への全件一括埋め込みを廃止し、パイプライン各段階で適用スコープの
+# 決定的フィルタを通した好みだけを注入する。
+#   ① トピック解析     : 汎用のみ（カテゴリはこの呼び出しの出力なので判定不能）
+#   ② ワークフロー設計 : 汎用 + カテゴリ一致。成果物スコープ付きは別小節で緩和提示
+#   ③ 生成ステップ     : カテゴリ + 成果物区分の完全フィルタ（強い命令を維持）
+
+_PREFS_SECTION_HEADER = "## ユーザーの蓄積された好み（学習済み）"
+
+
+def _valid_scope_category(category: str | None) -> str | None:
+    """解析出力の category を検証。enum 外・欠損はカテゴリ不明 (None) として扱い、
+    カテゴリ制約付きの好みは保守的に落とす。"""
+    return category if category in _SCOPE_CATEGORIES else None
+
+
+def _render_prefs_for_analysis(learned_prefs: list) -> str:
+    """① トピック解析: 汎用好みのみ。"""
+    generals = [p for p in learned_prefs if _pref_is_general(p)]
+    if not generals:
+        return ""
+    lines = "\n".join(f"- {p['text']}" for p in generals)
+    return f"{_PREFS_SECTION_HEADER}\n以下の好みを成果物の生成方針に必ず反映してください：\n{lines}"
+
+
+def _render_prefs_for_workflow(learned_prefs: list, category: str | None) -> str:
+    """② ワークフロー設計: 汎用 + カテゴリ一致。
+
+    成果物区分の制約を持つ好みは、成果物タイプ選択の**前**なので確定フィルタできない。
+    「コスト見積もりを毎回付けて」のような好みが選択に効くよう、ラベル付き別小節で
+    緩和した文言と共に提示する（design §3.1 の鶏卵問題対応）。
+    """
+    cat = _valid_scope_category(category)
+    if cat is None:
+        return _render_prefs_for_analysis(learned_prefs)
+
+    matched = [p for p in learned_prefs if _pref_category_matches(p, cat)]
+    unconstrained = [p for p in matched if not _pref_has_deliverable_constraint(p)]
+    constrained = [p for p in matched if _pref_has_deliverable_constraint(p)]
+    if not matched:
+        return ""
+
+    parts = [_PREFS_SECTION_HEADER]
+    if unconstrained:
+        lines = "\n".join(f"- {p['text']}" for p in unconstrained)
+        parts.append(f"以下の好みを成果物の生成方針に反映してください：\n{lines}")
+    if constrained:
+        lines = "\n".join(f"- [{_format_scope_label(p)}] {p['text']}" for p in constrained)
+        parts.append(
+            "以下は特定の成果物に対する好みです。該当する成果物を選ぶ場合はこの好みを考慮してください：\n"
+            f"{lines}"
+        )
+    return "\n".join(parts)
+
+
+def _render_prefs_for_generation(
+    learned_prefs: list,
+    category: str | None,
+    deliverable_types: list,
+) -> str:
+    """③ 生成: カテゴリ + 成果物区分の完全フィルタ。
+
+    text generator は複数の text 成果物を 1 呼び出しで生成するため、対象
+    deliverable_types のいずれかに適用される好みを注入し、[ ] ラベルで
+    どの成果物への好みかを示す。code generator は単一タイプを渡す。
+    """
+    cat = _valid_scope_category(category)
+    types = [t for t in deliverable_types if t]
+    applicable = [
+        p
+        for p in learned_prefs
+        if types and any(_pref_applies(p, cat, t) for t in types)
+    ]
+    if not applicable:
+        return ""
+    lines = "\n".join(f"- [{_format_scope_label(p)}] {p['text']}" for p in applicable)
+    return (
+        f"{_PREFS_SECTION_HEADER}\n"
+        "以下の好みを成果物の生成方針に必ず反映してください（[ ] は適用範囲、汎用は全成果物対象）：\n"
+        f"{lines}"
+    )
+
+
+def _compose_profile_text(profile_text_base: str, prefs_section: str) -> str:
+    """プロファイル JSON と好みセクションを結合。該当好み 0 件ならセクションを出さない。"""
+    if not prefs_section:
+        return profile_text_base
+    return f"{profile_text_base}\n\n{prefs_section}"
+
+
 class Orchestrator:
     """マルチエージェントワークフローを制御するオーケストレーター"""
 
@@ -1258,27 +1366,31 @@ class Orchestrator:
 
         try:
             # 1. プロファイル取得
+            # 20260706-preference-scope: learned_preferences は段階別フィルタで注入する
+            # ため、プロファイル JSON からは除外する（含めると全件が全プロンプトに
+            # 素通りしてフィルタが無効化される）。
             profile = self.db.get_user_profile(user_id) or {}
-            profile_text_base = json.dumps(profile, ensure_ascii=False) if profile else "プロファイル未登録"
-            learned_prefs = profile.get("learned_preferences", [])
-            if learned_prefs:
-                prefs_lines = "\n".join(f"- {p['text']}" for p in learned_prefs)
-                profile_text = (
-                    f"{profile_text_base}\n\n"
-                    "## ユーザーの蓄積された好み（学習済み）\n"
-                    "以下の好みを成果物の生成方針に必ず反映してください：\n"
-                    f"{prefs_lines}"
-                )
-            else:
-                profile_text = profile_text_base
+            profile_for_json = {k: v for k, v in profile.items() if k != "learned_preferences"}
+            profile_text_base = (
+                json.dumps(profile_for_json, ensure_ascii=False) if profile_for_json else "プロファイル未登録"
+            )
+            raw_learned_prefs = profile.get("learned_preferences", []) or []
+            learned_prefs = [
+                p
+                for p in raw_learned_prefs
+                if isinstance(p, dict) and isinstance(p.get("text"), str) and p["text"]
+            ]
 
-            # 2. トピック解析
+            # 2. トピック解析（① 汎用好みのみ注入。カテゴリはこの呼び出しの出力）
+            profile_text_analysis = _compose_profile_text(
+                profile_text_base, _render_prefs_for_analysis(learned_prefs)
+            )
             orchestrator_prompt = _load_prompt("orchestrator")
             analysis_prompt = (
                 f"{orchestrator_prompt}\n\n"
                 f"## トピック解析を実行してください\n\n"
                 f"トピック: {topic}\n\n"
-                f"ユーザープロファイル:\n{profile_text}"
+                f"ユーザープロファイル:\n{profile_text_analysis}"
             )
             analysis_raw = call_claude(analysis_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             analysis = _parse_claude_response(analysis_raw)
@@ -1289,12 +1401,17 @@ class Orchestrator:
 
             self.db.update_execution_status(execution_id, "planning")
 
-            # 3. ワークフロー設計
+            # 3. ワークフロー設計（② 汎用 + カテゴリ一致。成果物スコープ付きは
+            # 成果物タイプ選択の材料としてラベル + 緩和文言で提示）
+            profile_text_workflow = _compose_profile_text(
+                profile_text_base,
+                _render_prefs_for_workflow(learned_prefs, analysis.get("category")),
+            )
             wf_prompt = (
                 f"{orchestrator_prompt}\n\n"
                 f"## ワークフロー設計を実行してください\n\n"
                 f"トピック解析結果:\n```json\n{json.dumps(analysis, ensure_ascii=False)}\n```\n\n"
-                f"ユーザープロファイル:\n{profile_text}"
+                f"ユーザープロファイル:\n{profile_text_workflow}"
             )
             wf_raw = call_claude(wf_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             workflow = _parse_claude_response(wf_raw)
@@ -1410,6 +1527,14 @@ class Orchestrator:
 
             generator_prompt = _load_prompt("generator")
             combined_research = json.dumps(research_results, ensure_ascii=False)
+            # ③ text generator はワークフロー計画中の text 成果物を 1 呼び出しで生成する
+            # ため、計画中の text タイプのいずれかに適用される好みを完全フィルタで注入
+            planned_types = [s.get("deliverable_type") for s in workflow.get("generate_steps", [])]
+            text_types = [t for t in planned_types if t and t not in ("iac_code", "program_code")]
+            profile_text_generation = _compose_profile_text(
+                profile_text_base,
+                _render_prefs_for_generation(learned_prefs, category, text_types),
+            )
             gen_prompt = (
                 f"{generator_prompt}\n\n"
                 f"## 成果物を生成してください\n\n"
@@ -1417,7 +1542,7 @@ class Orchestrator:
                 f"カテゴリ: {category}\n\n"
                 f"ワークフロー計画:\n```json\n{json.dumps(workflow, ensure_ascii=False)}\n```\n\n"
                 f"調査結果:\n```json\n{combined_research}\n```\n\n"
-                f"ユーザープロファイル:\n{profile_text}"
+                f"ユーザープロファイル:\n{profile_text_generation}"
             )
             generator_start_ns = time.monotonic_ns()
             # 2026-05-13 改修: text generator は workspace モードに移行 (LLM の Part 分割応答対策)。
@@ -1474,7 +1599,15 @@ class Orchestrator:
                         "Generating code files for type (workspace mode)",
                         extra={"execution_id": execution_id, "code_type": code_type},
                     )
-                    prompt = _build_code_generation_prompt(topic, category, research_results, profile_text, code_type)
+                    # ③ code generator は単一タイプずつ生成するため、その code_type に
+                    # 適用される好みだけを完全フィルタで注入する
+                    profile_text_code = _compose_profile_text(
+                        profile_text_base,
+                        _render_prefs_for_generation(learned_prefs, category, [code_type]),
+                    )
+                    prompt = _build_code_generation_prompt(
+                        topic, category, research_results, profile_text_code, code_type
+                    )
                     # T1-2 P2 対応: call_claude_with_workspace の retry exhaust で発生する
                     # CalledProcessError 等を捕捉し、subagent_failed をペアで emit してから再 raise する
                     # (既存挙動 = 上位 try でも捕捉されるが、subagent_started/failed 対応を維持するため明示)。

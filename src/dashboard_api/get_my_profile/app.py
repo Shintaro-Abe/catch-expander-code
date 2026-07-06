@@ -54,27 +54,64 @@ def _extract_slack_user_id(user_sub: str | None) -> str | None:
     return candidate
 
 
-def _serialize_learned_preferences(raw: object) -> list[str]:
-    """UserProfilesTable の learned_preferences を frontend 用 string[] に正規化する。
+# 好みスコープの成果物区分 6 値 (src/agent/feedback/scope.py:SCOPE_DELIVERABLES と整合)
+_SCOPE_DELIVERABLES = frozenset(
+    {
+        "code",
+        "research_report",
+        "architecture_design",
+        "comparison_table",
+        "cost_estimate",
+        "procedure_guide",
+    }
+)
+_SCOPE_CATEGORIES = frozenset({"技術", "時事", "ビジネス", "学術", "カルチャー"})
 
-    実保存形式は `{"text": str, "created_at": str}` の dict 配列 (feedback_processor.py:199)。
-    将来の互換性のため、文字列要素 / 旧形式 / 想定外型も吸収する:
-    - dict: "text" フィールドを抽出 (空文字や whitespace-only はスキップ)
-    - str: そのまま採用
+
+def _serialize_scope(raw: object) -> dict:
+    """learned_preferences 要素の scope を frontend 用に正規化する。
+
+    scope 欠損・型不正・enum 外の値は汎用側（空リスト）に倒す (read-only 表示用途のため、
+    書き込み側 feedback_processor の validate_scope のような縮退フォールバックは不要)。
+    """
+    if not isinstance(raw, dict):
+        return {"categories": [], "deliverables": []}
+    categories = raw.get("categories")
+    deliverables = raw.get("deliverables")
+    return {
+        "categories": [c for c in categories if isinstance(c, str) and c in _SCOPE_CATEGORIES]
+        if isinstance(categories, list)
+        else [],
+        "deliverables": [d for d in deliverables if isinstance(d, str) and d in _SCOPE_DELIVERABLES]
+        if isinstance(deliverables, list)
+        else [],
+    }
+
+
+def _serialize_learned_preferences(raw: object) -> list[dict]:
+    """UserProfilesTable の learned_preferences を frontend 用 `{text, scope}[]` に正規化する。
+
+    実保存形式は `{"text": str, "created_at": str, "scope": {...}}` の dict 配列
+    (feedback_processor.py / scope.py)。将来の互換性のため、文字列要素 / 旧形式
+    (scope なし) / 想定外型も吸収する:
+    - dict: "text" フィールドを抽出 (空文字や whitespace-only はスキップ)、scope を正規化
+    - str: text として採用、scope は汎用
     - その他: スキップ
     """
     if not isinstance(raw, list):
         return []
-    result: list[str] = []
+    result: list[dict] = []
     for pref in raw:
         if isinstance(pref, str):
             text: object = pref
+            scope = _serialize_scope(None)
         elif isinstance(pref, dict):
             text = pref.get("text")
+            scope = _serialize_scope(pref.get("scope"))
         else:
             continue
         if isinstance(text, str) and text.strip():
-            result.append(text)
+            result.append({"text": text, "scope": scope})
     return result
 
 

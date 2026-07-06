@@ -62,10 +62,15 @@ class TestGetMyProfile:
             "learning_goals": "副業案件獲得",
             "background": "30代後半 / 子育て中",
             "output_preferences": "箇条書き重視",
-            # 本番形式: feedback_processor.py:199 が書き込む {"text": str, "created_at": str} dict
+            # 本番形式: feedback_processor.py が書き込む {"text", "created_at", "scope"} dict
+            # (scope なしは 20260706-preference-scope 移行前の旧形式)
             "learned_preferences": [
                 {"text": "長めのサマリを好む", "created_at": "2026-05-10T00:00:00.000Z"},
-                {"text": "コード例を望む", "created_at": "2026-05-12T00:00:00.000Z"},
+                {
+                    "text": "コード例を望む",
+                    "created_at": "2026-05-12T00:00:00.000Z",
+                    "scope": {"categories": ["技術"], "deliverables": ["code"]},
+                },
             ],
             "updated_at": "2026-05-18T10:00:00.000Z",
         }
@@ -79,8 +84,11 @@ class TestGetMyProfile:
         assert body["user_id"] == _USER_SUB
         assert body["role"] == "クラウドエンジニア"
         assert body["background"] == "30代後半 / 子育て中"
-        # backend が dict 配列を string[] に正規化する (H1 対応)
-        assert body["learned_preferences"] == ["長めのサマリを好む", "コード例を望む"]
+        # backend が dict 配列を {text, scope}[] に正規化する (scope 欠損 = 汎用)
+        assert body["learned_preferences"] == [
+            {"text": "長めのサマリを好む", "scope": {"categories": [], "deliverables": []}},
+            {"text": "コード例を望む", "scope": {"categories": ["技術"], "deliverables": ["code"]}},
+        ]
         assert body["updated_at"] == "2026-05-18T10:00:00.000Z"
         # GetItem は本人 PK のみで呼ばれる
         table.get_item.assert_called_once_with(Key={"user_id": _USER_SUB})
@@ -202,26 +210,59 @@ class TestGetMyProfile:
     def test_serialize_learned_preferences_handles_mixed_input(self):
         from src.dashboard_api.get_my_profile.app import _serialize_learned_preferences
 
-        # 本番形式 (dict with text + created_at)
-        assert _serialize_learned_preferences([{"text": "好み A", "created_at": "2026-01-01T00:00:00Z"}]) == ["好み A"]
+        _general = {"categories": [], "deliverables": []}
+
+        # 本番形式 (dict with text + created_at + scope)
+        assert _serialize_learned_preferences(
+            [
+                {
+                    "text": "好み A",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "scope": {"categories": ["時事"], "deliverables": ["research_report"]},
+                }
+            ]
+        ) == [{"text": "好み A", "scope": {"categories": ["時事"], "deliverables": ["research_report"]}}]
+
+        # 移行前の旧形式 (scope なし) は汎用扱い
+        assert _serialize_learned_preferences([{"text": "好み B", "created_at": "2026-01-01T00:00:00Z"}]) == [
+            {"text": "好み B", "scope": _general}
+        ]
 
         # 旧データ互換 (素の文字列)
-        assert _serialize_learned_preferences(["legacy_pref"]) == ["legacy_pref"]
+        assert _serialize_learned_preferences(["legacy_pref"]) == [{"text": "legacy_pref", "scope": _general}]
 
         # 混在
-        assert _serialize_learned_preferences([{"text": "A"}, "B", {"text": "C", "created_at": "x"}]) == ["A", "B", "C"]
+        mixed = _serialize_learned_preferences([{"text": "A"}, "B", {"text": "C", "created_at": "x"}])
+        assert [p["text"] for p in mixed] == ["A", "B", "C"]
 
         # 空文字 / whitespace-only / None text はスキップ
         assert _serialize_learned_preferences([{"text": ""}, {"text": "   "}, {"text": None}, {}]) == []
 
         # 想定外型 (int / None / list of list 等) はスキップ
-        assert _serialize_learned_preferences([123, None, ["nested"], "valid"]) == ["valid"]
+        assert _serialize_learned_preferences([123, None, ["nested"], "valid"]) == [
+            {"text": "valid", "scope": _general}
+        ]
 
         # 非 list は空配列
         assert _serialize_learned_preferences(None) == []
         assert _serialize_learned_preferences("not-a-list") == []
         assert _serialize_learned_preferences({}) == []
         assert _serialize_learned_preferences(42) == []
+
+    def test_serialize_scope_drops_invalid_enum_values(self):
+        from src.dashboard_api.get_my_profile.app import _serialize_scope
+
+        # enum 外の値・型不正は表示側では汎用側に倒す（縮退フォールバックは書き込み側の責務）
+        assert _serialize_scope({"categories": ["技術", "でたらめ"], "deliverables": ["code", "iac_code"]}) == {
+            "categories": ["技術"],
+            "deliverables": ["code"],
+        }
+        assert _serialize_scope({"categories": "技術", "deliverables": None}) == {
+            "categories": [],
+            "deliverables": [],
+        }
+        assert _serialize_scope(None) == {"categories": [], "deliverables": []}
+        assert _serialize_scope("junk") == {"categories": [], "deliverables": []}
 
     # ------------------------------------------------------------------
     # drift 検知 (Codex L2: _PROFILE_KEYS の意図せぬ改変を防ぐ)

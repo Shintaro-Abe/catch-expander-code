@@ -66,3 +66,6 @@ aws-architecture.drawio
 
 # Claude Code MCP server config (environment-specific paths and personal MCP setup)
 .mcp.json
+
+# preference-scope 移行スクリプトの提案ファイル（個人の好みデータを含むため commit しない）
+scripts/.migration_proposal.json

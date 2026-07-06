@@ -68,8 +68,26 @@
 | 用語（日本語） | 用語（英語） | 定義 | コード上の命名 |
 |--------------|------------|------|--------------|
 | フィードバックプロセッサー | Feedback Processor | F8 フィードバック（Slack 絵文字反応 + メンション返信）を解析し、`learned_preferences` を更新するモジュール（`src/agent/feedback/`） | `feedback_processor` |
-| 学習済み好み | Learned Preferences | ユーザーの過去フィードバックから抽出された嗜好情報。次回の deliverables 生成時に prompt 経由で反映される | `learned_preferences` |
+| 学習済み好み | Learned Preferences | ユーザーの過去フィードバックから抽出された嗜好情報。適用スコープの決定的フィルタを通過したものだけが次回の deliverables 生成 prompt に注入される | `learned_preferences` |
 | 好み | Preference | ユーザーが特定のスタイル・形式・出典源等に対して持つ嗜好。F8 フィードバックを通じて学習対象になる | `preference` |
+| 適用スコープ | Preference Scope | 好みが prompt に注入される条件（トピックカテゴリ × 成果物区分の 2 次元）。抽出時に 1 回だけ LLM が付与し、適用時はコードが決定的にフィルタする（ADR 0002） | `scope` |
+| 汎用好み | General Preference | 適用スコープの両次元が空（または `scope` 欠損）の好み。全パイプライン段階の prompt に注入される（例:「結論を先に簡潔に書く」） | `is_general` |
+| 段階的絞り込み | Progressive Narrowing | パイプライン進行に応じてフィルタ条件が増える好みの適用方式。①トピック解析 = 汎用のみ / ②ワークフロー設計 = 汎用 + カテゴリ一致（成果物スコープ付きは緩和提示）/ ③生成 = カテゴリ + 成果物区分の完全フィルタ | `_render_prefs_for_*` |
+| 成果物区分 | Scope Deliverable Kind | 適用スコープの成果物次元の語彙（6 値: コード / 調査レポート / アーキテクチャ設計書 / 比較表 / 料金見積もり / 手順書）。ワークフロー内部の成果物タイプ（7 値）とは**別レイヤーの語彙** | `SCOPE_DELIVERABLES` |
+
+#### 成果物区分（6 値）と成果物タイプ（7 値）の対応
+
+好みスコープは「ユーザーの認識の語彙」、成果物タイプは「ワークフロー内部の実行語彙」。
+フィルタ時にコード側の展開マップ（`SCOPE_DELIVERABLE_EXPANSION`）で対応付ける。
+
+| 成果物区分（scope） | 成果物タイプ（deliverable_type） |
+|-------------------|--------------------------------|
+| `code`（コード） | `iac_code` + `program_code` |
+| `research_report` | `research_report` |
+| `architecture_design` | `architecture_design` |
+| `comparison_table` | `comparison_table` |
+| `cost_estimate` | `cost_estimate` |
+| `procedure_guide` | `procedure_guide` |
 
 ## 2. 成果物タイプ
 
