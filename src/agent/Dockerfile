@@ -3,12 +3,14 @@ FROM node:22-slim
 # 非rootユーザー作成
 RUN groupadd -r appuser && useradd -r -g appuser -m appuser
 
-# Claude Code CLI と Codex CLI のインストール
-# claude-code は claude-agent-sdk (requirements.txt に pin) が内部で subprocess 起動する CLI。
-# devcontainer で claude-code 2.1.207 + claude-agent-sdk 0.2.110 の組み合わせを検証済みのため両者を pin する (ADR 0001 / T1)。
-RUN npm install -g @anthropic-ai/claude-code@2.1.207 @openai/codex@0.125.0 \
-    && codex --version \
-    && claude --version
+# Codex CLI のインストール
+# Claude Code CLI は claude-agent-sdk (requirements.txt に pin) が wheel に同梱するものを
+# subprocess 起動するため、npm での別途インストールは不要 (T24)。
+# 同梱 CLI のバージョンは SDK pin (0.2.110 → CLI 2.1.191) に決定的に追従する。
+# ※ 旧記述「SDK は CLI を同梱せず PATH 上の claude を使う」は誤りで、npm pin の 2.1.207 は
+#   SDK 経由では一度も使われていなかった (exec-20260711154440-67fed1d5 調査で判明)。
+RUN npm install -g @openai/codex@0.125.0 \
+    && codex --version
 
 # Python（ラッパースクリプト用）と curl（レビュアープロンプトの出典URL検証用）
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip curl \

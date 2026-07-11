@@ -45,6 +45,20 @@
   - [ ] `api_call_completed` / `rate_limit_hit` イベントが events テーブルに従来契約で記録されることを確認
 - [x] T21: `docs/architecture.md` の CLI 記述を SDK 構成に整合更新（エージェント基盤表 / §4.5 出力フォーマット）、セッションハンドオフ memo 更新。※ Dockerfile の CLI インストール・Node.js ランタイム・認証記述は SDK 移行後も事実として正しいため温存
 
+## Phase 6: T20 E2E 失敗（exec-20260711154440-67fed1d5）の是正
+
+> **経緯**: 2026-07-11 15:44 UTC の実機 E2E で、リサーチ 5 本成功後に text generator が
+> 3 回連続即死 → `NonDictGeneratorResponse`。根本原因は `_query_claude_sync` が SDK ストリームを
+> 最後まで回すため、CLI が「is_error result → 意図的な非ゼロ終了」をした際に SDK のエラーフレームが
+> 素の `Exception` として raise され（SDK `query.py:852`）、捕捉済み ResultMessage を破棄すること。
+> これにより `_attempt_claude_query` の is_error 分岐（usage-limit 検出 / rate_limit_hit emit /
+> 型付きリトライ・advisor 経路）が実運用でデッドコード化していた（構造修正を選択、症状パッチは不採用）。
+
+- [x] T22: `_query_claude_sync` を「最初の ResultMessage で return」に変更（SDK `receive_response` と同セマンティクス）。ResultMessage 到達前にストリームが素の `Exception` を raise した場合は `ClaudeInvocationError` に正規化してリトライ経路に乗せる（`ClaudeSDKError` 系は従来どおり素通し — CLINotFoundError/CLIConnectionError の即時 fail と ProcessError の stderr 429 判定を温存）。P2-2 正規化分岐にも stderr 429 判定を追加（SDK reader が途中 ProcessError をエラーフレーム化するため）
+- [x] T23: 回帰テスト追加（`TestQueryClaudeSync` 6 件）— (1) is_error ResultMessage 後にエラーフレーム Exception が来ても ResultMessage が返る、(2) 本番障害の E2E 再現: usage limit が `rate_limited=True` に分類され advisor スキップ、(3) ResultMessage なしの素の Exception → 正規化、(4) CLINotFoundError 素通し、(5) 空ストリーム → ClaudeInvocationError、(6) エラーフレーム内 429 の rate limit 分類。**全 533 passed**、変更ファイルの新規 lint ゼロ（11 件は HEAD 比較で pre-existing と同一集合を確認）
+- [x] T24: Dockerfile から未使用の `@anthropic-ai/claude-code@2.1.207` を除去（本番ログ全呼び出しで SDK 同梱 CLI 2.1.191 使用を確認、PATH claude への依存コードなし）。Dockerfile コメント / architecture.md（基盤表・ランタイム表・Dockerfile 抜粋）を同梱 CLI 前提に訂正
+- [ ] T25: 品質ゲート — ruff / 全テスト green ✔ → secret scan → commit → push → Codex レビューゲート（承認制）→ 再デプロイ（ユーザー実行）→ E2E 再実行
+
 ## 完了条件
 
 requirements.md の受け入れ条件 1〜7 がすべて観測事実つきで verified になること。

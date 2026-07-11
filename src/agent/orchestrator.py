@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
+    ClaudeSDKError,
     CLIConnectionError,
     CLINotFoundError,
     ProcessError,
@@ -537,21 +538,38 @@ def _build_claude_options(
 
 
 def _query_claude_sync(prompt: str, options: ClaudeAgentOptions) -> ResultMessage:
-    """Agent SDK の query() を同期実行し、最終 ResultMessage を返す (同期ファサードの最下層)。
+    """Agent SDK の query() を同期実行し、最初の ResultMessage を返す (同期ファサードの最下層)。
 
     orchestrator は同期構造 + ThreadPoolExecutor 並列のため、呼び出しごとに独立の
     イベントループを asyncio.run で生成する。ユニットテストはこの関数を patch する。
+
+    ResultMessage 受信時点で即 return する (SDK `receive_response` と同セマンティクス)。
+    CLI は is_error=true の result を出した後に意図的に非ゼロ終了し、SDK はその終端を
+    素の ``Exception`` としてストリームに流すため (SDK query.py `receive_messages`)、
+    ストリームを最後まで回すと捕捉済みの ResultMessage が破棄され、is_error 分岐
+    (usage-limit 検出 / rate_limit_hit emit / 型付きリトライ) が全て素通しになる
+    (T22, exec-20260711154440-67fed1d5 の障害対応)。
+
+    ResultMessage 到達前にストリームが素の ``Exception`` を raise した場合 (SDK reader が
+    途中失敗をエラーフレームに変換したケース) は ``ClaudeInvocationError`` に正規化して
+    リトライ経路に乗せる。``ClaudeSDKError`` 系はそのまま伝播させ、上位の
+    CLINotFoundError / CLIConnectionError 即時 fail と ProcessError の stderr 429 判定を温存する。
     """
 
     async def _run() -> ResultMessage:
-        result: ResultMessage | None = None
-        async for message in _sdk_query(prompt=prompt, options=options):
-            if isinstance(message, ResultMessage):
-                result = message
-        if result is None:
-            msg = "no ResultMessage received from Agent SDK"
-            raise ClaudeInvocationError(msg)
-        return result
+        try:
+            async for message in _sdk_query(prompt=prompt, options=options):
+                if isinstance(message, ResultMessage):
+                    return message
+        except ClaudeSDKError:
+            raise
+        except Exception as e:
+            raise ClaudeInvocationError(
+                "agent sdk stream failed before ResultMessage",
+                stderr=str(e),
+            ) from e
+        msg = "no ResultMessage received from Agent SDK"
+        raise ClaudeInvocationError(msg)
 
     return asyncio.run(_run())
 
@@ -595,8 +613,23 @@ def _attempt_claude_query(
     except ClaudeInvocationError as e:
         # Codex Pass 1 P2-2: SDK ストリームが ResultMessage なしで終端するケース。
         # 旧実装では CLI の異常応答としてリトライ対象だったため、即時 abort ではなく
-        # 共通のリトライ経路 (_ClaudeAttemptFailure) に正規化する
-        raise _ClaudeAttemptFailure(str(e), rate_limited=False) from e
+        # 共通のリトライ経路 (_ClaudeAttemptFailure) に正規化する。
+        # T22 補強: SDK reader は途中の ProcessError もエラーフレーム化して素の Exception に
+        # するため、この経路にも stderr 429 判定を掛けて旧実装のレート制限分類を温存する
+        stderr_text = e.stderr or ""
+        rate_limited = _claude_stderr_indicates_rate_limit(stderr_text)
+        if rate_limited:
+            _emit_rate_limit_hit(
+                emitter,
+                subtype="anthropic_429",
+                endpoint_path=endpoint_path,
+                detail=f"stderr_snippet={stderr_text[:200]}",
+            )
+        raise _ClaudeAttemptFailure(
+            str(e),
+            rate_limited=rate_limited,
+            stderr=stderr_text,
+        ) from e
 
     if result_msg.is_error:
         result_text = result_msg.result or ""

@@ -203,6 +203,121 @@ class TestCallClaude:
         assert cost_acc["total_output_tokens"] == 50
 
 
+def _real_result_message(result_text: str, *, is_error: bool = False, subtype: str = "success"):
+    """isinstance(message, ResultMessage) を通す必要がある _sdk_query 層テスト用の本物の ResultMessage。
+
+    _query_claude_sync を patch する上位層テストは _fake_result_message (SimpleNamespace) で足りるが、
+    _query_claude_sync 自体のストリーム消費を検証するにはスタブでは通らない (T22)。
+    """
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(
+        subtype=subtype,
+        duration_ms=1000,
+        duration_api_ms=800,
+        is_error=is_error,
+        num_turns=1,
+        session_id="test-session",
+        result=result_text,
+        usage={"input_tokens": 10, "output_tokens": 5},
+    )
+
+
+def _fake_sdk_stream(messages, tail_exc=None):
+    """_sdk_query 互換のフェイク async generator を返す。
+
+    tail_exc は全 message を yield し切った後に raise する。実 SDK が
+    「is_error result → CLI の意図的な非ゼロ終了 → エラーフレームを素の Exception として
+    raise」する挙動 (SDK query.py receive_messages) を模す。ResultMessage で即 return
+    していれば tail_exc には到達しない。
+    """
+
+    async def _gen(*, prompt, options):
+        for m in messages:
+            yield m
+        if tail_exc is not None:
+            raise tail_exc
+
+    return _gen
+
+
+class TestQueryClaudeSync:
+    """_query_claude_sync のストリーム消費セマンティクスのテスト (T22)。
+
+    exec-20260711154440-67fed1d5 の障害対応: ストリームを最後まで回すと、is_error result 後の
+    意図的な非ゼロ終了 (エラーフレーム = 素の Exception) が捕捉済み ResultMessage を破棄し、
+    is_error 分岐 (usage-limit 検出 / 型付きリトライ) が全て素通しになっていた。
+    """
+
+    def test_returns_result_message_before_trailing_error_frame(self):
+        """is_error ResultMessage の後にエラーフレーム Exception が控えていても、
+        ResultMessage 受信時点で即 return し例外に到達しない。"""
+        from orchestrator import _build_claude_options, _query_claude_sync
+
+        msg = _real_result_message("Claude AI usage limit reached|1783785000", is_error=True)
+        stream = _fake_sdk_stream(
+            [msg], tail_exc=Exception("Claude Code returned an error result: success")
+        )
+        with patch("orchestrator._sdk_query", stream):
+            result = _query_claude_sync("prompt", _build_claude_options("sonnet", None, None))
+        assert result is msg
+
+    def test_stream_error_before_result_is_normalized(self):
+        """ResultMessage 到達前の素の Exception (エラーフレーム) は ClaudeInvocationError に
+        正規化され、リトライ共通経路に乗る。"""
+        from orchestrator import ClaudeInvocationError, _build_claude_options, _query_claude_sync
+
+        stream = _fake_sdk_stream([], tail_exc=Exception("Fatal error in message reader"))
+        with patch("orchestrator._sdk_query", stream), pytest.raises(ClaudeInvocationError) as excinfo:
+            _query_claude_sync("prompt", _build_claude_options("sonnet", None, None))
+        assert "Fatal error in message reader" in excinfo.value.stderr
+
+    def test_sdk_typed_errors_propagate_unwrapped(self):
+        """ClaudeSDKError 系 (CLINotFoundError 等) はラップせず素通しし、
+        上位の即時 fail / stderr 429 判定を温存する。"""
+        from claude_agent_sdk import CLINotFoundError
+        from orchestrator import _build_claude_options, _query_claude_sync
+
+        stream = _fake_sdk_stream([], tail_exc=CLINotFoundError("claude not found"))
+        with patch("orchestrator._sdk_query", stream), pytest.raises(CLINotFoundError):
+            _query_claude_sync("prompt", _build_claude_options("sonnet", None, None))
+
+    def test_stream_end_without_result_raises_invocation_error(self):
+        """正常終端で ResultMessage が 1 件もない場合は従来どおり ClaudeInvocationError。"""
+        from orchestrator import ClaudeInvocationError, _build_claude_options, _query_claude_sync
+
+        stream = _fake_sdk_stream([])
+        with patch("orchestrator._sdk_query", stream), pytest.raises(ClaudeInvocationError) as excinfo:
+            _query_claude_sync("prompt", _build_claude_options("sonnet", None, None))
+        assert "no ResultMessage" in str(excinfo.value)
+
+    @patch("orchestrator.time.sleep")
+    def test_call_claude_usage_limit_with_nonzero_exit_is_rate_limited(self, mock_sleep):
+        """本番障害の end-to-end 再現: usage limit の is_error result + 非ゼロ終了が
+        素の Exception ではなく rate_limited=True の ClaudeInvocationError に分類され、
+        advisor エスカレーションもしない。"""
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        msg = _real_result_message("Claude AI usage limit reached|1783785000", is_error=True)
+        stream = _fake_sdk_stream(
+            [msg], tail_exc=Exception("Claude Code returned an error result: success")
+        )
+        with patch("orchestrator._sdk_query", stream), pytest.raises(ClaudeInvocationError) as excinfo:
+            call_claude("prompt")
+        assert excinfo.value.rate_limited is True
+
+    @patch("orchestrator.time.sleep")
+    def test_call_claude_stream_429_error_frame_is_rate_limited(self, mock_sleep):
+        """途中失敗のエラーフレーム (SDK reader が ProcessError を変換したケース) でも
+        stderr 429 判定が効き rate_limited=True で失敗する (T22 補強)。"""
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        stream = _fake_sdk_stream([], tail_exc=Exception("API Error: 429 Too Many Requests"))
+        with patch("orchestrator._sdk_query", stream), pytest.raises(ClaudeInvocationError) as excinfo:
+            call_claude("prompt")
+        assert excinfo.value.rate_limited is True
+
+
 class TestNamespaceSourceIds:
     """_namespace_source_ids関数のテスト"""
 

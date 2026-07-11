@@ -18,7 +18,7 @@
 
 | 項目 | 技術 |
 |------|------|
-| エージェントフレームワーク | Claude Agent SDK（`claude-agent-sdk`、内部で Claude Code CLI を subprocess 起動） |
+| エージェントフレームワーク | Claude Agent SDK（`claude-agent-sdk`、wheel に同梱する Claude Code CLI を subprocess 起動。CLI バージョンは SDK pin に追従） |
 | LLMモデル | Claude Sonnet 4.6（通常ステップ）/ GPT-5.5 via Codex CLI（品質レビューのみ） |
 | LLMプラン | Maxプラン（月額固定） |
 | 認証 | MaxプランOAuth（Claude Code公式アプリケーション経由） |
@@ -40,7 +40,7 @@
 | コンポーネント | 言語 | ランタイム |
 |--------------|------|-----------|
 | Lambda（トリガー） | Python 3.13 | AWS Lambda |
-| ECSタスク（エージェント実行） | Node.js（Claude Code CLI） + Python（ラッパースクリプト） | ECS Fargate |
+| ECSタスク（エージェント実行） | Python（エージェントロジック + Claude Agent SDK 同梱 CLI） + Node.js（Codex CLI） | ECS Fargate |
 
 ### フロントエンド（ダッシュボード SPA）
 
@@ -164,8 +164,8 @@ FROM node:22-slim
 # 非rootユーザー作成
 RUN groupadd -r appuser && useradd -r -g appuser -m appuser
 
-# Claude Code CLI と Codex CLIのインストール
-RUN npm install -g @anthropic-ai/claude-code @openai/codex@0.125.0 \
+# Codex CLI のインストール（Claude Code CLI は claude-agent-sdk が wheel に同梱するものを使用）
+RUN npm install -g @openai/codex@0.125.0 \
     && codex --version
 
 # Python（ラッパースクリプト用）+ curl
