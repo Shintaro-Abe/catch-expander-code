@@ -22,6 +22,14 @@ paths = [
   '''(^|/)\.aws(/|$)''',
   '''(^|/)\.aws-sam(/|$)''',
   '''(^|/)\.audit(/|$)''',
+  # 2026-07-11 追加: gitignored な生成物 / ツールキャッシュ / worktree コピー
+  # (detect --no-git のワーキングツリー全体スキャンで拾われるため明示除外)
+  '''(^|/)\.ruff_cache(/|$)''',
+  '''(^|/)\.pytest_cache(/|$)''',
+  '''(^|/)\.claude/worktrees(/|$)''',
+  '''(^|/)graphify-out(/|$)''',
+  # fingerprint 行 (sha:path:rule:line) が電話番号ルールに誤マッチするため
+  '''\.gitleaksignore$''',
 ]
 
 # Python MagicMock の assert_* メソッド名が openai-oauth-refresh-token rule (`rt_*` 系)
@@ -45,7 +53,8 @@ tags = ["ip", "network"]
   description = "Allowlist test/example IPs and localhost references"
   regexes = [
     '''192\.168\.0\.[01](?:\b|$)''',      # ゲートウェイ例（ドキュメント等でよく使われる）
-    '''10\.0\.0\.[01](?:\b|$)''',
+    '''10\.0\.0\.[0-9](?:\b|$)''',        # テストフィクスチャの例示 IP（10.0.0.2 等）
+    '''10\.0\.[0-9]{1,3}\.0/''',          # IaC (template.yaml / 構成図) の意図的なサブネット CIDR
   ]
 
 # メールアドレス（個人情報）
@@ -83,6 +92,12 @@ tags = ["pii", "phone"]
   regexes = [
     # バージョン番号等の誤検知を減らす
     '''0\.[0-9]+\.[0-9]+''',
+    # hex カラーコード (#000000 等、drawio / CSS)
+    '''#[0-9a-fA-F]{6}''',
+    # 小数の端数 (AWS 単価 $0.0000133334 やコスト値 0.000100 等)
+    '''\.[0-9]{4,}''',
+    # Slack 系ダミー ID (U01234567 等)
+    '''U0[0-9A-Z]{6,}''',
   ]
 
 # AWS アクセスキー ID（デフォルトルールでもカバーされるが明示的に定義）
@@ -117,6 +132,9 @@ tags = ["openai", "oauth", "secret"]
   description = "Allowlist common non-token rt_ patterns"
   regexes = [
     '''(?i)rt_(?:timeout|error|success|limit|max|min|value|type|count|index)''',
+    # snake_case の識別子断片 (insert_rich_text_unchanged 等のテスト名 / メソッド名)。
+    # 実トークンはランダム base64url で英小文字のみの複数語構成にはならない
+    '''rt_[a-z]+(?:_[a-z]+){2,}''',
   ]
 
 # 汎用 API キー（変数名に api と key を含む代入パターン）
