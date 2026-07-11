@@ -24,8 +24,13 @@ class TestIsGeneral:
     def test_empty_lists_are_general(self):
         assert is_general(_pref(categories=[], deliverables=[]))
 
-    def test_scope_not_dict_is_general(self):
-        assert is_general({"text": "t", "scope": "技術"})
+    def test_scope_none_value_is_not_general(self):
+        """Codex Pass 2 P1: 明示 scope=None はキー欠損（移行前）と区別し、型破損 = 非適用に倒す"""
+        assert not is_general({"text": "t", "scope": None})
+
+    def test_scope_not_dict_is_not_general(self):
+        """Codex Pass 1 P1: 型破損スコープは汎用（過剰注入側）に倒さない"""
+        assert not is_general({"text": "t", "scope": "技術"})
 
     def test_category_scoped_is_not_general(self):
         assert not is_general(_pref(categories=["技術"]))
@@ -67,9 +72,24 @@ class TestPreferenceApplies:
         assert not preference_applies(pref, category="時事", deliverable_type="iac_code")
         assert not preference_applies(pref, category="技術", deliverable_type="research_report")
 
-    def test_scope_with_non_list_values_treated_as_general(self):
-        pref = {"text": "t", "scope": {"categories": "技術", "deliverables": None}}
-        assert preference_applies(pref, category="時事", deliverable_type="research_report")
+    def test_malformed_scope_never_applies(self):
+        """Codex Pass 1 P1 / Pass 2 P1・P2: 型破損スコープはどこにも注入しない"""
+        malformed = [
+            {"text": "t", "scope": "code"},  # 非 dict
+            {"text": "t", "scope": None},  # 明示 null（キー欠損と区別）
+            {"text": "t", "scope": {"categories": "技術", "deliverables": None}},  # 次元が非 list
+            {"text": "t", "scope": {}},  # キー欠損 dict
+            {"text": "t", "scope": {"categories": [123], "deliverables": []}},  # 要素が非 str
+            {"text": "t", "scope": {"categories": ["でたらめ"], "deliverables": []}},  # enum 外
+            {"text": "t", "scope": {"categories": [], "deliverables": ["iac_code"]}},  # workflow 語彙混入
+        ]
+        for pref in malformed:
+            assert not preference_applies(pref, category="時事", deliverable_type="research_report"), pref
+            assert not preference_applies(pref, category="技術", deliverable_type="iac_code"), pref
+            assert not preference_applies(pref), pref
+            assert not is_general(pref), pref
+            # ラベル整形も TypeError にならず「不明」を返す（Pass 2 P2 の実証ケース）
+            assert format_scope_label(pref) == "不明", pref
 
 
 class TestExpandScopeDeliverables:
@@ -164,3 +184,7 @@ class TestFormatScopeLabel:
     def test_combined(self):
         label = format_scope_label(_pref(categories=["時事"], deliverables=["research_report"]))
         assert label == "時事・調査レポート"
+
+    def test_malformed_scope_labeled_unknown(self):
+        assert format_scope_label({"text": "t", "scope": "code"}) == "不明"
+        assert format_scope_label({"text": "t", "scope": {"categories": "技術", "deliverables": None}}) == "不明"

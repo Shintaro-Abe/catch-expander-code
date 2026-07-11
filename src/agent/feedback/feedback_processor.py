@@ -58,8 +58,16 @@ class FeedbackProcessor:
                 source_deliverable_types = []
 
             # 2. ユーザープロファイル取得
+            # Codex Pass 1 P2 対応: DynamoDB 側に string 要素 / malformed dict が混じっても
+            # プロンプト構築・merge が落ちないよう、text を持つ dict だけに正規化する
+            # （LLM に見せる一覧と merge の replaces_index 対象を同一リストに保つ）
             profile = self.db.get_user_profile(user_id) or {}
-            existing_prefs: list[dict] = profile.get("learned_preferences", [])
+            raw_existing = profile.get("learned_preferences", []) or []
+            existing_prefs: list[dict] = [
+                p
+                for p in raw_existing
+                if isinstance(p, dict) and isinstance(p.get("text"), str) and p["text"].strip()
+            ]
 
             # T1-2b (Codex 2 回目 P2 対応): emitter を Claude / Slack 呼び出しの **前** に作成し、
             # それぞれの API call が api_call_completed として観測されるようにする。
@@ -258,7 +266,9 @@ class FeedbackProcessor:
                 "scope": pref.get("scope") or {"categories": [], "deliverables": []},
             }
 
-            if replaces_index is not None and 0 <= replaces_index < len(result):
+            # Codex Pass 1 P2 対応: LLM 出力由来のため int 以外 (str "0" / bool) は追加扱い
+            is_valid_index = isinstance(replaces_index, int) and not isinstance(replaces_index, bool)
+            if is_valid_index and 0 <= replaces_index < len(result):
                 result[replaces_index] = new_item
             else:
                 result.append(new_item)

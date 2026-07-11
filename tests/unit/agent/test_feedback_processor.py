@@ -232,6 +232,20 @@ class TestMergePreferences:
 
         assert result == []
 
+    def test_non_int_replaces_index_appends(self):
+        """Codex Pass 1 P2: LLM 出力由来の str / bool index は置換せず追加扱い"""
+        processor = self._make_processor()
+        existing = [
+            {"text": "既存0", "created_at": "2026-01-01T00:00:00Z"},
+            {"text": "既存1", "created_at": "2026-01-01T00:00:00Z"},
+        ]
+        for bad_index in ("0", "1", True, 1.0, [0]):
+            result = processor._merge_preferences(existing, [{"text": "追加", "replaces_index": bad_index}])
+            assert len(result) == 3, f"replaces_index={bad_index!r} で置換されてしまった"
+            assert result[0]["text"] == "既存0"
+            assert result[1]["text"] == "既存1"
+            assert result[2]["text"] == "追加"
+
 
 class TestFeedbackProcessorProcess:
     """FeedbackProcessor.process メソッドの統合テスト"""

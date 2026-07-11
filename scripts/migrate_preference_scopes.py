@@ -117,18 +117,27 @@ def _dry_run(table) -> None:
     proposal: dict = {}
     for profile in profiles:
         user_id = profile["user_id"]
-        prefs = [p for p in profile.get("learned_preferences", []) if isinstance(p, dict) and p.get("text")]
-        unscoped = [p for p in prefs if "scope" not in p]
+        prefs = profile.get("learned_preferences", [])
+        if not isinstance(prefs, list):
+            print(f"user {user_id}: learned_preferences が list でないためスキップ")
+            continue
+        # Codex Pass 1 P2 対応: 同一 text の duplicate があっても衝突しないよう、
+        # 保存配列内の絶対 index をキーにして提案する
+        unscoped = [
+            (i, p)
+            for i, p in enumerate(prefs)
+            if isinstance(p, dict) and isinstance(p.get("text"), str) and p["text"] and "scope" not in p
+        ]
         if not unscoped:
-            print(f"user {user_id}: scope 未付与の好みなし（{len(prefs)} 件すべて付与済み）")
+            print(f"user {user_id}: scope 未付与の好みなし（全 {len(prefs)} 件）")
             continue
         print(f"\nuser {user_id}: {len(unscoped)} / {len(prefs)} 件を分類します...")
-        scopes = _classify(unscoped)
+        scopes = _classify([p for _, p in unscoped])
         rows = []
-        for pref, scope in zip(unscoped, scopes, strict=True):
-            labeled = {"text": pref["text"], "scope": scope}
+        for (idx, pref), scope in zip(unscoped, scopes, strict=True):
+            labeled = {"index": idx, "text": pref["text"], "scope": scope}
             rows.append(labeled)
-            print(f"  [{format_scope_label(labeled)}] {pref['text']}")
+            print(f"  {idx}: [{format_scope_label(labeled)}] {pref['text']}")
         proposal[user_id] = rows
 
     if not proposal:
@@ -146,39 +155,62 @@ def _apply(table) -> None:
     proposal = json.loads(PROPOSAL_PATH.read_text(encoding="utf-8"))
 
     for user_id, rows in proposal.items():
+        # Codex Pass 2 P3 対応: proposal / DynamoDB 側のコンテナ型自体も明示検証し、
+        # AttributeError 等の分かりにくい落ち方をさせない
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            print(f"ERROR: proposal の user {user_id} エントリが list[dict] ではありません。中断します。")
+            sys.exit(1)
         resp = table.get_item(Key={"user_id": user_id})
         profile = resp.get("Item")
         if not profile:
             print(f"user {user_id}: プロファイルが見つかりません。スキップ。")
             continue
         prefs = profile.get("learned_preferences", [])
+        if not isinstance(prefs, list):
+            print(f"ERROR: user {user_id} の learned_preferences が list ではありません。中断します。")
+            sys.exit(1)
         print(f"\nuser {user_id}: 書き戻し前の learned_preferences（ロールバック用）:")
         print(json.dumps(prefs, ensure_ascii=False, indent=2, default=str))
 
-        scope_by_text = {}
+        # Codex Pass 1 P2/P3 対応: 手修正されうる proposal を index 単位で厳密検証し、
+        # 1 件でも突合できなければ put_item せずに中断する（部分適用を作らない）
+        validated: list[tuple[int, dict]] = []
         for row in rows:
+            idx = row.get("index")
             scope = row.get("scope")
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                print(f"ERROR: proposal の index が不正です: {row}")
+                sys.exit(1)
             if not isinstance(scope, dict):
                 print(f"ERROR: proposal の scope が不正です: {row}")
                 sys.exit(1)
-            invalid_cats = [c for c in scope.get("categories", []) if c not in SCOPE_CATEGORIES]
-            invalid_dels = [d for d in scope.get("deliverables", []) if d not in SCOPE_DELIVERABLES]
-            if invalid_cats or invalid_dels:
-                print(f"ERROR: enum 外の値が含まれています: {invalid_cats + invalid_dels} ({row['text']})")
+            categories = scope.get("categories")
+            deliverables = scope.get("deliverables")
+            if not isinstance(categories, list) or not isinstance(deliverables, list):
+                print(f"ERROR: categories / deliverables は list 必須です: {row}")
                 sys.exit(1)
-            scope_by_text[row["text"]] = {
-                "categories": list(scope.get("categories", [])),
-                "deliverables": list(scope.get("deliverables", [])),
-            }
+            invalid = [c for c in categories if not isinstance(c, str) or c not in SCOPE_CATEGORIES]
+            invalid += [d for d in deliverables if not isinstance(d, str) or d not in SCOPE_DELIVERABLES]
+            if invalid:
+                print(f"ERROR: enum 外の値が含まれています: {invalid} ({row.get('text')})")
+                sys.exit(1)
+            pref = prefs[idx] if 0 <= idx < len(prefs) else None
+            if not (isinstance(pref, dict) and "scope" not in pref and pref.get("text") == row.get("text")):
+                print(
+                    f"ERROR: index {idx} の現在値が proposal と一致しません"
+                    f"（dry-run 後にデータが変わった可能性）。中断します: {row}"
+                )
+                sys.exit(1)
+            validated.append((idx, {"categories": list(categories), "deliverables": list(deliverables)}))
 
-        updated = 0
-        for pref in prefs:
-            if isinstance(pref, dict) and "scope" not in pref and pref.get("text") in scope_by_text:
-                pref["scope"] = scope_by_text[pref["text"]]
-                updated += 1
+        for idx, scope in validated:
+            prefs[idx]["scope"] = scope
+        if len(validated) != len(rows):
+            print(f"ERROR: 適用件数不一致 ({len(validated)} != {len(rows)})。中断します。")
+            sys.exit(1)
         profile["learned_preferences"] = prefs
         table.put_item(Item=profile)
-        print(f"user {user_id}: {updated} 件に scope を付与して書き戻しました。")
+        print(f"user {user_id}: {len(validated)} 件に scope を付与して書き戻しました。")
 
 
 def main() -> None:

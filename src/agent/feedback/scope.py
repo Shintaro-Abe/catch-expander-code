@@ -48,28 +48,42 @@ WORKFLOW_TYPE_TO_SCOPE = {
 _EMPTY_SCOPE: dict = {"categories": [], "deliverables": []}
 
 
-def _scope_of(pref: dict) -> dict:
-    """pref から scope を防御的に取り出す。欠損 / 非 dict は汎用扱い。"""
-    scope = pref.get("scope")
-    if not isinstance(scope, dict):
+def _scope_of(pref: dict) -> dict | None:
+    """pref から scope を防御的に取り出す。
+
+    - `scope` **キー欠損**: 移行前レコードの後方互換として**汎用**扱い
+    - `scope` が None / 非 dict / 次元が非 list / 要素が非 str・enum 外（型破損）:
+      **None** を返す。呼び出し側はどのプロンプトにも注入しない
+      （Codex Pass 1 P1-2 / Pass 2 P1・P2: 型破損を汎用 = 過剰注入側に倒すと
+      本障害を再生産し、要素型を素通しするとラベル整形で TypeError になるため）
+    """
+    if "scope" not in pref:
         return _EMPTY_SCOPE
+    scope = pref["scope"]
+    if not isinstance(scope, dict):
+        return None
     categories = scope.get("categories")
     deliverables = scope.get("deliverables")
-    return {
-        "categories": categories if isinstance(categories, list) else [],
-        "deliverables": deliverables if isinstance(deliverables, list) else [],
-    }
+    if not isinstance(categories, list) or not isinstance(deliverables, list):
+        return None
+    if not all(isinstance(c, str) and c in SCOPE_CATEGORIES for c in categories):
+        return None
+    if not all(isinstance(d, str) and d in SCOPE_DELIVERABLES for d in deliverables):
+        return None
+    return {"categories": categories, "deliverables": deliverables}
 
 
 def is_general(pref: dict) -> bool:
-    """汎用好み（スコープ制約なし）か。"""
+    """汎用好み（スコープ制約なし）か。型破損スコープは汎用に含めない。"""
     scope = _scope_of(pref)
-    return not scope["categories"] and not scope["deliverables"]
+    return scope is not None and not scope["categories"] and not scope["deliverables"]
 
 
 def category_matches(pref: dict, category: str | None) -> bool:
     """カテゴリ次元のみの一致判定（②ワークフロー設計用: 成果物次元は無視する）。"""
     scope = _scope_of(pref)
+    if scope is None:
+        return False
     if not scope["categories"]:
         return True
     return category is not None and category in scope["categories"]
@@ -77,7 +91,8 @@ def category_matches(pref: dict, category: str | None) -> bool:
 
 def has_deliverable_constraint(pref: dict) -> bool:
     """成果物区分の制約を持つか（②で「該当成果物を選ぶ場合に考慮」小節へ分ける判定）。"""
-    return bool(_scope_of(pref)["deliverables"])
+    scope = _scope_of(pref)
+    return scope is not None and bool(scope["deliverables"])
 
 
 def expand_scope_deliverables(scope_deliverables: list) -> set[str]:
@@ -96,13 +111,15 @@ def preference_applies(
     """決定的フィルタ本体 (design §3.1)。
 
     - scope 欠損 / 両リスト空 → 常に True（汎用）
+    - scope が型破損（非 dict / 次元が非 list）→ 常に False（どこにも注入しない）
     - categories 非空: category が None または ∉ categories → False
     - deliverables 非空: deliverable_type が None または展開後集合に ∉ → False
     """
     scope = _scope_of(pref)
-    if scope["categories"]:
-        if category is None or category not in scope["categories"]:
-            return False
+    if scope is None:
+        return False
+    if scope["categories"] and (category is None or category not in scope["categories"]):
+        return False
     if scope["deliverables"]:
         if deliverable_type is None:
             return False
@@ -154,9 +171,11 @@ def validate_scope(
 def format_scope_label(pref: dict) -> str:
     """Slack 通知・抽出プロンプトの既存好み一覧で使うスコープラベル (design §3.5)。
 
-    両空 → "汎用"、それ以外 → カテゴリ + 成果物区分の日本語ラベルを「・」連結。
+    両空 → "汎用"、型破損 → "不明"、それ以外 → カテゴリ + 成果物区分の日本語ラベルを「・」連結。
     """
     scope = _scope_of(pref)
+    if scope is None:
+        return "不明"
     parts = list(scope["categories"])
     parts += [SCOPE_DELIVERABLE_LABELS_JA.get(d, d) for d in scope["deliverables"]]
     return "・".join(parts) if parts else "汎用"

@@ -1289,9 +1289,13 @@ def _render_prefs_for_generation(
     if not applicable:
         return ""
     lines = "\n".join(f"- [{_format_scope_label(p)}] {p['text']}" for p in applicable)
+    # Codex Pass 1 P2 対応: text generator は複数 text 成果物を 1 呼び出しで生成するため、
+    # union フィルタで入った scope 付き好みが別成果物に波及しないよう適用範囲を明示的に縛る
     return (
         f"{_PREFS_SECTION_HEADER}\n"
-        "以下の好みを成果物の生成方針に必ず反映してください（[ ] は適用範囲、汎用は全成果物対象）：\n"
+        "以下の好みを成果物の生成方針に必ず反映してください。\n"
+        "ただし [ ] 付きの好みはその適用範囲に該当する成果物にのみ反映し、"
+        "他の成果物には反映しないこと。[汎用] は全成果物が対象：\n"
         f"{lines}"
     )
 
