@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 import json
 import logging
@@ -13,6 +14,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    CLIConnectionError,
+    CLINotFoundError,
+    ProcessError,
+    ResultMessage,
+)
+from claude_agent_sdk import (
+    query as _sdk_query,
+)
 from feedback.scope import (
     SCOPE_CATEGORIES as _SCOPE_CATEGORIES,
 )
@@ -410,10 +421,10 @@ def _namespace_source_ids(result: dict, step_id: str) -> None:
 
 
 def _claude_stderr_indicates_rate_limit(stderr_text: str) -> bool:
-    """claude CLI の stderr に Anthropic rate limit を示唆する文字列が含まれるか判定する。
+    """claude CLI プロセスの stderr に Anthropic rate limit を示唆する文字列が含まれるか判定する。
 
-    CLI は HTTP status code を直接返さないため、文字列ベースの簡易判定。
-    完全網羅ではないが、`429` / `rate limit` / `rate_limit` のいずれかを含めば
+    Agent SDK の ProcessError.stderr に対して適用する。HTTP status code を直接取得できない
+    経路のための文字列ベース簡易判定。`429` / `rate limit` / `rate_limit` のいずれかを含めば
     rate_limit_hit として記録する。
     """
     if not stderr_text:
@@ -422,16 +433,31 @@ def _claude_stderr_indicates_rate_limit(stderr_text: str) -> bool:
     return "429" in lowered or "rate limit" in lowered or "rate_limit" in lowered
 
 
-def _accumulate_cost(raw_stdout: str, cost_acc: dict | None) -> dict[str, int] | None:
-    """CLI JSON 出力から cost と tokens を取得してアキュムレータに加算する。
+_USAGE_LIMIT_RESULT_PATTERNS = ("usage limit", "rate limit", "rate_limit", "429")
+
+
+def _result_indicates_usage_limit(result_text: str) -> bool:
+    """is_error な ResultMessage のテキストが使用上限 / レート上限を示唆するか判定する。
+
+    サブスクリプション認証では使用上限到達が CLI プロセスの異常終了ではなく
+    「正常終了 + is_error 応答テキスト」で返るケースがあり、旧 stderr スニッフィングでは
+    検出漏れだった (.steering/20260706-agent-sdk-migration/design.md)。
+    """
+    if not result_text:
+        return False
+    lowered = result_text.lower()
+    return any(p in lowered for p in _USAGE_LIMIT_RESULT_PATTERNS)
+
+
+def _accumulate_cost(result_msg: Any, cost_acc: dict | None) -> dict[str, int] | None:
+    """ResultMessage から cost と tokens を取得してアキュムレータに加算する。
 
     Returns:
-        {"input_tokens": int, "output_tokens": int, "total_tokens": int} or None on parse failure.
+        {"input_tokens": int, "output_tokens": int, "total_tokens": int} or None on failure.
     """
     try:
-        data = json.loads(raw_stdout)
-        cost = data.get("total_cost_usd") or 0.0
-        usage = data.get("usage") or {}
+        cost = result_msg.total_cost_usd or 0.0
+        usage = result_msg.usage or {}
         input_tokens = int(usage.get("input_tokens") or 0)
         output_tokens = int(usage.get("output_tokens") or 0)
         cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
@@ -447,6 +473,236 @@ def _accumulate_cost(raw_stdout: str, cost_acc: dict | None) -> dict[str, int] |
         return None
 
 
+class ClaudeInvocationError(RuntimeError):
+    """call_claude 系 wrapper 専用例外。
+
+    Agent SDK の例外 / is_error 応答をラップする。CodexInvocationError と同様に
+    str(e)[:500] スライスでも失敗原因 (stderr / result テキスト断片) が読めるよう
+    __str__ に detail を含める。main.py の Slack 失敗通知はこの型で分岐する。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int | None = None,
+        stderr: str | None = None,
+        rate_limited: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.stderr = stderr or ""
+        self.rate_limited = rate_limited
+
+    def __str__(self) -> str:
+        base = self.args[0] if self.args else "claude agent sdk call failed"
+        suffix = f" rc={self.exit_code}" if self.exit_code is not None else ""
+        tail = (self.stderr or "")[-500:]
+        return f"{base}{suffix}: {tail}" if tail else f"{base}{suffix}"
+
+
+class _ClaudeAttemptFailure(Exception):
+    """1 回の query 試行の失敗を正規化する内部例外 (リトライ判定用)。"""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        rate_limited: bool,
+        exit_code: int | None = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(detail)
+        self.rate_limited = rate_limited
+        self.exit_code = exit_code
+        self.stderr = stderr
+
+
+def _build_claude_options(
+    model: str,
+    allowed_tools: list[str] | None,
+    cwd: Path | None,
+) -> ClaudeAgentOptions:
+    """旧 CLI フラグと等価な ClaudeAgentOptions を構築する。
+
+    system_prompt: SDK デフォルトは空システムプロンプトのため、旧 `claude -p` と同じ
+    Claude Code プリセットを明示する (design.md のパリティ注意点)。
+    """
+    return ClaudeAgentOptions(
+        model=model,
+        allowed_tools=list(allowed_tools) if allowed_tools else [],
+        cwd=str(cwd) if cwd is not None else None,
+        system_prompt={"type": "preset", "preset": "claude_code"},
+    )
+
+
+def _query_claude_sync(prompt: str, options: ClaudeAgentOptions) -> ResultMessage:
+    """Agent SDK の query() を同期実行し、最終 ResultMessage を返す (同期ファサードの最下層)。
+
+    orchestrator は同期構造 + ThreadPoolExecutor 並列のため、呼び出しごとに独立の
+    イベントループを asyncio.run で生成する。ユニットテストはこの関数を patch する。
+    """
+
+    async def _run() -> ResultMessage:
+        result: ResultMessage | None = None
+        async for message in _sdk_query(prompt=prompt, options=options):
+            if isinstance(message, ResultMessage):
+                result = message
+        if result is None:
+            msg = "no ResultMessage received from Agent SDK"
+            raise ClaudeInvocationError(msg)
+        return result
+
+    return asyncio.run(_run())
+
+
+def _attempt_claude_query(
+    prompt: str,
+    *,
+    model: str,
+    allowed_tools: list[str] | None,
+    cwd: Path | None,
+    endpoint_path: str,
+    emitter: Any,
+) -> ResultMessage:
+    """1 回の query 試行。失敗は _ClaudeAttemptFailure に正規化する。
+
+    - ProcessError: CLI プロセス異常終了。stderr の 429 判定は旧実装を踏襲
+    - is_error ResultMessage: 実行内エラー。サブスク使用上限が正常応答テキストで
+      返るケースを rate_limit_hit (subtype=subscription_limit) として新規捕捉
+    - ClaudeInvocationError (ResultMessage なし終端): リトライ対象に正規化
+    - CLINotFoundError / CLIConnectionError はここでは捕捉せず上位で即時 fail させる
+    """
+    options = _build_claude_options(model, allowed_tools, cwd)
+    try:
+        result_msg = _query_claude_sync(prompt, options)
+    except ProcessError as e:
+        stderr_text = e.stderr or ""
+        rate_limited = _claude_stderr_indicates_rate_limit(stderr_text)
+        if rate_limited:
+            _emit_rate_limit_hit(
+                emitter,
+                subtype="anthropic_429",
+                endpoint_path=endpoint_path,
+                detail=f"stderr_snippet={stderr_text[:200]}",
+            )
+        raise _ClaudeAttemptFailure(
+            f"claude process failed: {stderr_text[:500]}",
+            rate_limited=rate_limited,
+            exit_code=e.exit_code,
+            stderr=stderr_text,
+        ) from e
+    except ClaudeInvocationError as e:
+        # Codex Pass 1 P2-2: SDK ストリームが ResultMessage なしで終端するケース。
+        # 旧実装では CLI の異常応答としてリトライ対象だったため、即時 abort ではなく
+        # 共通のリトライ経路 (_ClaudeAttemptFailure) に正規化する
+        raise _ClaudeAttemptFailure(str(e), rate_limited=False) from e
+
+    if result_msg.is_error:
+        result_text = result_msg.result or ""
+        rate_limited = _result_indicates_usage_limit(result_text)
+        if rate_limited:
+            _emit_rate_limit_hit(
+                emitter,
+                subtype="subscription_limit",
+                endpoint_path=endpoint_path,
+                detail=f"result_snippet={result_text[:200]}",
+            )
+        raise _ClaudeAttemptFailure(
+            f"claude returned error result (subtype={getattr(result_msg, 'subtype', '')}): {result_text[:500]}",
+            rate_limited=rate_limited,
+            stderr=result_text,
+        )
+
+    return result_msg
+
+
+def _run_claude_with_retries(
+    prompt: str,
+    *,
+    model: str,
+    allowed_tools: list[str] | None = None,
+    advisor_allowed_tools: list[str] | None = None,
+    cwd: Path | None = None,
+    endpoint_path: str,
+    context_label: str = "",
+    emitter: Any = None,
+) -> ResultMessage:
+    """リトライ + advisor エスカレーション付きの Agent SDK 呼び出しエンジン。
+
+    3 つの wrapper (call_claude / call_claude_with_workspace /
+    call_claude_with_text_workspace) が共有する。セマンティクスは旧 CLI subprocess
+    実装と同一 (.steering/20260706-agent-sdk-migration/requirements.md AC-3):
+      - 失敗を MAX_CLAUDE_RETRIES 回まで指数バックオフでリトライ
+      - model == "sonnet" が枯渇し、かつ最後の失敗が rate limit でなければ
+        CLAUDE_ADVISOR_MODEL を 1 回だけ試行
+      - CLINotFoundError / CLIConnectionError は環境異常のため即時 fail (リトライしない)
+    """
+    label = f" ({context_label})" if context_label else ""
+    last_failure: _ClaudeAttemptFailure | None = None
+    try:
+        for attempt in range(MAX_CLAUDE_RETRIES):
+            try:
+                return _attempt_claude_query(
+                    prompt,
+                    model=model,
+                    allowed_tools=allowed_tools,
+                    cwd=cwd,
+                    endpoint_path=endpoint_path,
+                    emitter=emitter,
+                )
+            except _ClaudeAttemptFailure as e:
+                last_failure = e
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "Claude Agent SDK error%s, retrying | rc=%s | detail=%s",
+                    label,
+                    e.exit_code,
+                    str(e)[:500],
+                    extra={"attempt": attempt + 1, "wait_seconds": wait},
+                )
+                time.sleep(wait)
+
+        # Sonnet がリトライを使い切った場合、Opus を advisor として1回試行する
+        if model == "sonnet" and last_failure is not None and not last_failure.rate_limited:
+            logger.warning(
+                "Sonnet retries exhausted%s, escalating to advisor model %s",
+                label,
+                CLAUDE_ADVISOR_MODEL,
+                extra={"original_error": str(last_failure)[:200]},
+            )
+            try:
+                return _attempt_claude_query(
+                    prompt,
+                    model=CLAUDE_ADVISOR_MODEL,
+                    allowed_tools=(advisor_allowed_tools if advisor_allowed_tools is not None else allowed_tools),
+                    cwd=cwd,
+                    endpoint_path=endpoint_path,
+                    emitter=emitter,
+                )
+            except _ClaudeAttemptFailure as e:
+                # Codex Pass 1 P2-1: advisor 側の失敗を握り潰すと最終例外の
+                # rate_limited / stderr が「最後の Sonnet 失敗」を指したままになり、
+                # main.py の Slack 通知分類（例: advisor だけ usage limit）が誤る
+                last_failure = e
+    except (CLINotFoundError, CLIConnectionError) as e:
+        # CLI 不在 / 起動不能はリトライで解消しない環境異常。即時 fail する。
+        raise ClaudeInvocationError(
+            f"claude agent sdk connection failed: {type(e).__name__}",
+            stderr=str(e),
+        ) from e
+
+    if last_failure is not None:
+        raise ClaudeInvocationError(
+            "claude agent sdk call failed after retries",
+            exit_code=last_failure.exit_code,
+            stderr=last_failure.stderr,
+            rate_limited=last_failure.rate_limited,
+        ) from last_failure
+    msg = "Unexpected: no error and no response"
+    raise RuntimeError(msg)
+
+
 def call_claude(
     prompt: str,
     allowed_tools: list[str] | None = None,
@@ -455,84 +711,47 @@ def call_claude(
     emitter: Any = None,
     cost_acc: dict | None = None,
 ) -> str:
-    """Claude Code CLIを呼び出し、結果を返す（リトライ付き）
+    """Agent SDK 経由で Claude を呼び出し、最終応答テキストを返す（リトライ付き）
+
+    2026-07-06 Agent SDK 移行 (.steering/20260706-agent-sdk-migration):
+    旧実装は `claude -p --output-format json` subprocess の stdout (envelope JSON) を
+    そのまま返していた。本実装は ResultMessage.result のテキストを返す契約に変更。
+    呼び出し側の JSON 抽出は _parse_claude_response のフェンス抽出のみが残る。
 
     Args:
-        prompt: CLIに渡すプロンプト
+        prompt: モデルに渡すプロンプト
         allowed_tools: 許可するツールのリスト
         model: 使用するモデル名（デフォルト: sonnet）
         emitter: T1-2b で追加。Orchestrator から伝搬された EventEmitter。
             None なら observability emit は no-op (既存テスト互換性のためデフォルト None)。
 
     Returns:
-        CLIのstdout出力（JSON文字列）
-    """
-    cmd = ["claude", "-p", "-", "--model", model, "--output-format", "json"]
-    if allowed_tools:
-        cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+        最終応答テキスト (ResultMessage.result)
 
-    # T1-2b (Codex 2 回目 P2 対応): claude CLI は subprocess なので HTTP status を取得できない。
-    # exit code 0 = success、非 0 = failure として扱い、subtype="anthropic" で emit する。
-    # rate limit は stderr の文字列マッチで簡易判定する (完全網羅ではないが第一歩)。
+    Raises:
+        ClaudeInvocationError: リトライ + advisor エスカレーション枯渇後の失敗
+    """
     start_ns = time.monotonic_ns()
     success = False
     final_status: int | None = None
+    # endpoint_path は events テーブル / dashboard 集計のキーのため旧形式を維持する
     endpoint_path = f"/claude/cli?model={model}"
     call_toks: list[dict[str, int] | None] = [None]  # finally ブロックとトークン情報を共有
     try:
-        last_error: subprocess.CalledProcessError | None = None
-        for attempt in range(MAX_CLAUDE_RETRIES):
-            try:
-                result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
-                success = True
-                final_status = result.returncode
-                call_toks[0] = _accumulate_cost(result.stdout, cost_acc)
-                return result.stdout
-            except subprocess.CalledProcessError as e:
-                last_error = e
-                final_status = e.returncode
-                wait = 2 ** (attempt + 1)
-                stderr_snippet = e.stderr[:500] if e.stderr else ""
-                stdout_snippet = e.stdout[:500] if e.stdout else ""
-                if _claude_stderr_indicates_rate_limit(e.stderr or ""):
-                    _emit_rate_limit_hit(
-                        emitter,
-                        subtype="anthropic_429",
-                        endpoint_path=endpoint_path,
-                        detail=f"stderr_snippet={stderr_snippet[:200]}",
-                    )
-                logger.warning(
-                    "Claude CLI error, retrying | rc=%s | stderr=%s | stdout=%s",
-                    e.returncode,
-                    stderr_snippet,
-                    stdout_snippet,
-                    extra={"attempt": attempt + 1, "wait_seconds": wait},
-                )
-                time.sleep(wait)
-
-        # Sonnet がリトライを使い切った場合、Opus 4.7 を advisor として1回試行する
-        if last_error and model == "sonnet" and not _claude_stderr_indicates_rate_limit(last_error.stderr or ""):
-            advisor_cmd = ["claude", "-p", "-", "--model", CLAUDE_ADVISOR_MODEL, "--output-format", "json"]
-            if allowed_tools:
-                advisor_cmd.extend(["--allowedTools", ",".join(allowed_tools)])
-            logger.warning(
-                "Sonnet retries exhausted, escalating to advisor model %s",
-                CLAUDE_ADVISOR_MODEL,
-                extra={"original_error": str(last_error)[:200]},
-            )
-            try:
-                result = subprocess.run(advisor_cmd, input=prompt, capture_output=True, text=True, check=True)  # noqa: S603
-                success = True
-                final_status = result.returncode
-                call_toks[0] = _accumulate_cost(result.stdout, cost_acc)
-                return result.stdout
-            except subprocess.CalledProcessError:
-                pass
-
-        if last_error:
-            raise last_error
-        msg = "Unexpected: no error and no response"
-        raise RuntimeError(msg)
+        result_msg = _run_claude_with_retries(
+            prompt,
+            model=model,
+            allowed_tools=allowed_tools,
+            endpoint_path=endpoint_path,
+            emitter=emitter,
+        )
+        success = True
+        final_status = 0
+        call_toks[0] = _accumulate_cost(result_msg, cost_acc)
+        return result_msg.result or ""
+    except ClaudeInvocationError as e:
+        final_status = e.exit_code
+        raise
     finally:
         duration_ms = (time.monotonic_ns() - start_ns) // 1_000_000
         tok = call_toks[0] or {}
@@ -549,31 +768,40 @@ def call_claude(
         )
 
 
-def _parse_claude_response(raw: str) -> dict:
-    """Claude CLIのJSON応答をパースする"""
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = {"raw_text": raw}
+class ClaudeResponseParseError(ValueError):
+    """LLM 応答テキストから JSON dict を抽出できなかったことを示す例外。
 
-    # --output-format json の場合、result フィールドに応答本文が入る
-    if isinstance(data, dict) and "result" in data:
-        text = data["result"]
-    elif isinstance(data, dict) and "content" in data:
-        text = data["content"]
-    else:
-        text = raw
+    2026-07-06 Agent SDK 移行で導入した _parse_claude_response の厳密契約:
+    「dict を返すか本例外を投げる」。旧実装は失敗時に {"raw_text": ..., "parse_error": True}
+    や JSON array/scalar を黙って返し、6 call sites 中 5 つで型契約違反バグを生んだ
+    (.steering/20260512-parse-claude-response-dict-contract の対症療法を構造修正に昇格)。
+    """
 
+    def __init__(self, message: str, *, text_preview: str = "") -> None:
+        super().__init__(message)
+        self.text_preview = text_preview
+
+
+def _parse_claude_response(text: str) -> dict:
+    """LLM 応答テキストから JSON dict を抽出する。
+
+    契約: dict を返すか ClaudeResponseParseError を送出する。それ以外の型を返す経路はない。
+
+    旧実装にあった envelope パース (CLI stdout JSON の result / content キー取り出し) は
+    Agent SDK 移行で消滅した。researcher / reviewer プロンプトは ```json フェンス必須指示
+    のため、フェンス抽出系の戦略は残る (docs/glossary.md「フェンス抽出」)。
+    call_codex (reviewer) の生テキスト応答にも同じ戦略が適用される。
+    """
     if not isinstance(text, str):
-        return text
-
-    # 応答テキストからJSONブロックを抽出（複数の戦略で試行）
+        raise ClaudeResponseParseError(f"expected str response text, got {type(text).__name__}")
 
     # 戦略1: ```json コードブロックから抽出
     if "```json" in text:
         candidate = text.split("```json", 1)[1].split("```", 1)[0].strip()
         try:
-            return json.loads(candidate)
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             pass
 
@@ -581,13 +809,17 @@ def _parse_claude_response(raw: str) -> dict:
     if "```" in text:
         candidate = text.split("```", 1)[1].split("```", 1)[0].strip()
         try:
-            return json.loads(candidate)
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             pass
 
     # 戦略3: テキスト全体を直接JSONパース
     try:
-        return json.loads(text.strip())
+        obj = json.loads(text.strip())
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
         pass
 
@@ -605,10 +837,10 @@ def _parse_claude_response(raw: str) -> dict:
                 continue
 
     logger.warning(
-        "Failed to parse Claude response as JSON, returning as text",
+        "Failed to parse LLM response as JSON dict",
         extra={"text_preview": text[:300]},
     )
-    return {"raw_text": text, "parse_error": True}
+    raise ClaudeResponseParseError("no JSON dict found in LLM response", text_preview=text[:300])
 
 
 _CODE_TYPE_LABELS = {
@@ -760,7 +992,7 @@ def call_claude_with_workspace(
     emitter: Any = None,
     cost_acc: dict | None = None,
 ) -> tuple[str, dict[str, str], dict]:
-    """Claude CLI に Write ツールを許可して sandbox にファイルを書かせ、収集結果を返す。
+    """Agent SDK に Write ツールを許可して sandbox にファイルを書かせ、収集結果を返す。
 
     旧 JSON 文字列値方式（call_claude + _parse_claude_response）が大規模コードの
     エスケープミスで失敗するため、コード成果物はこの経路を使う。
@@ -774,94 +1006,31 @@ def call_claude_with_workspace(
         (raw_stdout, files, outcome)
     """
     sandbox = Path(tempfile.mkdtemp(prefix=f"agent-output-{code_type}-"))
-    # T1-2b (Codex 2 回目 P2 対応): workspace 経由の claude CLI も api_call_completed で観測する。
+    # T1-2b (Codex 2 回目 P2 対応): workspace 経由の Claude 呼び出しも api_call_completed で観測する。
     api_start_ns = time.monotonic_ns()
     api_success = False
     api_final_status: int | None = None
     endpoint_path = f"/claude/cli?model={model}&mode=workspace&code_type={code_type}"
     ws_call_toks: list[dict[str, int] | None] = [None]  # finally ブロックとトークン情報を共有
     try:
-        cmd = [
-            "claude",
-            "-p",
-            "-",
-            "--model",
-            model,
-            "--allowedTools",
-            "Write,Edit",
-            "--output-format",
-            "json",
-        ]
-        last_error: subprocess.CalledProcessError | None = None
-        raw_stdout = ""
-        for attempt in range(MAX_CLAUDE_RETRIES):
-            try:
-                result = subprocess.run(  # noqa: S603
-                    cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    cwd=str(sandbox),
-                )
-                raw_stdout = result.stdout
-                api_success = True
-                api_final_status = result.returncode
-                ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
-                break
-            except subprocess.CalledProcessError as e:
-                last_error = e
-                api_final_status = e.returncode
-                wait = 2 ** (attempt + 1)
-                if _claude_stderr_indicates_rate_limit(e.stderr or ""):
-                    _emit_rate_limit_hit(
-                        emitter,
-                        subtype="anthropic_429",
-                        endpoint_path=endpoint_path,
-                        detail=f"stderr_snippet={(e.stderr or '')[:200]}",
-                    )
-                logger.warning(
-                    "Claude CLI error (workspace mode), retrying | rc=%s | stderr=%s",
-                    e.returncode,
-                    (e.stderr or "")[:500],
-                    extra={"attempt": attempt + 1, "wait_seconds": wait, "code_type": code_type},
-                )
-                time.sleep(wait)
-        else:
-            # Sonnet がリトライを使い切った場合、Opus 4.7 を advisor として1回試行する
-            if last_error and model == "sonnet" and not _claude_stderr_indicates_rate_limit(last_error.stderr or ""):
-                advisor_cmd = [
-                    "claude", "-p", "-",
-                    "--model", CLAUDE_ADVISOR_MODEL,
-                    "--output-format", "json",
-                    "--allowedTools", "Write,Edit,Read",
-                ]
-                logger.warning(
-                    "Sonnet retries exhausted (workspace mode), escalating to advisor model %s",
-                    CLAUDE_ADVISOR_MODEL,
-                    extra={"original_error": str(last_error)[:200]},
-                )
-                try:
-                    result = subprocess.run(  # noqa: S603
-                        advisor_cmd,
-                        input=prompt,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        cwd=str(sandbox),
-                    )
-                    raw_stdout = result.stdout
-                    api_success = True
-                    api_final_status = result.returncode
-                    ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
-                except subprocess.CalledProcessError:
-                    pass
-
-            if not api_success:
-                if last_error:
-                    raise last_error
-                msg = "Unexpected: no error and no response (workspace mode)"
-                raise RuntimeError(msg)
+        try:
+            result_msg = _run_claude_with_retries(
+                prompt,
+                model=model,
+                allowed_tools=["Write", "Edit"],
+                advisor_allowed_tools=["Write", "Edit", "Read"],
+                cwd=sandbox,
+                endpoint_path=endpoint_path,
+                context_label=f"workspace:{code_type}",
+                emitter=emitter,
+            )
+        except ClaudeInvocationError as e:
+            api_final_status = e.exit_code
+            raise
+        api_success = True
+        api_final_status = 0
+        ws_call_toks[0] = _accumulate_cost(result_msg, cost_acc)
+        raw_stdout = result_msg.result or ""
 
         files, rejected = _collect_workspace_files(sandbox)
         outcome = _classify_workspace_outcome(files, rejected)
@@ -891,7 +1060,7 @@ def call_claude_with_text_workspace(
     emitter: Any = None,
     cost_acc: dict | None = None,
 ) -> tuple[str, str | None, dict]:
-    """Claude CLI に Write ツールを許可して sandbox に deliverable.json を書かせ、内容を返す。
+    """Agent SDK に Write ツールを許可して sandbox に deliverable.json を書かせ、内容を返す。
 
     text 成果物用の workspace モード。code 成果物用 ``call_claude_with_workspace`` とは責務を分離する
     (拡張子 whitelist 不要、単一ファイル想定、JSON 構造前提)。
@@ -916,7 +1085,7 @@ def call_claude_with_text_workspace(
     Returns:
         ``(raw_stdout, deliverable_content, outcome)`` のタプル。
 
-        - ``raw_stdout``: Claude CLI の stdout 全文 (``Wrote: deliverable.json`` 等の Write 履歴)
+        - ``raw_stdout``: 最終応答テキスト (ResultMessage.result。``Wrote: deliverable.json`` 等の要約)
         - ``deliverable_content``: ``expected_filename`` の中身 (UTF-8 文字列)。書かれなかった
           場合は ``None``
         - ``outcome``: ``{"file_exists": bool, "file_bytes": int, "extra_files": list[str]}``。
@@ -930,86 +1099,24 @@ def call_claude_with_text_workspace(
     endpoint_path = f"/claude/cli?model={model}&mode=workspace&kind=text"
     ws_call_toks: list[dict[str, int] | None] = [None]
     try:
-        cmd = [
-            "claude",
-            "-p",
-            "-",
-            "--model",
-            model,
-            "--allowedTools",
-            "Write,Edit",
-            "--output-format",
-            "json",
-        ]
-        last_error: subprocess.CalledProcessError | None = None
-        raw_stdout = ""
-        for attempt in range(MAX_CLAUDE_RETRIES):
-            try:
-                result = subprocess.run(  # noqa: S603
-                    cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    cwd=str(sandbox),
-                )
-                raw_stdout = result.stdout
-                api_success = True
-                api_final_status = result.returncode
-                ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
-                break
-            except subprocess.CalledProcessError as e:
-                last_error = e
-                api_final_status = e.returncode
-                wait = 2 ** (attempt + 1)
-                if _claude_stderr_indicates_rate_limit(e.stderr or ""):
-                    _emit_rate_limit_hit(
-                        emitter,
-                        subtype="anthropic_429",
-                        endpoint_path=endpoint_path,
-                        detail=f"stderr_snippet={(e.stderr or '')[:200]}",
-                    )
-                logger.warning(
-                    "Claude CLI error (text workspace mode), retrying | rc=%s | stderr=%s",
-                    e.returncode,
-                    (e.stderr or "")[:500],
-                    extra={"attempt": attempt + 1, "wait_seconds": wait},
-                )
-                time.sleep(wait)
-        else:
-            if last_error and model == "sonnet" and not _claude_stderr_indicates_rate_limit(last_error.stderr or ""):
-                advisor_cmd = [
-                    "claude", "-p", "-",
-                    "--model", CLAUDE_ADVISOR_MODEL,
-                    "--output-format", "json",
-                    "--allowedTools", "Write,Edit,Read",
-                ]
-                logger.warning(
-                    "Sonnet retries exhausted (text workspace mode), escalating to advisor model %s",
-                    CLAUDE_ADVISOR_MODEL,
-                    extra={"original_error": str(last_error)[:200]},
-                )
-                try:
-                    result = subprocess.run(  # noqa: S603
-                        advisor_cmd,
-                        input=prompt,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        cwd=str(sandbox),
-                    )
-                    raw_stdout = result.stdout
-                    api_success = True
-                    api_final_status = result.returncode
-                    ws_call_toks[0] = _accumulate_cost(raw_stdout, cost_acc)
-                except subprocess.CalledProcessError:
-                    pass
-
-            if not api_success:
-                if last_error:
-                    raise last_error
-                msg = "Unexpected: no error and no response (text workspace mode)"
-                raise RuntimeError(msg)
+        try:
+            result_msg = _run_claude_with_retries(
+                prompt,
+                model=model,
+                allowed_tools=["Write", "Edit"],
+                advisor_allowed_tools=["Write", "Edit", "Read"],
+                cwd=sandbox,
+                endpoint_path=endpoint_path,
+                context_label="text workspace",
+                emitter=emitter,
+            )
+        except ClaudeInvocationError as e:
+            api_final_status = e.exit_code
+            raise
+        api_success = True
+        api_final_status = 0
+        ws_call_toks[0] = _accumulate_cost(result_msg, cost_acc)
+        raw_stdout = result_msg.result or ""
 
         expected_path = sandbox / expected_filename
         file_exists = expected_path.is_file()
@@ -2107,7 +2214,17 @@ class Orchestrator:
             raw = call_codex(review_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             if self._prompt_recorder is not None:
                 self._prompt_recorder.record("reviewer_eval", str(loop), review_prompt, raw)
-            review_result = _parse_claude_response(raw)
+            try:
+                review_result = _parse_claude_response(raw)
+            except ClaudeResponseParseError:
+                # reviewer 応答が dict にならない場合、旧実装は {"raw_text": ..., "parse_error": True}
+                # を review_result として流していた。厳密契約化後も「不合格扱いで loop 継続 /
+                # 上限判定に委ねる」挙動を維持するため、明示的な不合格 dict に置き換える。
+                logger.warning(
+                    "Reviewer response unparseable; treating as not passed",
+                    extra={"loop": loop, "raw_preview": raw[:300]},
+                )
+                review_result = {"passed": False, "issues": [], "parse_error": True}
 
             # 各 iteration ごとの review_completed (T1-2): シグネチャ・戻り値・分岐ロジックは不変。
             # accumulated_fixer_notes は本 iteration 開始時点までの累積で集計する
@@ -2170,17 +2287,15 @@ class Orchestrator:
             fix_raw = call_claude(fix_prompt, emitter=self._emitter, cost_acc=self._cost_acc)
             if self._prompt_recorder is not None:
                 self._prompt_recorder.record("reviewer_fix", str(loop), fix_prompt, fix_raw)
-            parsed = _parse_claude_response(fix_raw)
-            # parse_error 経路 / parsed が dict でない経路 (JSON array/scalar) はいずれも
-            # current_deliverables を据え置き、旧版を保持する。
-            # `_parse_claude_response` は非 str text や JSON array/scalar を parse_error なしで
-            # そのまま返す経路があり、parsed.get(...) で AttributeError を起こすため明示ガードする。
-            if not isinstance(parsed, dict):
-                logger.warning(
-                    "Fix attempt produced non-dict response, keeping previous deliverables",
-                    extra={"loop": loop, "issues_count": len(errors), "parsed_type": type(parsed).__name__},
-                )
-            elif parsed.get("parse_error"):
+            # 厳密契約化後の _parse_claude_response は「dict を返すか raise」のため、
+            # 旧実装の 2 分岐 (非 dict / parse_error dict) は except 1 本に集約される。
+            # いずれの失敗でも current_deliverables を据え置き、旧版を保持する。
+            parsed: dict | None
+            try:
+                parsed = _parse_claude_response(fix_raw)
+            except ClaudeResponseParseError:
+                parsed = None
+            if parsed is None:
                 logger.warning(
                     "Fix attempt produced unparseable response, keeping previous deliverables",
                     extra={"loop": loop, "issues_count": len(errors)},

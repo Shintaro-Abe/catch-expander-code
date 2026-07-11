@@ -9,7 +9,7 @@ from feedback.scope import (
     validate_scope,
 )
 from notify.slack_client import SlackClient
-from orchestrator import _parse_claude_response, call_claude
+from orchestrator import ClaudeResponseParseError, _parse_claude_response, call_claude
 from state.dynamodb_client import DynamoDbClient
 
 # T1-2b (Tier 2.4): F8 フィードバック受信 → feedback_received イベントを emit。
@@ -80,9 +80,17 @@ class FeedbackProcessor:
                 topic, category, existing_prefs, feedback_text, source_deliverable_types
             )
             raw = call_claude(prompt, allowed_tools=None, emitter=emitter)
-            parsed = _parse_claude_response(raw)
+            # 厳密契約化後の _parse_claude_response は「dict を返すか raise」(20260706 Agent SDK 移行)。
+            # 旧「非 dict / parse_error dict を返す」経路は消滅したため、抽出失敗は except で
+            # 「好みなし」として graceful に処理する。
+            parsed: dict | None
+            try:
+                parsed = _parse_claude_response(raw)
+            except ClaudeResponseParseError:
+                logger.warning("Preference extraction response unparseable; treating as no preferences")
+                parsed = None
 
-            if parsed.get("parse_error"):
+            if parsed is None:
                 new_preferences: list[dict] = []
             else:
                 raw_prefs = parsed.get("preferences", [])

@@ -21,7 +21,7 @@ def mock_clients():
 
 
 def _make_claude_responses():
-    """Claude CLIの応答をシミュレートする"""
+    """call_claude の最終応答テキスト (20260706 Agent SDK 移行後の契約) をシミュレートする"""
     # 1. トピック解析
     analysis = {
         "category": "技術",
@@ -92,12 +92,12 @@ def _make_claude_responses():
     }
 
     responses = [
-        json.dumps({"result": json.dumps(analysis)}),
-        json.dumps({"result": json.dumps(workflow)}),
-        json.dumps({"result": json.dumps(research1)}),
-        json.dumps({"result": json.dumps(research2)}),
-        json.dumps({"result": json.dumps(deliverables)}),
-        json.dumps({"result": json.dumps(review)}),
+        json.dumps(analysis),
+        json.dumps(workflow),
+        json.dumps(research1),
+        json.dumps(research2),
+        json.dumps(deliverables),
+        json.dumps(review),
     ]
     return responses
 
@@ -105,13 +105,20 @@ def _make_claude_responses():
 class TestWorkflowE2E:
     """ワークフロー全体の統合テスト"""
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude")
     @patch("storage.notion_client.requests.request")
-    def test_full_workflow_success(self, mock_notion_request, mock_claude, mock_clients):
+    def test_full_workflow_success(
+        self, mock_notion_request, mock_claude, mock_codex, _mock_ws, mock_clients
+    ):
         from orchestrator import Orchestrator
 
         slack, db = mock_clients
-        mock_claude.side_effect = _make_claude_responses()
+        # 20260706 Agent SDK 移行: reviewer は call_codex、text 生成は legacy path (call_claude) を強制。
+        responses = _make_claude_responses()
+        mock_claude.side_effect = responses[:-1]  # analysis / workflow / research×2 / deliverables
+        mock_codex.return_value = responses[-1]  # review (reviewer = Codex)
 
         # Notion APIモック
         mock_notion_response = mock_notion_request.return_value
@@ -145,9 +152,13 @@ class TestWorkflowE2E:
         # 成果物保存の確認
         db.put_deliverable.assert_called_once()
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude")
     @patch("storage.notion_client.requests.request")
-    def test_partial_research_failure_continues(self, mock_notion_request, mock_claude, mock_clients):
+    def test_partial_research_failure_continues(
+        self, mock_notion_request, mock_claude, mock_codex, _mock_ws, mock_clients
+    ):
         from orchestrator import Orchestrator
 
         slack, db = mock_clients
@@ -182,21 +193,20 @@ class TestWorkflowE2E:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return json.dumps({"result": json.dumps(analysis)})
+                return json.dumps(analysis)
             if call_count == 2:
-                return json.dumps({"result": json.dumps(workflow)})
+                return json.dumps(workflow)
             # リサーチャー呼び出し（WebSearch + WebFetch）
             if allowed_tools == ["WebSearch", "WebFetch"]:
                 if "失敗ステップ" in prompt:
                     raise RuntimeError("Search failed")
-                return json.dumps({"result": json.dumps(research_ok)})
-            # レビュアー呼び出し（WebFetchのみ）
-            if allowed_tools == ["WebFetch"]:
-                return json.dumps({"result": json.dumps(review)})
-            # ジェネレーター（toolsなし）
-            return json.dumps({"result": json.dumps(deliverables)})
+                return json.dumps(research_ok)
+            # ジェネレーター（toolsなし、legacy text-gen path）
+            return json.dumps(deliverables)
 
         mock_claude.side_effect = mock_claude_side_effect
+        # 20260706 Agent SDK 移行: reviewer は call_codex 経由（合格を返す）
+        mock_codex.return_value = json.dumps(review)
 
         mock_notion_response = mock_notion_request.return_value
         mock_notion_response.status_code = 200
@@ -216,9 +226,13 @@ class TestWorkflowE2E:
 
         slack.post_completion.assert_called_once()
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude")
     @patch("storage.notion_client.requests.request")
-    def test_run_integrates_fixed_deliverables_into_notion_content(self, mock_notion_request, mock_claude, mock_clients):
+    def test_run_integrates_fixed_deliverables_into_notion_content(
+        self, mock_notion_request, mock_claude, mock_codex, _mock_ws, mock_clients
+    ):
         """レビュー修正後の deliverables が Notion 送信ペイロードに反映される"""
         from orchestrator import Orchestrator
 
@@ -272,16 +286,18 @@ class TestWorkflowE2E:
             },
         }
 
-        responses = [
-            json.dumps({"result": json.dumps(analysis)}),
-            json.dumps({"result": json.dumps(workflow)}),
-            json.dumps({"result": json.dumps(research)}),
-            json.dumps({"result": json.dumps(original_deliverables)}),
-            json.dumps({"result": json.dumps(failing_review)}),
-            json.dumps({"result": json.dumps(fixed_deliverables)}),
-            json.dumps({"result": json.dumps(passing_review)}),
+        # 20260706 Agent SDK 移行: reviewer は call_codex、text 生成 + fixer は call_claude。
+        mock_claude.side_effect = [
+            json.dumps(analysis),
+            json.dumps(workflow),
+            json.dumps(research),
+            json.dumps(original_deliverables),  # 初回 text 生成
+            json.dumps(fixed_deliverables),  # fixer 再生成
         ]
-        mock_claude.side_effect = responses
+        mock_codex.side_effect = [
+            json.dumps(failing_review),  # 1回目レビュー: 不合格
+            json.dumps(passing_review),  # 2回目レビュー: 合格
+        ]
 
         mock_notion_response = mock_notion_request.return_value
         mock_notion_response.status_code = 200

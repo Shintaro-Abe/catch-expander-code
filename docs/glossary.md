@@ -122,6 +122,10 @@
 | SPA | SPA（Single Page Application） | 初回ロード時に HTML / JS / CSS をまとめて取得し、以降はページ遷移なしで動作するウェブアプリケーション方式。本プロジェクトのダッシュボードは React + Vite 構成の SPA として S3 / CloudFront で配信される | - |
 | JWT | JWT（JSON Web Token） | ユーザー認証情報を JSON 形式で署名したトークン。Slack OAuth 認証成功後に `auth_callback` Lambda が発行し、HttpOnly cookie としてブラウザに保存される。Lambda Authorizer が API リクエストごとに検証する | `jwt` |
 | Slack OAuth | Slack OAuth | Slack のユーザー認証フロー（OAuth 2.0）。ダッシュボードはユーザーを Slack の認可エンドポイントへリダイレクトし、コールバックで得たコードでユーザー情報を取得・JWT を発行する | - |
+| Agent SDK | Claude Agent SDK | Claude Code を型付きインターフェース（`query()` / `ClaudeAgentOptions` / `ResultMessage`）で呼び出す公式 Python SDK。純粋な HTTP クライアントではなく、内部で Claude Code CLI を subprocess として起動する | `claude_agent_sdk` |
+| 同期ファサード | Sync Facade | `call_claude` 系の同期シグネチャを維持したまま、内部で `asyncio.run(query(...))` を実行する呼び出し層。orchestrator の ThreadPoolExecutor 並列と共存する | `call_claude` |
+| envelope パース | Envelope Parse | 旧 CLI（`--output-format json`）の stdout JSON から `result` キーを取り出す外側のパース。Agent SDK 移行で消滅する | - |
+| フェンス抽出 | Fence Extraction | モデル出力テキストから ```json コードブロックを剥がして JSON を取り出す内側のパース。researcher / reviewer プロンプトがフェンス必須指示のため Agent SDK 移行後も残存する | `_parse_claude_response` |
 
 ## 4. ステータス
 

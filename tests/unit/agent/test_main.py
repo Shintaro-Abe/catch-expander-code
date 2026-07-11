@@ -481,13 +481,14 @@ class TestNotifyTaskFailure:
         assert "Claude OAuth" not in message
         assert "Cloudflare" not in message
 
-    def test_rate_limit_error_sends_rate_limit_message(self, monkeypatch):
+    def test_codex_rate_limit_error_sends_rate_limit_message(self, monkeypatch):
+        """Codex CLI (CalledProcessError) の stderr 429 判定は従来どおり動く"""
         monkeypatch.setenv("SLACK_CHANNEL", "C123")
         monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
         monkeypatch.setenv("EXECUTION_ID", "exec-rl-1")
         mock_slack = MagicMock()
 
-        exc = subprocess.CalledProcessError(1, ["claude", "-p", "-"], stderr="Error: rate limit exceeded")
+        exc = subprocess.CalledProcessError(1, ["codex", "exec"], stderr="Error: rate limit exceeded")
         with patch("main.SlackClient", return_value=mock_slack):
             from main import _notify_task_failure
 
@@ -498,20 +499,45 @@ class TestNotifyTaskFailure:
         assert "再投入" in message
         assert "exec-rl-1" in message
 
-    def test_claude_cli_failure_sends_claude_message(self, monkeypatch):
+    def test_claude_rate_limit_error_sends_rate_limit_message(self, monkeypatch):
+        """20260706 Agent SDK 移行: Claude の rate limit は ClaudeInvocationError.rate_limited で分岐"""
         monkeypatch.setenv("SLACK_CHANNEL", "C123")
         monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
-        monkeypatch.setenv("EXECUTION_ID", "exec-cli-1")
+        monkeypatch.setenv("EXECUTION_ID", "exec-rl-2")
         mock_slack = MagicMock()
 
-        exc = subprocess.CalledProcessError(1, ["claude", "-p", "-"], stderr="some other error")
+        from orchestrator import ClaudeInvocationError
+
+        exc = ClaudeInvocationError("claude agent sdk call failed after retries", rate_limited=True)
         with patch("main.SlackClient", return_value=mock_slack):
             from main import _notify_task_failure
 
             _notify_task_failure("slack-token", exc)
 
         message = mock_slack.post_error.call_args[0][2]
-        assert "Claude CLI" in message
+        assert "レート制限" in message
+        assert "再投入" in message
+        assert "exec-rl-2" in message
+
+    def test_claude_sdk_failure_sends_claude_message(self, monkeypatch):
+        """20260706 Agent SDK 移行: Claude 呼び出し失敗は ClaudeInvocationError で届く"""
+        monkeypatch.setenv("SLACK_CHANNEL", "C123")
+        monkeypatch.setenv("SLACK_THREAD_TS", "111.222")
+        monkeypatch.setenv("EXECUTION_ID", "exec-cli-1")
+        mock_slack = MagicMock()
+
+        from orchestrator import ClaudeInvocationError
+
+        exc = ClaudeInvocationError(
+            "claude agent sdk call failed after retries", exit_code=1, stderr="some other error"
+        )
+        with patch("main.SlackClient", return_value=mock_slack):
+            from main import _notify_task_failure
+
+            _notify_task_failure("slack-token", exc)
+
+        message = mock_slack.post_error.call_args[0][2]
+        assert "Claude Agent SDK" in message
         assert "exec-cli-1" in message
         assert "レート制限" not in message
 

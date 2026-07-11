@@ -9,7 +9,7 @@ import boto3
 import requests
 from feedback.feedback_processor import FeedbackProcessor
 from notify.slack_client import SlackClient
-from orchestrator import Orchestrator
+from orchestrator import ClaudeInvocationError, Orchestrator
 from state.dynamodb_client import DynamoDbClient
 from storage.notion_client import NotionCloudflareBlockError
 
@@ -189,24 +189,34 @@ def _notify_task_failure(slack_token: str, exc: BaseException | None = None) -> 
             "繰り返し失敗する場合はログを確認しますのでお知らせください。\n"
             f"{id_line}"
         )
+    elif isinstance(exc, ClaudeInvocationError):
+        # 20260706 Agent SDK 移行: Claude 呼び出し失敗は subprocess.CalledProcessError では
+        # なくこの型で届く。rate limit 判定は exception 属性で行う (stderr 文字列判定は不要)。
+        if exc.rate_limited:
+            message = (
+                "APIレート制限（またはサブスクリプション使用上限）に達したためタスクを完了できませんでした。\n"
+                "しばらく時間をおいてから再投入をお試しください。\n"
+                f"{id_line}"
+            )
+        else:
+            message = (
+                "Claude Agent SDK の実行に失敗しました。\n"
+                "ログを確認しますのでお知らせください。\n"
+                f"{id_line}"
+            )
     elif isinstance(exc, subprocess.CalledProcessError):
+        # Codex CLI (call_codex / CodexInvocationError) の経路。Claude は Agent SDK 移行後
+        # この型を投げない。
         stderr = (exc.stderr or "").lower()
-        cmd_str = " ".join(exc.cmd) if isinstance(exc.cmd, list) else str(exc.cmd)
         if "429" in stderr or "rate limit" in stderr or "rate_limit" in stderr:
             message = (
                 "APIレート制限に達したためタスクを完了できませんでした。\n"
                 "しばらく時間をおいてから再投入をお試しください。\n"
                 f"{id_line}"
             )
-        elif "codex" in cmd_str:
-            message = (
-                "Codex CLI の実行に失敗しました。\n"
-                "ログを確認しますのでお知らせください。\n"
-                f"{id_line}"
-            )
         else:
             message = (
-                "Claude CLI の実行に失敗しました。\n"
+                "Codex CLI の実行に失敗しました。\n"
                 "ログを確認しますのでお知らせください。\n"
                 f"{id_line}"
             )

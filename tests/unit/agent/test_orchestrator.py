@@ -1,65 +1,206 @@
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 
+def _fake_result_message(
+    result_text: str,
+    *,
+    is_error: bool = False,
+    subtype: str = "success",
+    usage: dict | None = None,
+    total_cost_usd: float = 0.0,
+):
+    """ResultMessage 相当のスタブ (20260706 Agent SDK 移行)。
+
+    _query_claude_sync を patch した先で参照される属性のみ持てばよい。
+    MagicMock は is_error が truthy になる罠があるため SimpleNamespace を使う。
+    """
+    return SimpleNamespace(
+        result=result_text,
+        is_error=is_error,
+        subtype=subtype,
+        usage=usage if usage is not None else {"input_tokens": 10, "output_tokens": 5},
+        total_cost_usd=total_cost_usd,
+    )
+
+
 class TestCallClaude:
-    """call_claude関数のテスト"""
+    """call_claude 関数のテスト (Agent SDK 同期ファサード)"""
 
-    @patch("orchestrator.subprocess.run")
-    def test_call_claude_success(self, mock_run):
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_success_returns_result_text(self, mock_query):
         from orchestrator import call_claude
 
-        mock_run.return_value = MagicMock(stdout='{"result": "test output"}')
+        mock_query.return_value = _fake_result_message("test output")
         result = call_claude("test prompt")
-        assert result == '{"result": "test output"}'
+        assert result == "test output"
 
-        cmd = mock_run.call_args[0][0]
-        assert cmd[0] == "claude"
-        assert "-p" in cmd
-        assert "--output-format" in cmd
+        prompt_arg, options = mock_query.call_args.args
+        assert prompt_arg == "test prompt"
+        assert options.model == "sonnet"
 
-    @patch("orchestrator.subprocess.run")
-    def test_call_claude_with_allowed_tools(self, mock_run):
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_with_allowed_tools(self, mock_query):
         from orchestrator import call_claude
 
-        mock_run.return_value = MagicMock(stdout="{}")
+        mock_query.return_value = _fake_result_message("{}")
         call_claude("prompt", allowed_tools=["WebSearch", "WebFetch"])
 
-        cmd = mock_run.call_args[0][0]
-        assert "--allowedTools" in cmd
-        assert "WebSearch,WebFetch" in cmd
+        options = mock_query.call_args.args[1]
+        assert options.allowed_tools == ["WebSearch", "WebFetch"]
 
-    @patch("orchestrator.time.sleep")
-    @patch("orchestrator.subprocess.run")
-    def test_call_claude_retries_on_failure(self, mock_run, mock_sleep):
-        import subprocess
-
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_uses_claude_code_system_prompt_preset(self, mock_query):
+        """SDK デフォルトは空システムプロンプトのため、旧 CLI と等価な preset 指定を検証する
+        (design.md パリティ注意点)。"""
         from orchestrator import call_claude
 
-        mock_run.side_effect = [
-            subprocess.CalledProcessError(1, "claude"),
-            subprocess.CalledProcessError(1, "claude"),
-            MagicMock(stdout='{"result": "ok"}'),
+        mock_query.return_value = _fake_result_message("ok")
+        call_claude("prompt")
+
+        options = mock_query.call_args.args[1]
+        assert options.system_prompt == {"type": "preset", "preset": "claude_code"}
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_retries_on_process_error(self, mock_query, mock_sleep):
+        from claude_agent_sdk import ProcessError
+        from orchestrator import call_claude
+
+        mock_query.side_effect = [
+            ProcessError("boom", exit_code=1, stderr="err"),
+            ProcessError("boom", exit_code=1, stderr="err"),
+            _fake_result_message("ok"),
         ]
         result = call_claude("prompt")
-        assert result == '{"result": "ok"}'
-        assert mock_run.call_count == 3
+        assert result == "ok"
+        assert mock_query.call_count == 3
         assert mock_sleep.call_count == 2
 
     @patch("orchestrator.time.sleep")
-    @patch("orchestrator.subprocess.run")
-    def test_call_claude_raises_after_max_retries(self, mock_run, mock_sleep):
-        import subprocess
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_raises_after_max_retries_and_advisor(self, mock_query, mock_sleep):
+        """3 リトライ枯渇後に advisor (Opus) を 1 回試行し、それも失敗したら
+        ClaudeInvocationError を送出する。"""
+        from claude_agent_sdk import ProcessError
+        from orchestrator import CLAUDE_ADVISOR_MODEL, ClaudeInvocationError, call_claude
 
+        mock_query.side_effect = ProcessError("boom", exit_code=1, stderr="err")
+        with pytest.raises(ClaudeInvocationError):
+            call_claude("prompt")
+        # MAX_CLAUDE_RETRIES (3) + advisor 1 回
+        assert mock_query.call_count == 4
+        advisor_options = mock_query.call_args_list[3].args[1]
+        assert advisor_options.model == CLAUDE_ADVISOR_MODEL
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_rate_limit_skips_advisor(self, mock_query, mock_sleep):
+        """stderr が 429 を示す場合、advisor エスカレーションせず rate_limited=True で失敗する
+        (旧実装セマンティクスの維持)。"""
+        from claude_agent_sdk import ProcessError
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        mock_query.side_effect = ProcessError("boom", exit_code=1, stderr="HTTP 429 rate limit")
+        with pytest.raises(ClaudeInvocationError) as excinfo:
+            call_claude("prompt")
+        assert mock_query.call_count == 3  # advisor なし
+        assert excinfo.value.rate_limited is True
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_subscription_limit_in_error_result(self, mock_query, mock_sleep):
+        """サブスク使用上限が「正常終了 + is_error 応答テキスト」で返るケースを
+        rate limit として扱う (旧 stderr スニッフィングでは検出漏れだった新規捕捉)。"""
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        mock_query.return_value = _fake_result_message(
+            "You've reached your usage limit. Try again later.", is_error=True, subtype="error_during_execution"
+        )
+        with pytest.raises(ClaudeInvocationError) as excinfo:
+            call_claude("prompt")
+        assert mock_query.call_count == 3  # rate limit 扱いのため advisor なし
+        assert excinfo.value.rate_limited is True
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_advisor_failure_updates_final_exception(self, mock_query, mock_sleep):
+        """Sonnet 通常失敗 ×3 の後 advisor だけ usage limit で失敗した場合、
+        最終例外は advisor 側の失敗 (rate_limited=True) を反映する (Codex Pass 1 P2-1)。"""
+        from claude_agent_sdk import ProcessError
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        mock_query.side_effect = [
+            ProcessError("boom", exit_code=1, stderr="err"),
+            ProcessError("boom", exit_code=1, stderr="err"),
+            ProcessError("boom", exit_code=1, stderr="err"),
+            _fake_result_message(
+                "You've reached your usage limit. Try again later.",
+                is_error=True,
+                subtype="error_during_execution",
+            ),
+        ]
+        with pytest.raises(ClaudeInvocationError) as excinfo:
+            call_claude("prompt")
+        assert mock_query.call_count == 4  # 3 リトライ + advisor 1 回
+        assert excinfo.value.rate_limited is True
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_no_result_message_is_retried(self, mock_query, mock_sleep):
+        """ResultMessage なしのストリーム終端は即時 abort せず
+        リトライ共通経路に正規化される (Codex Pass 1 P2-2)。"""
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        mock_query.side_effect = [
+            ClaudeInvocationError("no ResultMessage received from Agent SDK"),
+            _fake_result_message("ok"),
+        ]
+        assert call_claude("prompt") == "ok"
+        assert mock_query.call_count == 2
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_cli_not_found_fails_fast(self, mock_query, mock_sleep):
+        """CLI 不在は環境異常のためリトライせず即時 fail する。"""
+        from claude_agent_sdk import CLINotFoundError
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        mock_query.side_effect = CLINotFoundError("claude not found")
+        with pytest.raises(ClaudeInvocationError):
+            call_claude("prompt")
+        assert mock_query.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("orchestrator._query_claude_sync")
+    def test_call_claude_accumulates_cost_from_result_message(self, mock_query):
         from orchestrator import call_claude
 
-        mock_run.side_effect = subprocess.CalledProcessError(1, "claude")
-        with pytest.raises(subprocess.CalledProcessError):
-            call_claude("prompt")
-        assert mock_run.call_count == 3
+        mock_query.return_value = _fake_result_message(
+            "ok",
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 10,
+                "cache_read_input_tokens": 40,
+            },
+            total_cost_usd=0.25,
+        )
+        cost_acc = {
+            "total_cost_usd": 0.0,
+            "total_tokens_used": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+        }
+        call_claude("prompt", cost_acc=cost_acc)
+        assert cost_acc["total_cost_usd"] == 0.25
+        assert cost_acc["total_tokens_used"] == 200
+        assert cost_acc["total_input_tokens"] == 100
+        assert cost_acc["total_output_tokens"] == 50
 
 
 class TestNamespaceSourceIds:
@@ -144,39 +285,39 @@ class TestNamespaceSourceIds:
 
 
 class TestParseClaudeResponse:
-    """_parse_claude_response関数のテスト"""
+    """_parse_claude_response 関数のテスト (厳密契約: dict を返すか ClaudeResponseParseError)。
 
-    def test_parse_result_field(self):
-        from orchestrator import _parse_claude_response
-
-        raw = json.dumps({"result": '{"category": "技術"}'})
-        result = _parse_claude_response(raw)
-        assert result["category"] == "技術"
+    20260706 Agent SDK 移行で入力は「モデルの最終応答テキスト」になった。
+    旧 envelope パース (CLI stdout JSON の result キー取り出し) のテストは削除済み。
+    """
 
     def test_parse_json_code_block(self):
         from orchestrator import _parse_claude_response
 
-        raw = json.dumps({"result": '```json\n{"category": "時事"}\n```'})
-        result = _parse_claude_response(raw)
+        text = '```json\n{"category": "時事"}\n```'
+        result = _parse_claude_response(text)
         assert result["category"] == "時事"
+
+    def test_parse_generic_code_block(self):
+        from orchestrator import _parse_claude_response
+
+        text = '```\n{"category": "学術"}\n```'
+        result = _parse_claude_response(text)
+        assert result["category"] == "学術"
 
     def test_parse_direct_json(self):
         from orchestrator import _parse_claude_response
 
-        raw = '{"category": "ビジネス"}'
-        result = _parse_claude_response(raw)
+        text = '{"category": "ビジネス"}'
+        result = _parse_claude_response(text)
         assert result["category"] == "ビジネス"
 
     def test_parse_json_after_preamble(self):
         """前置き文の後にJSONが来るケースを正しく抽出できること（戦略4）"""
         from orchestrator import _parse_claude_response
 
-        # Claudeが前置き文をつけた場合のシミュレーション
-        prose_with_json = (
-            '以下が調査結果です。\n\n{"step_id": "r-1", "summary": "概要", "sources": [], "extra": "data"}'
-        )
-        raw = json.dumps({"result": prose_with_json})
-        result = _parse_claude_response(raw)
+        text = '以下が調査結果です。\n\n{"step_id": "r-1", "summary": "概要", "sources": [], "extra": "data"}'
+        result = _parse_claude_response(text)
         assert result["step_id"] == "r-1"
         assert result["summary"] == "概要"
 
@@ -184,44 +325,59 @@ class TestParseClaudeResponse:
         """JSONの後に余分なテキストがある場合も正しく抽出できること（戦略4 raw_decode）"""
         from orchestrator import _parse_claude_response
 
-        json_with_trailing = (
+        text = (
             '{"step_id": "r-2", "summary": "summary text", "sources": [], "extra": "val"}\n\n'
             "以上が結果です。ご確認ください。"
         )
-        raw = json.dumps({"result": json_with_trailing})
-        result = _parse_claude_response(raw)
+        result = _parse_claude_response(text)
         assert result["step_id"] == "r-2"
 
     def test_parse_ignores_small_json_fragments(self):
         """キー数2以下の断片的JSONオブジェクトを無視して大きなJSONを返すこと"""
         from orchestrator import _parse_claude_response
 
-        # 最初の {} はキー1個の断片的JSON。その後に本体JSONが来る
-        text_with_small_fragment = (
+        text = (
             'The format is {"type": "text"}. '
             "Here is the full output: "
             '{"step_id": "r-3", "summary": "full result", "sources": [], "extra": "more"}'
         )
-        raw = json.dumps({"result": text_with_small_fragment})
-        result = _parse_claude_response(raw)
-        # キー数3以上の大きい方が返ること
+        result = _parse_claude_response(text)
         assert result.get("step_id") == "r-3"
 
-    def test_parse_returns_parse_error_when_no_json(self):
-        """JSONが全く見つからない場合はparse_error=Trueを返すこと"""
+    def test_parse_raises_when_no_json(self):
+        """JSON が全く見つからない場合は ClaudeResponseParseError を送出すること
+        (旧: {"raw_text": ..., "parse_error": True} を黙って返していた)"""
+        from orchestrator import ClaudeResponseParseError, _parse_claude_response
+
+        with pytest.raises(ClaudeResponseParseError) as excinfo:
+            _parse_claude_response("JSONを含まない純粋なテキストです。")
+        assert excinfo.value.text_preview
+
+    def test_parse_raises_on_json_array(self):
+        """valid JSON でも dict でない値 (array/scalar) は返さず raise すること
+        (旧実装の型契約違反経路の根絶)"""
+        from orchestrator import ClaudeResponseParseError, _parse_claude_response
+
+        with pytest.raises(ClaudeResponseParseError):
+            _parse_claude_response("[]")
+        with pytest.raises(ClaudeResponseParseError):
+            _parse_claude_response('"just a string"')
+        with pytest.raises(ClaudeResponseParseError):
+            _parse_claude_response("123")
+
+    def test_parse_raises_on_non_str_input(self):
+        from orchestrator import ClaudeResponseParseError, _parse_claude_response
+
+        with pytest.raises(ClaudeResponseParseError):
+            _parse_claude_response(None)  # type: ignore[arg-type]
+
+    def test_parse_fenced_array_falls_through_to_outer_dict(self):
+        """フェンス内が array でも、フェンス外に dict があれば戦略4で拾うこと"""
         from orchestrator import _parse_claude_response
 
-        raw = json.dumps({"result": "JSONを含まない純粋なテキストです。"})
-        result = _parse_claude_response(raw)
-        assert result.get("parse_error") is True
-        assert "raw_text" in result
-
-    def test_parse_handles_invalid_outer_json(self):
-        """外側のJSONが無効でもクラッシュしないこと"""
-        from orchestrator import _parse_claude_response
-
-        result = _parse_claude_response("not json at all")
-        assert result.get("parse_error") is True
+        text = '```json\n[1, 2]\n```\n{"step_id": "r-4", "summary": "s", "sources": [], "extra": 1}'
+        result = _parse_claude_response(text)
+        assert result["step_id"] == "r-4"
 
 
 class TestRunResearchers:
@@ -231,9 +387,7 @@ class TestRunResearchers:
     def test_parallel_execution_all_success(self, mock_claude):
         from orchestrator import Orchestrator
 
-        mock_claude.return_value = json.dumps(
-            {"result": json.dumps({"step_id": "r-1", "summary": "結果", "sources": []})}
-        )
+        mock_claude.return_value = json.dumps({"step_id": "r-1", "summary": "結果", "sources": []})
 
         slack = MagicMock()
         db = MagicMock()
@@ -255,7 +409,7 @@ class TestRunResearchers:
         def side_effect(prompt, allowed_tools=None, **_kwargs):
             # T1-2b: call_claude に emitter kwarg が追加されたため、未知の kwarg を吸収する
             if "概要" in prompt:
-                return json.dumps({"result": json.dumps({"step_id": "r-1", "summary": "ok", "sources": []})})
+                return json.dumps({"step_id": "r-1", "summary": "ok", "sources": []})
             raise RuntimeError("Search failed")
 
         mock_claude.side_effect = side_effect
@@ -294,18 +448,15 @@ class TestReviewLoop:
     """レビューループのテスト"""
 
     @patch("orchestrator.call_claude")
-    def test_review_passes_first_time(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_passes_first_time(self, mock_codex, mock_claude):
         from orchestrator import Orchestrator
 
-        mock_claude.return_value = json.dumps(
+        mock_codex.return_value = json.dumps(
             {
-                "result": json.dumps(
-                    {
-                        "passed": True,
-                        "issues": [],
-                        "quality_metadata": {"sources_verified": 5, "sources_unverified": 0},
-                    }
-                )
+                "passed": True,
+                "issues": [],
+                "quality_metadata": {"sources_verified": 5, "sources_unverified": 0},
             }
         )
 
@@ -318,43 +469,35 @@ class TestReviewLoop:
         )
         assert result["passed"] is True
         assert final_deliverables == {"content_blocks": []}
-        assert mock_claude.call_count == 1
+        assert mock_codex.call_count == 1
+        assert mock_claude.call_count == 0
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_fix_then_pass(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_fix_then_pass(self, mock_codex, mock_claude):
         from orchestrator import Orchestrator
 
-        responses = [
-            # 1回目レビュー: 不合格
+        # reviewer (call_codex): 1回目 不合格 → 2回目 合格
+        mock_codex.side_effect = [
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "passed": False,
-                            "issues": [
-                                {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
-                            ],
-                            "quality_metadata": {},
-                        }
-                    )
+                    "passed": False,
+                    "issues": [
+                        {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+                    ],
+                    "quality_metadata": {},
                 }
             ),
-            # 修正後の成果物
-            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fixed"})}),
-            # 2回目レビュー: 合格
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "passed": True,
-                            "issues": [],
-                            "quality_metadata": {"sources_verified": 5, "sources_unverified": 0},
-                        }
-                    )
+                    "passed": True,
+                    "issues": [],
+                    "quality_metadata": {"sources_verified": 5, "sources_unverified": 0},
                 }
             ),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude): 修正後の成果物
+        mock_claude.side_effect = [json.dumps({"content_blocks": [], "summary": "fixed"})]
 
         slack = MagicMock()
         db = MagicMock()
@@ -365,41 +508,36 @@ class TestReviewLoop:
         )
         assert result["passed"] is True
         assert final_deliverables.get("summary") == "fixed"
-        assert mock_claude.call_count == 3
+        assert mock_codex.call_count == 2
+        assert mock_claude.call_count == 1
 
     @patch("orchestrator.call_claude")
-    def test_run_review_loop_returns_fixed_deliverables_on_passed(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_run_review_loop_returns_fixed_deliverables_on_passed(self, mock_codex, mock_claude):
         """修正後に合格した場合、修正済み成果物を返す"""
         from orchestrator import Orchestrator
 
-        responses = [
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "passed": False,
-                            "issues": [
-                                {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
-                            ],
-                            "quality_metadata": {},
-                        }
-                    )
+                    "passed": False,
+                    "issues": [
+                        {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
+                    ],
+                    "quality_metadata": {},
                 }
             ),
-            json.dumps({"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})}),
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "passed": True,
-                            "issues": [],
-                            "quality_metadata": {"sources_verified": 3, "sources_unverified": 0},
-                        }
-                    )
+                    "passed": True,
+                    "issues": [],
+                    "quality_metadata": {"sources_verified": 3, "sources_unverified": 0},
                 }
             ),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude): 修正版成果物
+        mock_claude.side_effect = [json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})]
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -410,21 +548,25 @@ class TestReviewLoop:
         assert final_deliverables["summary"] == "修正版"
 
     @patch("orchestrator.call_claude")
-    def test_run_review_loop_returns_fixed_deliverables_on_max_loop(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_run_review_loop_returns_fixed_deliverables_on_max_loop(self, mock_codex, mock_claude):
         """ループ上限到達でも、最後に適用された修正版を返す"""
         from orchestrator import Orchestrator
 
         issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
         failing_review = {"passed": False, "issues": [issue], "quality_metadata": {}}
 
-        responses = [
-            json.dumps({"result": json.dumps(failing_review)}),
-            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-1"})}),
-            json.dumps({"result": json.dumps(failing_review)}),
-            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-2"})}),
-            json.dumps({"result": json.dumps(failing_review)}),
+        # reviewer (call_codex): 3 回とも不合格
+        mock_codex.side_effect = [
+            json.dumps(failing_review),
+            json.dumps(failing_review),
+            json.dumps(failing_review),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude): 2 回の修正
+        mock_claude.side_effect = [
+            json.dumps({"content_blocks": [], "summary": "fix-1"}),
+            json.dumps({"content_blocks": [], "summary": "fix-2"}),
+        ]
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -436,7 +578,8 @@ class TestReviewLoop:
         assert any("レビュー修正上限" in n for n in notes)
 
     @patch("orchestrator.call_claude")
-    def test_run_review_loop_keeps_previous_on_parse_error(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_run_review_loop_keeps_previous_on_parse_error(self, mock_codex, mock_claude):
         """fix 応答が parse_error の場合、前回成果物を保持する"""
         from orchestrator import Orchestrator
 
@@ -448,13 +591,13 @@ class TestReviewLoop:
             "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
         }
 
-        responses = [
-            json.dumps({"result": json.dumps(failing_review)}),
-            # fix response は不正な JSON → parse_error になる
-            json.dumps({"result": "this is not valid json at all"}),
-            json.dumps({"result": json.dumps(passing_review)}),
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps(failing_review),
+            json.dumps(passing_review),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude): 不正な JSON → parse_error になる
+        mock_claude.side_effect = ["this is not valid json at all"]
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -465,28 +608,25 @@ class TestReviewLoop:
         assert final_deliverables == original
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_preserves_code_files_on_fix_success(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_preserves_code_files_on_fix_success(self, mock_codex, mock_claude):
         """レビュー修正成功時も code_files は保持される（generator は text のみ返す契約のため）"""
         from orchestrator import Orchestrator
 
         issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
-        responses = [
-            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
-            # 修正レスポンスは text 成果物のみ（code_files を含まない = 実運用の挙動）
-            json.dumps({"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})}),
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "passed": True,
-                            "issues": [],
-                            "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
-                        }
-                    )
+                    "passed": True,
+                    "issues": [],
+                    "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
                 }
             ),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude): 修正レスポンスは text 成果物のみ（code_files を含まない = 実運用の挙動）
+        mock_claude.side_effect = [json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})]
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -506,27 +646,25 @@ class TestReviewLoop:
         assert final_deliverables["code_files"] == original_code_files
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_no_code_files_when_absent(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_no_code_files_when_absent(self, mock_codex, mock_claude):
         """元の成果物に code_files が無ければ、修正後にもキーが現れない"""
         from orchestrator import Orchestrator
 
         issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
-        responses = [
-            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
-            json.dumps({"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})}),
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "passed": True,
-                            "issues": [],
-                            "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
-                        }
-                    )
+                    "passed": True,
+                    "issues": [],
+                    "quality_metadata": {"sources_verified": 1, "sources_unverified": 0},
                 }
             ),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude): 修正版
+        mock_claude.side_effect = [json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "修正版"})]
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -536,21 +674,25 @@ class TestReviewLoop:
         assert "code_files" not in final_deliverables
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_preserves_code_files_across_multiple_fixes(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_preserves_code_files_across_multiple_fixes(self, mock_codex, mock_claude):
         """複数回の修正を跨いでも code_files は保持される"""
         from orchestrator import Orchestrator
 
         issue = {"item": "test", "severity": "error", "description": "wrong", "fix_instruction": "fix"}
         failing_review = {"passed": False, "issues": [issue], "quality_metadata": {}}
 
-        responses = [
-            json.dumps({"result": json.dumps(failing_review)}),
-            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-1"})}),
-            json.dumps({"result": json.dumps(failing_review)}),
-            json.dumps({"result": json.dumps({"content_blocks": [], "summary": "fix-2"})}),
-            json.dumps({"result": json.dumps(failing_review)}),
+        # reviewer (call_codex): 3 回とも不合格
+        mock_codex.side_effect = [
+            json.dumps(failing_review),
+            json.dumps(failing_review),
+            json.dumps(failing_review),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude): 2 回の修正
+        mock_claude.side_effect = [
+            json.dumps({"content_blocks": [], "summary": "fix-1"}),
+            json.dumps({"content_blocks": [], "summary": "fix-2"}),
+        ]
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -562,7 +704,8 @@ class TestReviewLoop:
         assert final_deliverables["code_files"] == original_code_files
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_code_issue_does_not_claim_fix_in_summary(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_code_issue_does_not_claim_fix_in_summary(self, mock_codex, mock_claude):
         """コード関連指摘を受けても、generator は summary で「修正した」と主張しない
 
         fix_prompt のスコープ制約セクションにより、generator は code_files を修正したと
@@ -576,22 +719,21 @@ class TestReviewLoop:
             "description": "resolver.tf の filter ブロックは Route 53 Resolver では非対応",
             "fix_instruction": "resolver.tf から filter ブロックを削除する",
         }
-        responses = [
-            json.dumps({"result": json.dumps({"passed": False, "issues": [code_issue], "quality_metadata": {}})}),
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [code_issue], "quality_metadata": {}}),
+            json.dumps({"passed": True, "issues": [], "quality_metadata": {}}),
+        ]
+        # fixer (call_claude): コード指摘には修正主張せず notes に記録
+        mock_claude.side_effect = [
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "content_blocks": [{"t": "unchanged"}],
-                            "summary": "Route 53 Resolver の概要レポート",
-                            "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
-                        }
-                    )
+                    "content_blocks": [{"t": "unchanged"}],
+                    "summary": "Route 53 Resolver の概要レポート",
+                    "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
                 }
             ),
-            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
         ]
-        mock_claude.side_effect = responses
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -607,8 +749,8 @@ class TestReviewLoop:
 
         result, final_deliverables = orch._run_review_loop("prompt", original, [], "技術", "gen_prompt", "C1", "ts1")
 
-        # fix call (2 回目の call_claude 呼び出し) の prompt にスコープ制約セクションが含まれていること
-        fix_call_prompt = mock_claude.call_args_list[1].args[0]
+        # fix call (call_claude の唯一の呼び出し = fixer) の prompt にスコープ制約セクションが含まれていること
+        fix_call_prompt = mock_claude.call_args_list[0].args[0]
         assert "本ループでの修正可能範囲" in fix_call_prompt
         assert "code_files" in fix_call_prompt
         assert "quality_metadata.notes" in fix_call_prompt
@@ -622,7 +764,8 @@ class TestReviewLoop:
         assert result["passed"] is True
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_text_issue_updates_text_normally(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_text_issue_updates_text_normally(self, mock_codex, mock_claude):
         """テキスト関連指摘では、従来通り summary / content_blocks が更新される (回帰なし)"""
         from orchestrator import Orchestrator
 
@@ -632,21 +775,20 @@ class TestReviewLoop:
             "description": "数値 $100 億 が出典 [3] と矛盾 ($85 億)",
             "fix_instruction": "セクション 3 の市場規模を $85 億 に修正",
         }
-        responses = [
-            json.dumps({"result": json.dumps({"passed": False, "issues": [text_issue], "quality_metadata": {}})}),
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [text_issue], "quality_metadata": {}}),
+            json.dumps({"passed": True, "issues": [], "quality_metadata": {}}),
+        ]
+        # fixer (call_claude): テキスト修正版
+        mock_claude.side_effect = [
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "content_blocks": [{"t": "fixed-section-3"}],
-                            "summary": "市場規模を $85 億 に更新済みの最新版",
-                        }
-                    )
+                    "content_blocks": [{"t": "fixed-section-3"}],
+                    "summary": "市場規模を $85 億 に更新済みの最新版",
                 }
             ),
-            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
         ]
-        mock_claude.side_effect = responses
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
 
@@ -666,7 +808,8 @@ class TestReviewLoop:
         assert final_deliverables["code_files"] == original_code_files
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_merges_fixer_notes_into_review_quality_metadata(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_merges_fixer_notes_into_review_quality_metadata(self, mock_codex, mock_claude):
         """fix loop で fixer が quality_metadata.notes に書いた未修正記録は、
         後続の review pass 時にも review_result.quality_metadata.notes へマージされる
         (Codex review P2 対応 — Notion / DynamoDB に流れる出力経路で notes が捨てられない)。
@@ -679,24 +822,23 @@ class TestReviewLoop:
             "description": "resolver.tf の filter ブロックは非対応",
             "fix_instruction": "filter ブロック削除",
         }
-        responses = [
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
             json.dumps(
-                {"result": json.dumps({"passed": False, "issues": [code_issue], "quality_metadata": {"notes": []}})}
+                {"passed": False, "issues": [code_issue], "quality_metadata": {"notes": []}}
             ),
+            json.dumps({"passed": True, "issues": [], "quality_metadata": {"notes": []}}),
+        ]
+        # fixer (call_claude): notes に未修正記録
+        mock_claude.side_effect = [
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "content_blocks": [{"t": "unchanged"}],
-                            "summary": "Route 53 概要",
-                            "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
-                        }
-                    )
+                    "content_blocks": [{"t": "unchanged"}],
+                    "summary": "Route 53 概要",
+                    "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
                 }
             ),
-            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {"notes": []}})}),
         ]
-        mock_claude.side_effect = responses
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original_code_files = {"files": {"resolver.tf": "..."}, "readme_content": "# README"}
@@ -717,7 +859,8 @@ class TestReviewLoop:
         assert final_deliverables["code_files"] == original_code_files
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_accumulates_fixer_notes_across_multiple_fixes(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_accumulates_fixer_notes_across_multiple_fixes(self, mock_codex, mock_claude):
         """複数回の fix にまたがって fixer notes が累積される (Codex review 2 回目 P2 対応)。
 
         1 回目の fixer が記録した「コード関連指摘 N 件は本ループ未修正」が、2 回目の fix で
@@ -738,43 +881,38 @@ class TestReviewLoop:
             "description": "数値矛盾",
             "fix_instruction": "$85 億 に修正",
         }
-        responses = [
+        # reviewer (call_codex): 1回目コード error → 2回目テキスト error → 3回目 pass
+        mock_codex.side_effect = [
             # 1 回目 review: コード関連 error
             json.dumps(
-                {"result": json.dumps({"passed": False, "issues": [code_issue], "quality_metadata": {"notes": []}})}
-            ),
-            # 1 回目 fix: fixer がスコープ制約に従い notes に未修正を記録
-            json.dumps(
-                {
-                    "result": json.dumps(
-                        {
-                            "content_blocks": [{"t": "after-fix-1"}],
-                            "summary": "Route 53 概要",
-                            "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
-                        }
-                    )
-                }
+                {"passed": False, "issues": [code_issue], "quality_metadata": {"notes": []}}
             ),
             # 2 回目 review: 別のテキスト error (code error は前回未修正のまま)
             json.dumps(
-                {"result": json.dumps({"passed": False, "issues": [text_issue], "quality_metadata": {"notes": []}})}
+                {"passed": False, "issues": [text_issue], "quality_metadata": {"notes": []}}
+            ),
+            # 3 回目 review: pass を返す (reviewer は fixer notes を echo しない)
+            json.dumps({"passed": True, "issues": [], "quality_metadata": {"notes": []}}),
+        ]
+        # fixer (call_claude): 2 回の修正
+        mock_claude.side_effect = [
+            # 1 回目 fix: fixer がスコープ制約に従い notes に未修正を記録
+            json.dumps(
+                {
+                    "content_blocks": [{"t": "after-fix-1"}],
+                    "summary": "Route 53 概要",
+                    "quality_metadata": {"notes": ["コード関連指摘 1 件は本ループ未修正"]},
+                }
             ),
             # 2 回目 fix: テキスト指摘に対応、notes は空 (1 回目の note を引き継がない応答)
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "content_blocks": [{"t": "after-fix-2"}],
-                            "summary": "市場規模 $85 億 に更新済み",
-                            "quality_metadata": {"notes": []},
-                        }
-                    )
+                    "content_blocks": [{"t": "after-fix-2"}],
+                    "summary": "市場規模 $85 億 に更新済み",
+                    "quality_metadata": {"notes": []},
                 }
             ),
-            # 3 回目 review: pass を返す (reviewer は fixer notes を echo しない)
-            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {"notes": []}})}),
         ]
-        mock_claude.side_effect = responses
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original_code_files = {"files": {"resolver.tf": "..."}, "readme_content": "# README"}
@@ -796,22 +934,25 @@ class TestReviewLoop:
         assert final_deliverables["code_files"] == original_code_files
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_safely_skips_null_quality_metadata_in_fixer_response(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_safely_skips_null_quality_metadata_in_fixer_response(self, mock_codex, mock_claude):
         """fixer 応答の quality_metadata が null でも _accumulate_fixer_notes は raise せず safely skip する
         (Codex review 3 回目 P2 対応 — malformed LLM 応答でも review loop が abort しない)。
         """
         from orchestrator import Orchestrator
 
         issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
-        responses = [
-            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
-            # fixer が malformed: quality_metadata が null
-            json.dumps(
-                {"result": json.dumps({"content_blocks": [{"t": "fixed"}], "summary": "OK", "quality_metadata": None})}
-            ),
-            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps({"passed": True, "issues": [], "quality_metadata": {}}),
         ]
-        mock_claude.side_effect = responses
+        # fixer (call_claude) が malformed: quality_metadata が null
+        mock_claude.side_effect = [
+            json.dumps(
+                {"content_blocks": [{"t": "fixed"}], "summary": "OK", "quality_metadata": None}
+            ),
+        ]
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -825,30 +966,29 @@ class TestReviewLoop:
         assert all(isinstance(n, str) for n in notes)
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_safely_skips_scalar_notes_in_fixer_response(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_safely_skips_scalar_notes_in_fixer_response(self, mock_codex, mock_claude):
         """fixer 応答の quality_metadata.notes が文字列 (scalar) でも、文字単位で
         accumulated に追加されず safely skip する (Notion/DynamoDB の corrupt 防止)。
         """
         from orchestrator import Orchestrator
 
         issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
-        responses = [
-            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
-            # fixer が malformed: notes が文字列
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps({"passed": True, "issues": [], "quality_metadata": {}}),
+        ]
+        # fixer (call_claude) が malformed: notes が文字列
+        mock_claude.side_effect = [
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "content_blocks": [{"t": "fixed"}],
-                            "summary": "OK",
-                            "quality_metadata": {"notes": "コード関連指摘 1 件は本ループ未修正"},
-                        }
-                    )
+                    "content_blocks": [{"t": "fixed"}],
+                    "summary": "OK",
+                    "quality_metadata": {"notes": "コード関連指摘 1 件は本ループ未修正"},
                 }
             ),
-            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
         ]
-        mock_claude.side_effect = responses
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -863,28 +1003,27 @@ class TestReviewLoop:
         assert "コード関連指摘 1 件は本ループ未修正" not in notes
 
     @patch("orchestrator.call_claude")
-    def test_review_loop_safely_skips_int_notes_in_fixer_response(self, mock_claude):
+    @patch("orchestrator.call_codex")
+    def test_review_loop_safely_skips_int_notes_in_fixer_response(self, mock_codex, mock_claude):
         """fixer 応答の quality_metadata.notes が整数でも raise せず safely skip する。"""
         from orchestrator import Orchestrator
 
         issue = {"item": "test", "severity": "error", "description": "x", "fix_instruction": "y"}
-        responses = [
-            json.dumps({"result": json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}})}),
-            # fixer が malformed: notes が整数
+        # reviewer (call_codex): 不合格 → 合格
+        mock_codex.side_effect = [
+            json.dumps({"passed": False, "issues": [issue], "quality_metadata": {}}),
+            json.dumps({"passed": True, "issues": [], "quality_metadata": {}}),
+        ]
+        # fixer (call_claude) が malformed: notes が整数
+        mock_claude.side_effect = [
             json.dumps(
                 {
-                    "result": json.dumps(
-                        {
-                            "content_blocks": [{"t": "fixed"}],
-                            "summary": "OK",
-                            "quality_metadata": {"notes": 5},
-                        }
-                    )
+                    "content_blocks": [{"t": "fixed"}],
+                    "summary": "OK",
+                    "quality_metadata": {"notes": 5},
                 }
             ),
-            json.dumps({"result": json.dumps({"passed": True, "issues": [], "quality_metadata": {}})}),
         ]
-        mock_claude.side_effect = responses
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -903,7 +1042,7 @@ class TestReviewLoop:
     # 既存 TestReviewLoop の他テストは call_codex を patch しておらず実 CLI が
     # 呼ばれて parse_error になる pre-existing failure があるため、新規テストは
     # call_codex (reviewer) と call_claude (fixer) の両方を patch する。
-    # call_codex は生 JSON 文字列を返し、call_claude は {"result": "..."} 形式を返す。
+    # call_codex は生 JSON 文字列を返し、call_claude は最終応答テキスト (フェンス付き or 生 JSON) を返す。
     # ========================================================================
 
     @patch("orchestrator.call_claude")
@@ -921,7 +1060,7 @@ class TestReviewLoop:
             ),
         ]
         # fixer (call_claude): content_blocks キーを omit
-        mock_claude.return_value = json.dumps({"result": json.dumps({"summary": "fixed summary only"})})
+        mock_claude.return_value = json.dumps({"summary": "fixed summary only"})
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original-1"}, {"t": "original-2"}], "summary": "初版"}
@@ -942,9 +1081,7 @@ class TestReviewLoop:
                 {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
             ),
         ]
-        mock_claude.return_value = json.dumps(
-            {"result": json.dumps({"content_blocks": None, "summary": "fixed"})}
-        )
+        mock_claude.return_value = json.dumps({"content_blocks": None, "summary": "fixed"})
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -965,9 +1102,7 @@ class TestReviewLoop:
                 {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
             ),
         ]
-        mock_claude.return_value = json.dumps(
-            {"result": json.dumps({"content_blocks": [], "summary": "fixed"})}
-        )
+        mock_claude.return_value = json.dumps({"content_blocks": [], "summary": "fixed"})
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -988,9 +1123,7 @@ class TestReviewLoop:
                 {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
             ),
         ]
-        mock_claude.return_value = json.dumps(
-            {"result": json.dumps({"content_blocks": "not a list", "summary": "fixed"})}
-        )
+        mock_claude.return_value = json.dumps({"content_blocks": "not a list", "summary": "fixed"})
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -1013,9 +1146,7 @@ class TestReviewLoop:
                 {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
             ),
         ]
-        mock_claude.return_value = json.dumps(
-            {"result": json.dumps({"content_blocks": [{"t": "fixer-version"}], "summary": "fixed"})}
-        )
+        mock_claude.return_value = json.dumps({"content_blocks": [{"t": "fixer-version"}], "summary": "fixed"})
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -1049,9 +1180,7 @@ class TestReviewLoop:
             ),
         ]
         # fixer が content_blocks=None で fallback 発動
-        mock_claude.return_value = json.dumps(
-            {"result": json.dumps({"content_blocks": None, "summary": "fixed"})}
-        )
+        mock_claude.return_value = json.dumps({"content_blocks": None, "summary": "fixed"})
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original-a"}, {"t": "original-b"}], "summary": "初版"}
@@ -1083,9 +1212,9 @@ class TestReviewLoop:
     def test_fix_loop_keeps_previous_when_fixer_returns_non_dict(self, mock_codex, mock_claude, caplog):
         """fixer 応答が JSON array/scalar (非 dict) の場合、AttributeError を起こさず旧版を保持する。
 
-        `_parse_claude_response` は valid JSON でも `[]`, `"text"`, `123` 等を parse_error なしで
-        そのまま返す経路があり、`parsed.get(...)` で AttributeError になる pre-existing リスク。
-        Codex レビュー (1 回目, P1) の指摘に対する構造保護。
+        20260706 Agent SDK 移行で `_parse_claude_response` は厳密契約 (dict or raise) になり、
+        旧「非 dict をそのまま返す」経路は消滅した。本テストは非 dict 応答が
+        ClaudeResponseParseError → unparseable 分岐で旧版保持されることを検証する。
         """
         import logging
 
@@ -1098,8 +1227,10 @@ class TestReviewLoop:
                 {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
             ),
         ]
-        # fixer が JSON array を返す (非 dict)。`_parse_claude_response` は `[]` をそのまま返す。
-        mock_claude.return_value = json.dumps({"result": "[]"})
+        # fixer が JSON array を返す (非 dict)。厳密契約化後の `_parse_claude_response` は
+        # `[]` を返さず ClaudeResponseParseError を送出し、unparseable 分岐に集約される
+        # (20260706 Agent SDK 移行: 旧「非 dict をそのまま返す」経路の根絶)。
+        mock_claude.return_value = "[]"
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -1111,13 +1242,12 @@ class TestReviewLoop:
         # 旧版 deliverables が維持されること
         assert final["content_blocks"] == [{"t": "original"}]
         assert final["summary"] == "初版"
-        # 適切な warning が出ていること
-        non_dict_records = [
+        # 適切な warning が出ていること (非 dict も unparseable に集約された)
+        unparseable_records = [
             r for r in caplog.records
-            if "Fix attempt produced non-dict response" in r.getMessage()
+            if "Fix attempt produced unparseable response" in r.getMessage()
         ]
-        assert len(non_dict_records) == 1
-        assert non_dict_records[0].parsed_type == "list"
+        assert len(unparseable_records) == 1
 
     @patch("orchestrator.call_claude")
     @patch("orchestrator.call_codex")
@@ -1139,8 +1269,8 @@ class TestReviewLoop:
                 {"passed": True, "issues": [], "quality_metadata": {"sources_verified": 1, "sources_unverified": 0}}
             ),
         ]
-        # fixer が parse_error になる応答 (raw_text に変換される)
-        mock_claude.return_value = json.dumps({"result": "this is not valid json at all"})
+        # fixer が JSON 抽出不能な応答を返す (ClaudeResponseParseError → 旧版保持)
+        mock_claude.return_value = "this is not valid json at all"
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         original = {"content_blocks": [{"t": "original"}], "summary": "初版"}
@@ -1182,9 +1312,7 @@ class TestReviewLoop:
             ),
         ]
         # fixer が content_blocks=None で fallback の判定対象だが、旧版も無効なため fallback 発動せず
-        mock_claude.return_value = json.dumps(
-            {"result": json.dumps({"content_blocks": None, "summary": "fixed"})}
-        )
+        mock_claude.return_value = json.dumps({"content_blocks": None, "summary": "fixed"})
 
         orch = Orchestrator(MagicMock(), MagicMock(), "token", "db_id", "gh_token", "owner/repo")
         # 旧版自身が無効値 (空 list)
@@ -1246,16 +1374,21 @@ class TestCodeGeneration:
         # コード成果物の構造化ルールセクションが削除されている
         assert "コード成果物の構造化ルール" not in content
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
-    def test_code_generation_per_type_merges_files(self, mock_call_claude, mock_call_workspace, _mock_load):
+    def test_code_generation_per_type_merges_files(
+        self, mock_call_claude, mock_call_workspace, mock_call_codex, _mock_load, _mock_ws
+    ):
         """iac_code と program_code が個別 workspace 呼び出しでマージされる"""
         from orchestrator import Orchestrator
 
         analysis, workflow, research = self._make_analysis_and_workflow(["iac_code", "program_code"])
         text_deliverables = {"content_blocks": [], "summary": "完成"}
-        review = {"passed": True, "issues": [], "quality_metadata": {}}
+        # reviewer は call_codex 経由
+        mock_call_codex.return_value = json.dumps({"passed": True, "issues": [], "quality_metadata": {}})
 
         # コード生成は call_claude_with_workspace 経由
         mock_call_workspace.side_effect = [
@@ -1270,13 +1403,12 @@ class TestCodeGeneration:
                 {"files_kind": "valid", "files_count": 2, "files_total_bytes": 30, "rejected": []},
             ),
         ]
-        # text 系は call_claude 経由
+        # text 系は call_claude 経由 (review は call_codex に移動したため含めない)
         mock_call_claude.side_effect = [
-            json.dumps({"result": json.dumps(analysis)}),
-            json.dumps({"result": json.dumps(workflow)}),
-            json.dumps({"result": json.dumps(research)}),
-            json.dumps({"result": json.dumps(text_deliverables)}),
-            json.dumps({"result": json.dumps(review)}),
+            json.dumps(analysis),
+            json.dumps(workflow),
+            json.dumps(research),
+            json.dumps(text_deliverables),
         ]
 
         db = MagicMock()
@@ -1299,18 +1431,21 @@ class TestCodeGeneration:
         # README.md は files から分離されて readme_content にマージされる
         assert "README.md" not in files_arg
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
     def test_code_generation_partial_failure_keeps_successful_types(
-        self, mock_call_claude, mock_call_workspace, _mock_load
+        self, mock_call_claude, mock_call_workspace, mock_call_codex, _mock_load, _mock_ws
     ):
         """一方のタイプが workspace 失敗でも、もう一方は push される + Slack 部分失敗通知"""
         from orchestrator import Orchestrator
 
         analysis, workflow, research = self._make_analysis_and_workflow(["iac_code", "program_code"])
         text_deliverables = {"content_blocks": [], "summary": "完成"}
-        review = {"passed": True, "issues": [], "quality_metadata": {}}
+        # reviewer は call_codex 経由
+        mock_call_codex.return_value = json.dumps({"passed": True, "issues": [], "quality_metadata": {}})
 
         mock_call_workspace.side_effect = [
             (
@@ -1326,11 +1461,10 @@ class TestCodeGeneration:
             ),
         ]
         mock_call_claude.side_effect = [
-            json.dumps({"result": json.dumps(analysis)}),
-            json.dumps({"result": json.dumps(workflow)}),
-            json.dumps({"result": json.dumps(research)}),
-            json.dumps({"result": json.dumps(text_deliverables)}),
-            json.dumps({"result": json.dumps(review)}),
+            json.dumps(analysis),
+            json.dumps(workflow),
+            json.dumps(research),
+            json.dumps(text_deliverables),
         ]
 
         db = MagicMock()
@@ -1356,10 +1490,14 @@ class TestCodeGeneration:
         assert len(warning_calls) == 1
         assert "プログラムコード" in warning_calls[0].args[2]
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
+    @patch("orchestrator.call_codex")
     @patch("orchestrator.call_claude_with_workspace")
     @patch("orchestrator.call_claude")
-    def test_generator_code_files_always_discarded(self, mock_call_claude, mock_call_workspace, _mock_load):
+    def test_generator_code_files_always_discarded(
+        self, mock_call_claude, mock_call_workspace, mock_call_codex, _mock_load, _mock_ws
+    ):
         """ジェネレーターが誤って code_files を返しても、workspace 経由の値で上書きされる"""
         from orchestrator import Orchestrator
 
@@ -1369,7 +1507,8 @@ class TestCodeGeneration:
             "code_files": {"files": {"LEAK.tf": "# must not be used"}, "readme_content": ""},
             "summary": "完成",
         }
-        review = {"passed": True, "issues": [], "quality_metadata": {}}
+        # reviewer は call_codex 経由
+        mock_call_codex.return_value = json.dumps({"passed": True, "issues": [], "quality_metadata": {}})
 
         mock_call_workspace.side_effect = [
             (
@@ -1379,11 +1518,10 @@ class TestCodeGeneration:
             ),
         ]
         mock_call_claude.side_effect = [
-            json.dumps({"result": json.dumps(analysis)}),
-            json.dumps({"result": json.dumps(workflow)}),
-            json.dumps({"result": json.dumps(research)}),
-            json.dumps({"result": json.dumps(text_deliverables)}),
-            json.dumps({"result": json.dumps(review)}),
+            json.dumps(analysis),
+            json.dumps(workflow),
+            json.dumps(research),
+            json.dumps(text_deliverables),
         ]
 
         db = MagicMock()
@@ -1422,11 +1560,12 @@ class TestLearnedPreferencesInProfileText:
         }
         research = {"step_id": "r-1", "summary": "概要", "sources": []}
         deliverables = {"content_blocks": [], "code_files": None, "summary": "完成"}
+        # Agent SDK 移行後の call_claude は素のテキスト（bare JSON / フェンス付き JSON）を返す
         return [
-            json.dumps({"result": json.dumps(analysis)}),
-            json.dumps({"result": json.dumps(workflow)}),
-            json.dumps({"result": json.dumps(research)}),
-            json.dumps({"result": json.dumps(deliverables)}),
+            json.dumps(analysis, ensure_ascii=False),
+            json.dumps(workflow, ensure_ascii=False),
+            json.dumps(research, ensure_ascii=False),
+            json.dumps(deliverables, ensure_ascii=False),
         ]
 
     @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
@@ -1598,11 +1737,12 @@ class TestProgressiveNarrowingInRun:
         }
         research = {"step_id": "r-1", "summary": "概要", "sources": []}
         deliverables = {"content_blocks": [], "code_files": None, "summary": "完成"}
+        # Agent SDK 移行後の call_claude は素のテキスト（bare JSON / フェンス付き JSON）を返す
         return [
-            json.dumps({"result": json.dumps(analysis)}),
-            json.dumps({"result": json.dumps(workflow)}),
-            json.dumps({"result": json.dumps(research)}),
-            json.dumps({"result": json.dumps(deliverables)}),
+            json.dumps(analysis, ensure_ascii=False),
+            json.dumps(workflow, ensure_ascii=False),
+            json.dumps(research, ensure_ascii=False),
+            json.dumps(deliverables, ensure_ascii=False),
         ]
 
     def _run_orchestrator(self, mock_call_claude, mock_call_codex, prefs, category="時事"):
@@ -1697,11 +1837,11 @@ class TestPutDeliverableGitHubUrl:
         deliverables = {"content_blocks": [], "code_files": None, "summary": "完成"}
         review = {"passed": True, "issues": [], "quality_metadata": {}}
         return [
-            json.dumps({"result": json.dumps(analysis)}),
-            json.dumps({"result": json.dumps(workflow)}),
-            json.dumps({"result": json.dumps(research)}),
-            json.dumps({"result": json.dumps(deliverables)}),
-            json.dumps({"result": json.dumps(review)}),
+            json.dumps(analysis),
+            json.dumps(workflow),
+            json.dumps(research),
+            json.dumps(deliverables),
+            json.dumps(review),
         ]
 
     def _make_orch(self, db, mock_review_loop_return):
@@ -1717,9 +1857,10 @@ class TestPutDeliverableGitHubUrl:
         orch._run_review_loop = MagicMock(return_value=mock_review_loop_return)
         return orch
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
     @patch("orchestrator.call_claude")
-    def test_put_deliverable_with_github_url(self, mock_call_claude, _mock_load):
+    def test_put_deliverable_with_github_url(self, mock_call_claude, _mock_load, _mock_ws):
         """code_files ありで storage_targets に github を含む場合、put_deliverable に github_url が含まれる"""
         mock_call_claude.side_effect = self._make_responses_with_storage(["notion", "github"])
 
@@ -1744,9 +1885,10 @@ class TestPutDeliverableGitHubUrl:
         assert payload["github_url"] == "https://github.com/owner/repo/tree/main/test-20260429"
         assert payload["storage"] == "notion+github"
 
+    @patch("orchestrator._should_use_workspace_text_gen", return_value=False)
     @patch("orchestrator._load_prompt", return_value="# テスト用プロンプト")
     @patch("orchestrator.call_claude")
-    def test_put_deliverable_without_github_url(self, mock_call_claude, _mock_load):
+    def test_put_deliverable_without_github_url(self, mock_call_claude, _mock_load, _mock_ws):
         """code_files なしの場合、put_deliverable に github_url キー自体が含まれない"""
         mock_call_claude.side_effect = self._make_responses_with_storage(["notion"])
 
@@ -2102,37 +2244,32 @@ class TestClassifyWorkspaceOutcome:
 
 
 class TestCallClaudeWithWorkspace:
-    """Claude CLI の Write ツール経由呼び出しの sandbox 管理 + リトライ"""
+    """Agent SDK の Write ツール経由呼び出しの sandbox 管理 + リトライ"""
 
-    def _fake_subprocess_run(self, files_to_write: dict[str, str] | None = None, stdout: str = "ok"):
-        """Claude CLI の subprocess.run を差し替える fake。cwd を見て指定ファイルを書く。"""
+    def _fake_query(self, files_to_write: dict[str, str] | None = None, result_text: str = "ok"):
+        """_query_claude_sync を差し替える fake。options.cwd を見て指定ファイルを書く。"""
         from pathlib import Path
 
-        def runner(cmd, **kwargs):
-            sandbox = Path(kwargs["cwd"])
+        def runner(prompt, options):
+            sandbox = Path(options.cwd)
             for rel, content in (files_to_write or {}).items():
                 target = sandbox / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
-            result = MagicMock()
-            result.stdout = stdout
-            result.returncode = 0
-            return result
+            return _fake_result_message(result_text)
 
         return runner
 
-    def test_creates_and_cleans_sandbox(self, tmp_path):
+    def test_creates_and_cleans_sandbox(self):
         from orchestrator import call_claude_with_workspace
 
         captured: dict = {}
 
-        def fake_run(cmd, **kwargs):
-            captured["cwd"] = kwargs["cwd"]
-            result = MagicMock()
-            result.stdout = ""
-            return result
+        def fake_query(prompt, options):
+            captured["cwd"] = options.cwd
+            return _fake_result_message("")
 
-        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+        with patch("orchestrator._query_claude_sync", side_effect=fake_query):
             call_claude_with_workspace("p", "iac_code")
 
         assert captured["cwd"].startswith("/tmp/agent-output-iac_code-")
@@ -2141,19 +2278,16 @@ class TestCallClaudeWithWorkspace:
 
         assert not Path(captured["cwd"]).exists()
 
-    def test_passes_cwd_to_subprocess(self):
+    def test_passes_cwd_in_options(self):
         from orchestrator import call_claude_with_workspace
 
         captured: dict = {}
 
-        def fake_run(cmd, **kwargs):
-            captured["cwd"] = kwargs.get("cwd")
-            captured["cmd"] = cmd
-            result = MagicMock()
-            result.stdout = ""
-            return result
+        def fake_query(prompt, options):
+            captured["cwd"] = options.cwd
+            return _fake_result_message("")
 
-        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+        with patch("orchestrator._query_claude_sync", side_effect=fake_query):
             call_claude_with_workspace("p", "iac_code")
 
         assert captured["cwd"] is not None
@@ -2164,73 +2298,89 @@ class TestCallClaudeWithWorkspace:
 
         captured: dict = {}
 
-        def fake_run(cmd, **kwargs):
-            captured["cmd"] = cmd
-            result = MagicMock()
-            result.stdout = ""
-            return result
+        def fake_query(prompt, options):
+            captured["allowed_tools"] = options.allowed_tools
+            return _fake_result_message("")
 
-        with patch("orchestrator.subprocess.run", side_effect=fake_run):
+        with patch("orchestrator._query_claude_sync", side_effect=fake_query):
             call_claude_with_workspace("p", "iac_code")
 
-        assert "--allowedTools" in captured["cmd"]
-        idx = captured["cmd"].index("--allowedTools")
-        assert "Write" in captured["cmd"][idx + 1]
-        assert "Edit" in captured["cmd"][idx + 1]
+        assert "Write" in captured["allowed_tools"]
+        assert "Edit" in captured["allowed_tools"]
 
     def test_returns_collected_files(self):
         from orchestrator import call_claude_with_workspace
 
-        runner = self._fake_subprocess_run(
+        runner = self._fake_query(
             files_to_write={"main.tf": "resource ...", "README.md": "# doc"},
-            stdout="Wrote: main.tf, README.md",
+            result_text="Wrote: main.tf, README.md",
         )
 
-        with patch("orchestrator.subprocess.run", side_effect=runner):
+        with patch("orchestrator._query_claude_sync", side_effect=runner):
             raw, files, outcome = call_claude_with_workspace("p", "iac_code")
 
         assert raw == "Wrote: main.tf, README.md"
         assert files == {"main.tf": "resource ...", "README.md": "# doc"}
         assert outcome["files_kind"] == "valid"
 
-    def test_retries_on_subprocess_error(self):
-        import subprocess
-
+    def test_retries_on_process_error(self):
+        from claude_agent_sdk import ProcessError
         from orchestrator import call_claude_with_workspace
 
         call_count = {"n": 0}
 
-        def fake_run(cmd, **kwargs):
+        def fake_query(prompt, options):
             call_count["n"] += 1
             if call_count["n"] < 2:
-                raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="err")
-            result = MagicMock()
-            result.stdout = ""
-            return result
+                raise ProcessError("boom", exit_code=1, stderr="err")
+            return _fake_result_message("")
 
         with (
-            patch("orchestrator.subprocess.run", side_effect=fake_run),
+            patch("orchestrator._query_claude_sync", side_effect=fake_query),
             patch("orchestrator.time.sleep"),
         ):
             call_claude_with_workspace("p", "iac_code")
 
         assert call_count["n"] == 2
 
-    def test_cleans_sandbox_on_exception(self):
-        import subprocess
+    def test_advisor_gets_read_tool_after_retries_exhausted(self):
+        """sonnet 枯渇後の advisor 試行では allowed_tools に Read が追加される (旧 CLI 実装踏襲)"""
+        from claude_agent_sdk import ProcessError
+        from orchestrator import CLAUDE_ADVISOR_MODEL, call_claude_with_workspace
 
-        from orchestrator import call_claude_with_workspace
+        calls: list = []
+
+        def fake_query(prompt, options):
+            calls.append(options)
+            if len(calls) <= 3:
+                raise ProcessError("boom", exit_code=1, stderr="err")
+            return _fake_result_message("")
+
+        with (
+            patch("orchestrator._query_claude_sync", side_effect=fake_query),
+            patch("orchestrator.time.sleep"),
+        ):
+            call_claude_with_workspace("p", "iac_code")
+
+        assert len(calls) == 4
+        advisor_options = calls[3]
+        assert advisor_options.model == CLAUDE_ADVISOR_MODEL
+        assert advisor_options.allowed_tools == ["Write", "Edit", "Read"]
+
+    def test_cleans_sandbox_on_exception(self):
+        from claude_agent_sdk import ProcessError
+        from orchestrator import ClaudeInvocationError, call_claude_with_workspace
 
         captured: dict = {}
 
-        def fake_run(cmd, **kwargs):
-            captured["cwd"] = kwargs["cwd"]
-            raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="")
+        def fake_query(prompt, options):
+            captured["cwd"] = options.cwd
+            raise ProcessError("boom", exit_code=1, stderr="")
 
         with (
-            patch("orchestrator.subprocess.run", side_effect=fake_run),
+            patch("orchestrator._query_claude_sync", side_effect=fake_query),
             patch("orchestrator.time.sleep"),
-            pytest.raises(subprocess.CalledProcessError),
+            pytest.raises(ClaudeInvocationError),
         ):
             call_claude_with_workspace("p", "iac_code")
 

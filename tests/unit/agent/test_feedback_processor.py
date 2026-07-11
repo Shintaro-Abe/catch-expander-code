@@ -265,7 +265,7 @@ class TestFeedbackProcessorProcess:
         mock_db.get_user_profile.return_value = {"user_id": "U1", "role": "エンジニア"}
 
         mock_call_claude.return_value = json.dumps(
-            {"result": json.dumps({"preferences": [{"text": "Terraformはmodule分割する", "replaces_index": None}]})}
+            {"preferences": [{"text": "Terraformはmodule分割する", "replaces_index": None}]}, ensure_ascii=False
         )
 
         mock_slack = MagicMock()
@@ -290,7 +290,7 @@ class TestFeedbackProcessorProcess:
         mock_db.get_execution.return_value = {"topic": "topic", "category": "cat"}
         mock_db.get_user_profile.return_value = None
 
-        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+        mock_call_claude.return_value = json.dumps({"preferences": []}, ensure_ascii=False)
 
         mock_slack = MagicMock()
         processor = self._make_processor(mock_slack=mock_slack, mock_db=mock_db)
@@ -305,7 +305,7 @@ class TestFeedbackProcessorProcess:
         mock_db = MagicMock()
         mock_db.get_execution.side_effect = KeyError("Item")
         mock_db.get_user_profile.return_value = None
-        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+        mock_call_claude.return_value = json.dumps({"preferences": []}, ensure_ascii=False)
 
         processor = self._make_processor(mock_db=mock_db)
         # 例外が外に出ないこと
@@ -337,7 +337,7 @@ class TestFeedbackProcessorProcess:
         mock_db.get_execution.return_value = {"topic": "t", "category": "c"}
         mock_db.get_user_profile.return_value = None
         mock_call_claude.return_value = json.dumps(
-            {"result": json.dumps({"preferences": [{"text": "好み", "replaces_index": None}]})}
+            {"preferences": [{"text": "好み", "replaces_index": None}]}, ensure_ascii=False
         )
         mock_db.put_user_profile.side_effect = RuntimeError("DynamoDB error")
 
@@ -357,7 +357,7 @@ class TestFeedbackProcessorProcess:
         mock_db = MagicMock()
         mock_db.get_execution.return_value = {"topic": "t", "category": "c"}
         mock_db.get_user_profile.return_value = None
-        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+        mock_call_claude.return_value = json.dumps({"preferences": []}, ensure_ascii=False)
 
         processor = self._make_processor(mock_db=mock_db)
         processor.process("U1", "👍", "exec-001", "C1", "ts1")
@@ -374,17 +374,14 @@ class TestFeedbackProcessorProcess:
         mock_db.get_user_profile.return_value = None
         mock_call_claude.return_value = json.dumps(
             {
-                "result": json.dumps(
-                    {
-                        "preferences": [
-                            {"text": "好み1", "replaces_index": None},
-                            {"text": "好み2", "replaces_index": None},
-                            {"text": "好み3", "replaces_index": None},
-                            {"text": "好み4（切り捨て）", "replaces_index": None},
-                        ]
-                    }
-                )
-            }
+                "preferences": [
+                    {"text": "好み1", "replaces_index": None},
+                    {"text": "好み2", "replaces_index": None},
+                    {"text": "好み3", "replaces_index": None},
+                    {"text": "好み4（切り捨て）", "replaces_index": None},
+                ]
+            },
+            ensure_ascii=False,
         )
 
         mock_slack = MagicMock()
@@ -421,7 +418,7 @@ class TestProcessScopeValidation:
 
     @staticmethod
     def _claude_response(preferences):
-        return json.dumps({"result": json.dumps({"preferences": preferences})})
+        return json.dumps({"preferences": preferences}, ensure_ascii=False)
 
     @patch("feedback.feedback_processor.call_claude")
     def test_valid_scope_is_saved(self, mock_call_claude):
@@ -497,6 +494,48 @@ class TestProcessScopeValidation:
         assert saved[0]["scope"]["deliverables"] == ["code", "research_report"]
 
     @patch("feedback.feedback_processor.call_claude")
+    def test_unparseable_response_treated_as_empty(self, mock_call_claude):
+        """Codex Pass 1 P1 対応（Agent SDK 厳密契約版）: JSON array / scalar / 非 JSON 応答は
+        ClaudeResponseParseError となり「好みなし」として graceful に処理される"""
+        for garbage in ("[]", '"text"', "42", "not a json", '[{"text": "x"}]'):
+            mock_db = self._make_db()
+            mock_call_claude.return_value = garbage
+
+            mock_slack = MagicMock()
+            processor = self._make_processor(mock_slack=mock_slack, mock_db=mock_db)
+            processor.process("U1", "feedback", "exec-001", "C1", "ts1")
+
+            mock_slack.post_feedback_unextracted.assert_called_once()
+            mock_slack.post_error.assert_not_called()
+
+    @patch("feedback.feedback_processor.call_claude")
+    def test_malformed_existing_prefs_are_normalized(self, mock_call_claude):
+        """Codex Pass 1 P2: 既存 learned_preferences の string 要素 / malformed dict で落ちない"""
+        mock_db = self._make_db()
+        mock_db.get_user_profile.return_value = {
+            "user_id": "U1",
+            "learned_preferences": [
+                "legacy string",
+                {"text": None},
+                {"no_text": True},
+                {"text": "正常な既存好み", "created_at": "2026-01-01T00:00:00Z"},
+            ],
+        }
+        mock_call_claude.return_value = self._claude_response(
+            [{"text": "新しい好み", "scope": {"categories": [], "deliverables": []}, "replaces_index": None}]
+        )
+
+        processor = self._make_processor(mock_db=mock_db)
+        processor.process("U1", "feedback", "exec-001", "C1", "ts1")
+
+        prompt = mock_call_claude.call_args[0][0]
+        assert "正常な既存好み" in prompt
+        assert "legacy string" not in prompt  # 正規化で除外
+
+        saved = mock_db.put_user_profile.call_args[0][0]["learned_preferences"]
+        assert [p["text"] for p in saved] == ["正常な既存好み", "新しい好み"]
+
+    @patch("feedback.feedback_processor.call_claude")
     def test_non_dict_preference_entries_are_filtered(self, mock_call_claude):
         mock_db = self._make_db()
         mock_call_claude.return_value = self._claude_response(
@@ -533,7 +572,7 @@ class TestFeedbackReceivedEmit:
         mock_db.get_execution.return_value = {"topic": "T", "category": "技術"}
         mock_db.get_user_profile.return_value = None
         mock_call_claude.return_value = json.dumps(
-            {"result": json.dumps({"preferences": [{"text": "新しい好み", "replaces_index": None}]})}
+            {"preferences": [{"text": "新しい好み", "replaces_index": None}]}, ensure_ascii=False
         )
 
         emitter_instance = MagicMock()
@@ -585,7 +624,7 @@ class TestFeedbackReceivedEmit:
         mock_db = MagicMock()
         mock_db.get_execution.return_value = {"topic": "T", "category": "技術"}
         mock_db.get_user_profile.return_value = None
-        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+        mock_call_claude.return_value = json.dumps({"preferences": []}, ensure_ascii=False)
 
         emitter_instance = MagicMock()
         mock_emitter_cls.return_value = emitter_instance
@@ -605,7 +644,7 @@ class TestFeedbackReceivedEmit:
         mock_db = MagicMock()
         mock_db.get_execution.return_value = {"topic": "T", "category": "技術"}
         mock_db.get_user_profile.return_value = None
-        mock_call_claude.return_value = json.dumps({"result": json.dumps({"preferences": []})})
+        mock_call_claude.return_value = json.dumps({"preferences": []}, ensure_ascii=False)
 
         processor = self._make_processor(mock_db=mock_db)
         processor.process("U1", "feedback", "exec-004", "C1", "ts1")
