@@ -35,7 +35,7 @@
 
 ## Phase 5: レビューと検証（CLAUDE.md 規律に従う）
 
-- [ ] T17: pre-commit-secret-scan → commit → push（ユーザー決定: コミット前レビュー方式に変更、レビュー収束後に 2 論理コミット）
+- [x] T17: pre-commit-secret-scan (gitleaks 8.30.1, no leaks) → **2 論理コミット** (4fa1184 pref-scope 是正 / b62a438 SDK 移行) → push 完了（ユーザー決定によりコミット前レビュー方式に変更、レビュー収束後にコミット）
 - [x] T18: Codex レビューゲート — **収束 (2026-07-11)**: Pass 1 (gpt-5.4): P1×0 / P2×2 → 両方是正 + 回帰テスト 2 件追加、527 passed。Pass 2 (gpt-5.5): **指摘ゼロ**、是正 2 件も「意図どおり」確認（`.audit/2026-07-06_agent-sdk-migration.md`）。方式: read-only sandbox + 差分埋め込み（bwrap が devcontainer で不可のため）
 - [ ] T19: ユーザー明示承認後に `sam build` / `sam deploy`（dev）
 - [ ] T20: 実機検証（`/deploy-verify` + design.md の環境前提 4 項目）:
@@ -43,7 +43,7 @@
   - [ ] CloudWatch Logs で researcher（WebSearch）/ generator（sandbox Write）/ fix loop の実動作確認
   - [ ] `.credentials.json` 認証成功と終了時 writeback の発火確認
   - [ ] `api_call_completed` / `rate_limit_hit` イベントが events テーブルに従来契約で記録されることを確認
-- [ ] T21: `docs/architecture.md` の CLI 記述を SDK 構成に整合更新、セッションハンドオフ memo 更新
+- [x] T21: `docs/architecture.md` の CLI 記述を SDK 構成に整合更新（エージェント基盤表 / §4.5 出力フォーマット）、セッションハンドオフ memo 更新。※ Dockerfile の CLI インストール・Node.js ランタイム・認証記述は SDK 移行後も事実として正しいため温存
 
 ## 完了条件
 
