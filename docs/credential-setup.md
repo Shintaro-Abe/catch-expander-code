@@ -129,7 +129,9 @@ aws secretsmanager create-secret \
 
 ### 3.1 コード成果物リポジトリの作成
 
-1. GitHubで `catch-expander-code` リポジトリを作成（Private）
+1. GitHubで `catch-expander-deliverables` リポジトリを作成（Private）
+   （template.yaml の `GitHubRepository` パラメータと一致させること。旧記述の
+   `catch-expander-code` は誤り — 実際の push 先は deliverables リポジトリ）
 2. READMEを追加して初期化
 
 ### 3.2 Fine-grained PATの作成
@@ -142,7 +144,7 @@ aws secretsmanager create-secret \
 |------|------|
 | Token name | `catch-expander` |
 | Expiration | 90 days（期限切れ前に再発行） |
-| Repository access | Only select repositories → `catch-expander-code` |
+| Repository access | Only select repositories → `catch-expander-deliverables` |
 
 4. Repository permissionsで以下のみ付与:
 
