@@ -328,6 +328,20 @@ class TestWritebackClaudeCredentials:
 
         mock_client_factory.assert_not_called()
 
+    def test_skips_writeback_when_oauth_section_is_not_dict(self, tmp_path):
+        """T27 (Codex Pass 1 補足): claudeAiOauth が null 等でも例外ではなく skip。"""
+        from main import _hash_text, _writeback_claude_credentials
+
+        initial_content = _claude_creds_json("old-at", "old-rt")
+        self._setup_creds_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
+        (tmp_path / ".claude" / ".credentials.json").write_text('{"claudeAiOauth": null}')
+
+        with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
+            _writeback_claude_credentials("arn:claude", initial_hash)
+
+        mock_client_factory.assert_not_called()
+
     def test_swallows_put_exception(self, tmp_path):
         from main import _hash_text, _writeback_claude_credentials
 

@@ -72,6 +72,9 @@ def _claude_credentials_look_valid(content: str) -> bool:
         oauth = json.loads(content).get("claudeAiOauth", {})
     except (json.JSONDecodeError, AttributeError):
         return False
+    # Codex Pass 1 補足: claudeAiOauth が null / 文字列でも例外ではなく invalid skip にする
+    if not isinstance(oauth, dict):
+        return False
     return bool(oauth.get("accessToken")) and bool(oauth.get("refreshToken"))
 
 
