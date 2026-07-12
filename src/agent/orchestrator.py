@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -558,9 +559,14 @@ def _query_claude_sync(prompt: str, options: ClaudeAgentOptions) -> ResultMessag
 
     async def _run() -> ResultMessage:
         try:
-            async for message in _sdk_query(prompt=prompt, options=options):
-                if isinstance(message, ResultMessage):
-                    return message
+            # Codex Pass 1 P2-1: 早期 return 時の transport 終了をイベントループ shutdown の
+            # finalizer 任せにせず、aclosing で generator の aclose() を明示的に走らせる
+            async with contextlib.aclosing(
+                _sdk_query(prompt=prompt, options=options)
+            ) as stream:
+                async for message in stream:
+                    if isinstance(message, ResultMessage):
+                        return message
         except ClaudeSDKError:
             raise
         except Exception as e:

@@ -262,6 +262,26 @@ class TestQueryClaudeSync:
             result = _query_claude_sync("prompt", _build_claude_options("sonnet", None, None))
         assert result is msg
 
+    def test_early_return_closes_stream_generator(self):
+        """ResultMessage での早期 return 後も aclosing により generator の finally
+        (= SDK 側 transport cleanup 相当) が実行される (Codex Pass 1 P2-1/P2-2)。"""
+        from orchestrator import _build_claude_options, _query_claude_sync
+
+        cleanup = {"ran": False}
+        msg = _real_result_message("ok")
+
+        async def _gen(*, prompt, options):
+            try:
+                yield msg
+                yield _real_result_message("should not be consumed")
+            finally:
+                cleanup["ran"] = True
+
+        with patch("orchestrator._sdk_query", _gen):
+            result = _query_claude_sync("prompt", _build_claude_options("sonnet", None, None))
+        assert result is msg
+        assert cleanup["ran"] is True
+
     def test_stream_error_before_result_is_normalized(self):
         """ResultMessage 到達前の素の Exception (エラーフレーム) は ClaudeInvocationError に
         正規化され、リトライ共通経路に乗る。"""
