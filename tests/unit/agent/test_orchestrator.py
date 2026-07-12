@@ -128,6 +128,22 @@ class TestCallClaude:
 
     @patch("orchestrator.time.sleep")
     @patch("orchestrator._query_claude_sync")
+    def test_call_claude_session_limit_in_error_result(self, mock_query, mock_sleep):
+        """新 CLI の session limit 文言 (exec-20260712005527 で観測) を rate limit として
+        扱う (T26)。旧パターン集合では 'session limit' が漏れており advisor エスカレーション +
+        汎用 Slack 文言に誤分類されていた。"""
+        from orchestrator import ClaudeInvocationError, call_claude
+
+        mock_query.return_value = _fake_result_message(
+            "You've hit your session limit · resets 2am (UTC)", is_error=True
+        )
+        with pytest.raises(ClaudeInvocationError) as excinfo:
+            call_claude("prompt")
+        assert mock_query.call_count == 3  # rate limit 扱いのため advisor なし
+        assert excinfo.value.rate_limited is True
+
+    @patch("orchestrator.time.sleep")
+    @patch("orchestrator._query_claude_sync")
     def test_call_claude_advisor_failure_updates_final_exception(self, mock_query, mock_sleep):
         """Sonnet 通常失敗 ×3 の後 advisor だけ usage limit で失敗した場合、
         最終例外は advisor 側の失敗 (rate_limited=True) を反映する (Codex Pass 1 P2-1)。"""

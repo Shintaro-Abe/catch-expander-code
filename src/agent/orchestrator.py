@@ -435,7 +435,9 @@ def _claude_stderr_indicates_rate_limit(stderr_text: str) -> bool:
     return "429" in lowered or "rate limit" in lowered or "rate_limit" in lowered
 
 
-_USAGE_LIMIT_RESULT_PATTERNS = ("usage limit", "rate limit", "rate_limit", "429")
+# "session limit": exec-20260712005527 で観測した新 CLI 文言
+# "You've hit your session limit · resets 2am (UTC)"
+_USAGE_LIMIT_RESULT_PATTERNS = ("usage limit", "session limit", "rate limit", "rate_limit", "429")
 
 
 def _result_indicates_usage_limit(result_text: str) -> bool:

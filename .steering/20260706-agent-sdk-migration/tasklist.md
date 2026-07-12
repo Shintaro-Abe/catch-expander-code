@@ -57,7 +57,18 @@
 - [x] T22: `_query_claude_sync` を「最初の ResultMessage で return」に変更（SDK `receive_response` と同セマンティクス）。ResultMessage 到達前にストリームが素の `Exception` を raise した場合は `ClaudeInvocationError` に正規化してリトライ経路に乗せる（`ClaudeSDKError` 系は従来どおり素通し — CLINotFoundError/CLIConnectionError の即時 fail と ProcessError の stderr 429 判定を温存）。P2-2 正規化分岐にも stderr 429 判定を追加（SDK reader が途中 ProcessError をエラーフレーム化するため）
 - [x] T23: 回帰テスト追加（`TestQueryClaudeSync` 6 件）— (1) is_error ResultMessage 後にエラーフレーム Exception が来ても ResultMessage が返る、(2) 本番障害の E2E 再現: usage limit が `rate_limited=True` に分類され advisor スキップ、(3) ResultMessage なしの素の Exception → 正規化、(4) CLINotFoundError 素通し、(5) 空ストリーム → ClaudeInvocationError、(6) エラーフレーム内 429 の rate limit 分類。**全 533 passed**、変更ファイルの新規 lint ゼロ（11 件は HEAD 比較で pre-existing と同一集合を確認）
 - [x] T24: Dockerfile から未使用の `@anthropic-ai/claude-code@2.1.207` を除去（本番ログ全呼び出しで SDK 同梱 CLI 2.1.191 使用を確認、PATH claude への依存コードなし）。Dockerfile コメント / architecture.md（基盤表・ランタイム表・Dockerfile 抜粋）を同梱 CLI 前提に訂正
-- [ ] T25: 品質ゲート — ruff / 全テスト green ✔ → secret scan → commit → push → Codex レビューゲート（承認制）→ 再デプロイ（ユーザー実行）→ E2E 再実行
+> **E2E 再実行 2 回の結果 (2026-07-12)**:
+> exec-20260712003302: 401 認証失敗（ローカル Claude Code セッションが refresh token を
+> ローテーションしシークレット側が失効。さらに CLI がログアウトした空 credentials を
+> writeback がシークレットに書き戻し破壊 → T27）。
+> exec-20260712005527: 再同期後 56 分ほぼ完走（解析/設計/リサーチ 5 本/text generator/
+> コード生成 2 種/fix loop まで実機成功 = T20 の大半を実証）、最終盤に
+> `You've hit your session limit · resets 2am (UTC)` で失敗。新 CLI の上限文言
+> "session limit" が `_USAGE_LIMIT_RESULT_PATTERNS` に無くレート制限扱いにならなかった → T26。
+
+- [x] T26: `_USAGE_LIMIT_RESULT_PATTERNS` に "session limit" を追加（advisor スキップ / Slack レート制限文言の分類を回復）+ 本番観測文言での回帰テスト（`test_call_claude_session_limit_in_error_result`）
+- [x] T27: `_writeback_claude_credentials` に空 credentials ガード（`_claude_credentials_look_valid`: accessToken / refreshToken が空 or JSON 不正なら writeback をスキップ）+ 回帰テスト 2 件、既存フィクスチャを claudeAiOauth 実形状に更新。**全 537 passed**、新規 lint ゼロ
+- [ ] T25: 品質ゲート — ruff / 全テスト green ✔ → secret scan（初回 102 件は全件精査で FP、`.gitleaks.toml` 整備 202efa0）✔ → commit（46b9784）→ push ✔ → **Codex レビューゲート収束**（Pass 1: P2×2 → aclosing 化 + 回帰テストで是正（ec5cb6d、534 passed）、Pass 2: 指摘ゼロ。`.audit/2026-07-11_sdk-stream-error-result.md`）✔ → 再デプロイ完了（2026-07-12、ユーザー実行。**検証**: stack UPDATE_COMPLETE + AgentImageUri=ec5cb6d + task definition `catch-expander-agent:16` が ec5cb6d image を参照）✔ → 残り: E2E 再実行（T20 / preference-scope T8-4）
 
 ## 完了条件
 

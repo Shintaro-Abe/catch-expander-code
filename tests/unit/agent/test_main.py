@@ -1,3 +1,4 @@
+import json
 import subprocess
 from unittest.mock import MagicMock, patch
 
@@ -218,6 +219,11 @@ class TestWritebackCodexCredentials:
 # ---------------------------------------------------------------------------
 
 
+def _claude_creds_json(access: str, refresh: str) -> str:
+    """claudeAiOauth 形式のダミー credentials (T27 のログイン判定を通す/落とす用)。"""
+    return json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": refresh}})
+
+
 class TestWritebackClaudeCredentials:
     def _patch_home(self, tmp_path):
         return patch.object(
@@ -234,7 +240,7 @@ class TestWritebackClaudeCredentials:
     def test_skips_when_credentials_unchanged(self, tmp_path):
         from main import _hash_text, _writeback_claude_credentials
 
-        content = '{"token": "same"}'
+        content = _claude_creds_json("same-at", "same-rt")
         self._setup_creds_file(tmp_path, content)
         initial_hash = _hash_text(content)
 
@@ -246,10 +252,11 @@ class TestWritebackClaudeCredentials:
     def test_calls_put_when_credentials_changed(self, tmp_path):
         from main import _hash_text, _writeback_claude_credentials
 
-        initial_content = '{"token": "old"}'
+        initial_content = _claude_creds_json("old-at", "old-rt")
+        new_content = _claude_creds_json("new-at", "new-rt")
         self._setup_creds_file(tmp_path, initial_content)
         initial_hash = _hash_text(initial_content)
-        (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
+        (tmp_path / ".claude" / ".credentials.json").write_text(new_content)
 
         mock_client = MagicMock()
         mock_client.get_secret_value.return_value = {"SecretString": initial_content}
@@ -258,19 +265,23 @@ class TestWritebackClaudeCredentials:
 
         mock_client.put_secret_value.assert_called_once_with(
             SecretId="arn:claude",
-            SecretString='{"token": "new"}',
+            SecretString=new_content,
         )
 
     def test_skips_when_remote_updated_concurrently(self, tmp_path):
         from main import _hash_text, _writeback_claude_credentials
 
-        initial_content = '{"token": "old"}'
+        initial_content = _claude_creds_json("old-at", "old-rt")
         self._setup_creds_file(tmp_path, initial_content)
         initial_hash = _hash_text(initial_content)
-        (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
+        (tmp_path / ".claude" / ".credentials.json").write_text(
+            _claude_creds_json("new-at", "new-rt")
+        )
 
         mock_client = MagicMock()
-        mock_client.get_secret_value.return_value = {"SecretString": '{"token": "concurrent"}'}
+        mock_client.get_secret_value.return_value = {
+            "SecretString": _claude_creds_json("concurrent-at", "concurrent-rt")
+        }
         with self._patch_home(tmp_path), patch("main.boto3.client", return_value=mock_client):
             _writeback_claude_credentials("arn:claude", initial_hash)
 
@@ -284,13 +295,48 @@ class TestWritebackClaudeCredentials:
 
         mock_client_factory.assert_not_called()
 
+    def test_skips_writeback_when_credentials_logged_out(self, tmp_path):
+        """T27 (exec-20260712003302): 認証失敗で CLI がログアウトし空になった credentials を
+        書き戻すとシークレット側の正常値まで破壊するため、writeback をスキップする。"""
+        from main import _hash_text, _writeback_claude_credentials
+
+        initial_content = _claude_creds_json("old-at", "old-rt")
+        self._setup_creds_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
+        (tmp_path / ".claude" / ".credentials.json").write_text(
+            json.dumps(
+                {"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}
+            )
+        )
+
+        with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
+            _writeback_claude_credentials("arn:claude", initial_hash)
+
+        mock_client_factory.assert_not_called()
+
+    def test_skips_writeback_when_credentials_unparseable(self, tmp_path):
+        """T27: JSON として読めない credentials も writeback しない (fail-closed)。"""
+        from main import _hash_text, _writeback_claude_credentials
+
+        initial_content = _claude_creds_json("old-at", "old-rt")
+        self._setup_creds_file(tmp_path, initial_content)
+        initial_hash = _hash_text(initial_content)
+        (tmp_path / ".claude" / ".credentials.json").write_text("not-json")
+
+        with self._patch_home(tmp_path), patch("main.boto3.client") as mock_client_factory:
+            _writeback_claude_credentials("arn:claude", initial_hash)
+
+        mock_client_factory.assert_not_called()
+
     def test_swallows_put_exception(self, tmp_path):
         from main import _hash_text, _writeback_claude_credentials
 
-        initial_content = '{"token": "old"}'
+        initial_content = _claude_creds_json("old-at", "old-rt")
         self._setup_creds_file(tmp_path, initial_content)
         initial_hash = _hash_text(initial_content)
-        (tmp_path / ".claude" / ".credentials.json").write_text('{"token": "new"}')
+        (tmp_path / ".claude" / ".credentials.json").write_text(
+            _claude_creds_json("new-at", "new-rt")
+        )
 
         mock_client = MagicMock()
         mock_client.get_secret_value.return_value = {"SecretString": initial_content}

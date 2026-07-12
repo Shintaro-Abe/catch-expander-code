@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -59,6 +60,21 @@ def _setup_claude_credentials(secret_value: str) -> str:
     return _hash_text(secret_value)
 
 
+def _claude_credentials_look_valid(content: str) -> bool:
+    """credentials.json がログイン状態のトークンを保持しているかを判定する。
+
+    T27 (exec-20260712003302): 認証失敗時に CLI がログアウトして credentials を
+    空にすることがあり、それを writeback するとシークレット側の正常値まで破壊する。
+    accessToken / refreshToken が非空文字列であることだけを最小条件として確認する
+    （トークン値そのものは検証もログもしない）。
+    """
+    try:
+        oauth = json.loads(content).get("claudeAiOauth", {})
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    return bool(oauth.get("accessToken")) and bool(oauth.get("refreshToken"))
+
+
 def _writeback_claude_credentials(secret_arn: str, initial_hash: str) -> None:
     """タスク終了時、credentials が refresh されていれば Secrets Manager に書き戻す。
 
@@ -74,6 +90,12 @@ def _writeback_claude_credentials(secret_arn: str, initial_hash: str) -> None:
         current = creds_path.read_text()
         if _hash_text(current) == initial_hash:
             logger.info("Credentials unchanged at task exit")
+            return
+        if not _claude_credentials_look_valid(current):
+            # T27: ログアウト等で空になった credentials を書き戻すとシークレットを破壊する
+            logger.warning(
+                "Credentials at task exit look logged-out/empty; skipping writeback"
+            )
             return
         sm = boto3.client("secretsmanager")
         remote_now = sm.get_secret_value(SecretId=secret_arn)["SecretString"]
