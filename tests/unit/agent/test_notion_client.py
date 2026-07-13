@@ -167,6 +167,41 @@ class TestNormalizeCodeLanguages:
         self._normalize(original)
         assert original == snapshot
 
+    def test_nested_children_are_normalized_recursively(self):
+        """Codex T28 Pass 1 P1-2: toggle 等の type payload 内 children の code block も
+        正規化する（トップレベルのみだと 400 が再発する）。"""
+        toggle = {
+            "type": "toggle",
+            "toggle": {
+                "rich_text": [{"type": "text", "text": {"content": "詳細"}}],
+                "children": [
+                    self._code_block("terraform"),
+                    {
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {
+                            "rich_text": [],
+                            "children": [self._code_block("yml")],
+                        },
+                    },
+                ],
+            },
+        }
+        snapshot = copy.deepcopy(toggle)
+        result = self._normalize([toggle])
+        children = result[0]["toggle"]["children"]
+        assert children[0]["code"]["language"] == "hcl"
+        nested = children[1]["bulleted_list_item"]["children"]
+        assert nested[0]["code"]["language"] == "yaml"
+        assert toggle == snapshot  # 非 mutate
+
+    def test_nested_children_without_changes_keep_identity(self):
+        toggle = {
+            "type": "toggle",
+            "toggle": {"rich_text": [], "children": [self._code_block("java")]},
+        }
+        result = self._normalize([toggle])
+        assert result[0] is toggle
+
     @patch("storage.notion_client.requests.request")
     def test_create_page_normalizes_code_language_in_payload(self, mock_request):
         """create_page 経由で送信 payload の language が正規化されることを確認。"""
