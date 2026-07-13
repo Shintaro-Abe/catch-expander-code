@@ -46,6 +46,101 @@ class NotionCloudflareBlockError(Exception):
         self.cf_ray = cf_ray
 
 
+# Notion API code block の language 許容値 (API version 2022-06-28)。
+# 2026-07-13 の 400 validation_error 応答 enum + API リファレンスより。
+# LLM 生成の content_blocks は許容外の値 (例: "terraform", "yml", "properties") を
+# 出し得るため、送信前に _normalize_code_languages で決定的に正規化する
+# (T28, exec-20260713114159。_split_long_rich_text と同じ検証層パターン)。
+_NOTION_CODE_LANGUAGES = frozenset({
+    "abap", "abc", "agda", "arduino", "ascii art", "assembly", "bash", "basic", "bnf",
+    "c", "c#", "c++", "clojure", "coffeescript", "coq", "css", "dart", "dhall", "diff",
+    "docker", "ebnf", "elixir", "elm", "erlang", "f#", "flow", "fortran", "gherkin",
+    "glsl", "go", "graphql", "groovy", "haskell", "hcl", "html", "idris", "java",
+    "javascript", "json", "julia", "kotlin", "latex", "less", "lisp", "livescript",
+    "llvm ir", "lua", "makefile", "markdown", "markup", "matlab", "mathematica",
+    "mermaid", "nix", "notion formula", "objective-c", "ocaml", "pascal", "perl", "php",
+    "plain text", "powershell", "prolog", "protobuf", "purescript", "python", "r",
+    "racket", "reason", "ruby", "rust", "sass", "scala", "scheme", "scss", "shell",
+    "smalltalk", "solidity", "sql", "swift", "toml", "typescript", "vb.net", "verilog",
+    "vhdl", "visual basic", "webassembly", "xml", "yaml", "java/c/c++/c#",
+})
+
+# LLM が高頻度で出す非許容値 → 許容値の対応。ここに無い未知値は "plain text" に縮退する
+_CODE_LANGUAGE_ALIASES = {
+    "terraform": "hcl",
+    "tf": "hcl",
+    "yml": "yaml",
+    "sh": "shell",
+    "zsh": "shell",
+    "console": "shell",
+    "shell-session": "shell",
+    "js": "javascript",
+    "jsx": "javascript",
+    "node": "javascript",
+    "ts": "typescript",
+    "tsx": "typescript",
+    "py": "python",
+    "rb": "ruby",
+    "kt": "kotlin",
+    "cs": "c#",
+    "csharp": "c#",
+    "cpp": "c++",
+    "objc": "objective-c",
+    "golang": "go",
+    "dockerfile": "docker",
+    "gradle": "groovy",
+    "make": "makefile",
+    "md": "markdown",
+    "tex": "latex",
+    "proto": "protobuf",
+    "ps1": "powershell",
+    "plaintext": "plain text",
+    "text": "plain text",
+    "txt": "plain text",
+    "plain": "plain text",
+    "properties": "plain text",
+    "ini": "plain text",
+    "conf": "plain text",
+    "env": "plain text",
+}
+
+
+def _normalize_code_language(language) -> str:
+    """language を Notion 許容値に正規化する。未知値・非文字列は "plain text" に縮退。"""
+    if not isinstance(language, str):
+        return "plain text"
+    lowered = language.strip().lower()
+    if lowered in _NOTION_CODE_LANGUAGES:
+        return lowered
+    return _CODE_LANGUAGE_ALIASES.get(lowered, "plain text")
+
+
+def _normalize_code_languages(blocks: list[dict]) -> list[dict]:
+    """code block の language を許容値に正規化した新しい list を返す。
+
+    入力 list / dict は mutate しない (_split_long_rich_text と同じ規律)。
+    code block 以外・不正構造はそのまま通す。
+    """
+    result: list[dict] = []
+    for block in blocks:
+        code_payload = block.get("code") if isinstance(block, dict) else None
+        if not isinstance(code_payload, dict):
+            result.append(block)
+            continue
+        original = code_payload.get("language")
+        normalized = _normalize_code_language(original)
+        if normalized == original:
+            result.append(block)
+            continue
+        logger.info(
+            "Normalized Notion code block language | original=%r normalized=%r",
+            original,
+            normalized,
+        )
+        result.append({**block, "code": {**code_payload, "language": normalized}})
+    return result
+
+
 def _is_cloudflare_block(status_code: int, body: str) -> bool:
     if status_code != 403:
         return False
@@ -236,7 +331,7 @@ class NotionClient:
         slack_user: str,
     ) -> tuple[str, str]:
         """成果物ページを作成し、(ページURL, ページID)を返す"""
-        content_blocks = _split_long_rich_text(content_blocks)
+        content_blocks = _normalize_code_languages(_split_long_rich_text(content_blocks))
         properties: dict = {
             "タイトル": {"title": [{"text": {"content": title}}]},
             "カテゴリ": {"select": {"name": category}},
@@ -276,6 +371,6 @@ class NotionClient:
 
     def append_blocks(self, page_id: str, blocks: list[dict]) -> None:
         """ページにブロックを追記する"""
-        blocks = _split_long_rich_text(blocks)
+        blocks = _normalize_code_languages(_split_long_rich_text(blocks))
         payload = {"children": blocks}
         self._request_with_retry("PATCH", f"{NOTION_API_BASE}/blocks/{page_id}/children", payload)

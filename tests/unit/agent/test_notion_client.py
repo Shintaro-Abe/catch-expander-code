@@ -103,6 +103,102 @@ class TestSplitLongRichText:
         assert blocks == snapshot
 
 
+class TestNormalizeCodeLanguages:
+    """_normalize_code_languages のテスト (T28, exec-20260713114159 の 400 再発防止)"""
+
+    def _normalize(self, blocks):
+        from storage.notion_client import _normalize_code_languages
+
+        return _normalize_code_languages(blocks)
+
+    def _code_block(self, language):
+        return {
+            "type": "code",
+            "code": {
+                "rich_text": [{"type": "text", "text": {"content": "x"}}],
+                "language": language,
+            },
+        }
+
+    def test_terraform_is_mapped_to_hcl(self):
+        """本番障害の再現: generator プロンプト例由来の terraform を hcl に正規化する。"""
+        result = self._normalize([self._code_block("terraform")])
+        assert result[0]["code"]["language"] == "hcl"
+
+    def test_common_aliases_are_mapped(self):
+        blocks = [self._code_block(lang) for lang in ("yml", "sh", "py", "properties")]
+        result = self._normalize(blocks)
+        assert [b["code"]["language"] for b in result] == [
+            "yaml",
+            "shell",
+            "python",
+            "plain text",
+        ]
+
+    def test_valid_language_passes_through_unchanged(self):
+        original = self._code_block("java")
+        result = self._normalize([original])
+        assert result[0] is original
+
+    def test_unknown_language_falls_back_to_plain_text(self):
+        result = self._normalize([self._code_block("klingon")])
+        assert result[0]["code"]["language"] == "plain text"
+
+    def test_uppercase_valid_language_is_lowercased(self):
+        result = self._normalize([self._code_block("Java")])
+        assert result[0]["code"]["language"] == "java"
+
+    def test_non_string_language_falls_back_to_plain_text(self):
+        result = self._normalize([self._code_block(None)])
+        assert result[0]["code"]["language"] == "plain text"
+
+    def test_non_code_blocks_and_malformed_entries_pass_through(self):
+        blocks = [
+            {"type": "paragraph", "paragraph": {"rich_text": []}},
+            {"type": "code", "code": "not-a-dict"},
+            "not-a-dict-block",
+        ]
+        result = self._normalize(blocks)
+        assert result == blocks
+
+    def test_input_blocks_are_not_mutated(self):
+        original = [self._code_block("terraform")]
+        snapshot = copy.deepcopy(original)
+        self._normalize(original)
+        assert original == snapshot
+
+    @patch("storage.notion_client.requests.request")
+    def test_create_page_normalizes_code_language_in_payload(self, mock_request):
+        """create_page 経由で送信 payload の language が正規化されることを確認。"""
+        from storage.notion_client import NotionClient
+
+        mock_response = mock_request.return_value
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"id": "page-id", "url": "https://notion.so/page"}
+
+        client = NotionClient("ntn_test_token", "db-id-123")
+        client.create_page("Test", "技術", [self._code_block("terraform")], None, "U1")
+
+        payload = mock_request.call_args[1]["json"]
+        assert payload["children"][0]["code"]["language"] == "hcl"
+
+    @patch("storage.notion_client.requests.request")
+    def test_append_blocks_normalizes_code_language_in_payload(self, mock_request):
+        from storage.notion_client import NotionClient
+
+        mock_response = mock_request.return_value
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {}
+
+        client = NotionClient("ntn_test_token", "db-id-123")
+        client.append_blocks("page-id", [self._code_block("yml")])
+
+        payload = mock_request.call_args[1]["json"]
+        assert payload["children"][0]["code"]["language"] == "yaml"
+
+
 class TestNotionClient:
     """NotionClient のテスト"""
 

@@ -28,10 +28,12 @@
 {"type": "heading_3", "heading_3": {"rich_text": [{"type": "text", "text": {"content": "見出し3"}}]}}
 {"type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": "本文テキスト"}}]}}
 {"type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": "リスト項目"}}]}}
-{"type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": "コード"}}], "language": "terraform"}}
+{"type": "code", "code": {"rich_text": [{"type": "text", "text": {"content": "コード"}}], "language": "hcl"}}
 {"type": "table", "table": {"table_width": 3, "has_column_header": true, "children": [...]}}
 {"type": "divider", "divider": {}}
 ```
+
+code ブロックの `language` は Notion API の許容値のみ使用してください（例: `bash`, `java`, `python`, `yaml`, `json`, `sql`, `docker`, `hcl`(Terraform), `plain text`）。`terraform` / `yml` / `properties` などの非対応値は使わないでください。
 
 ### 共通構成
 

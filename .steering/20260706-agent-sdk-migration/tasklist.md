@@ -67,8 +67,15 @@
 > "session limit" が `_USAGE_LIMIT_RESULT_PATTERNS` に無くレート制限扱いにならなかった → T26。
 
 - [x] T26: `_USAGE_LIMIT_RESULT_PATTERNS` に "session limit" を追加（advisor スキップ / Slack レート制限文言の分類を回復）+ 本番観測文言での回帰テスト（`test_call_claude_session_limit_in_error_result`）
-- [x] T27: `_writeback_claude_credentials` に空 credentials ガード（`_claude_credentials_look_valid`: accessToken / refreshToken が空 or JSON 不正なら writeback をスキップ）+ 回帰テスト 2 件、既存フィクスチャを claudeAiOauth 実形状に更新。**全 537 passed**、新規 lint ゼロ
-- [ ] T25: 品質ゲート — ruff / 全テスト green ✔ → secret scan（初回 102 件は全件精査で FP、`.gitleaks.toml` 整備 202efa0）✔ → commit（46b9784）→ push ✔ → **Codex レビューゲート収束**（Pass 1: P2×2 → aclosing 化 + 回帰テストで是正（ec5cb6d、534 passed）、Pass 2: 指摘ゼロ。`.audit/2026-07-11_sdk-stream-error-result.md`）✔ → 再デプロイ完了（2026-07-12、ユーザー実行。**検証**: stack UPDATE_COMPLETE + AgentImageUri=ec5cb6d + task definition `catch-expander-agent:16` が ec5cb6d image を参照）✔ → 残り: E2E 再実行（T20 / preference-scope T8-4）
+- [x] T27: `_writeback_claude_credentials` に空 credentials ガード（`_claude_credentials_look_valid`: accessToken / refreshToken が空 or JSON 不正 or claudeAiOauth 非 dict なら writeback をスキップ）+ 回帰テスト 3 件、既存フィクスチャを claudeAiOauth 実形状に更新。**全 538 passed**、新規 lint ゼロ。コミット 8ebf97e + e0ce396。**Codex ゲート: Pass 1 指摘ゼロで収束**（補足 1 件は isinstance ガードで対応。`.audit/2026-07-12_session-limit-writeback-guard.md`。Pass 2 はユーザー判断でスキップ）
+> **4 回目 E2E (exec-20260713114159, 2026-07-13 11:42-13:04)**: text generator リトライ回復
+> (2 回検証失敗→3 回目成功)・コード生成・レビューループ (unparseable fix 2 回とも前版維持で継続)・
+> **GitHub push 成功 (新 PAT)**・Notion ページ作成成功まで到達。ブロック追記の 400
+> (`code.language` が Notion 許容 enum 外) で失敗 → T28。SDK 移行とは無関係の pre-existing バグ
+> (generator プロンプト例が非対応の "terraform" を教示 + notion_client に language 検証層なし)。
+
+- [x] T28: Notion code block language の正規化層 — `notion_client` に `_normalize_code_languages`（許容 enum + alias マップ、未知は "plain text" に縮退、非 mutate）を追加し `create_page` / `append_blocks` に適用。`prompts/generator.md` の例を `terraform` → `hcl` に訂正 + 許容値の指示行を追加。回帰テスト 10 件（本番障害の terraform 再現・payload 検証含む）→ **全 548 passed**、新規 lint ゼロ
+- [ ] T25: 品質ゲート — ruff / 全テスト green ✔ → secret scan（初回 102 件は全件精査で FP、`.gitleaks.toml` 整備 202efa0）✔ → commit（46b9784）→ push ✔ → **Codex レビューゲート収束**（Pass 1: P2×2 → aclosing 化 + 回帰テストで是正（ec5cb6d、534 passed）、Pass 2: 指摘ゼロ。`.audit/2026-07-11_sdk-stream-error-result.md`）✔ → 再デプロイ完了（2026-07-12、ユーザー実行。**検証**: stack UPDATE_COMPLETE + AgentImageUri=ec5cb6d + task definition `catch-expander-agent:16`）✔ → T26/T27 デプロイ完了（2026-07-12、ユーザー実行。**検証**: stack UPDATE_COMPLETE + AgentImageUri=e0ce396 + task definition `catch-expander-agent:17`）✔ → 残り: E2E 再実行（T20 残分 / preference-scope T8-4。**前提: シークレット再同期 + 使用上限の回復**）
 
 ## 完了条件
 
