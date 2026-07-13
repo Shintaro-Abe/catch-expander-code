@@ -38,11 +38,11 @@
 - [x] T17: pre-commit-secret-scan (gitleaks 8.30.1, no leaks) → **2 論理コミット** (4fa1184 pref-scope 是正 / b62a438 SDK 移行) → push 完了（ユーザー決定によりコミット前レビュー方式に変更、レビュー収束後にコミット）
 - [x] T18: Codex レビューゲート — **収束 (2026-07-11)**: Pass 1 (gpt-5.4): P1×0 / P2×2 → 両方是正 + 回帰テスト 2 件追加、527 passed。Pass 2 (gpt-5.5): **指摘ゼロ**、是正 2 件も「意図どおり」確認（`.audit/2026-07-06_agent-sdk-migration.md`）。方式: read-only sandbox + 差分埋め込み（bwrap が devcontainer で不可のため）
 - [x] T19: `sam build` / `sam deploy` 完了（2026-07-11、ユーザー実行）。agent image は CI push 済みの b62a438 タグを指定。stack UPDATE_COMPLETE + task definition :15 反映を検証済み
-- [ ] T20: 実機検証（`/deploy-verify` + design.md の環境前提 4 項目）:
-  - [ ] ECS タスクで実トピック投入 → ワークフロー完走
-  - [ ] CloudWatch Logs で researcher（WebSearch）/ generator（sandbox Write）/ fix loop の実動作確認
-  - [ ] `.credentials.json` 認証成功と終了時 writeback の発火確認
-  - [ ] `api_call_completed` / `rate_limit_hit` イベントが events テーブルに従来契約で記録されることを確認
+- [x] T20: 実機検証 **完了 (2026-07-13, exec-20260713132408-fc99067c, task def :17 = e0ce396)**:
+  - [x] ECS タスクで実トピック投入 → ワークフロー**完走** — `execution_completed status=success`、Notion URL + GitHub URL 発行、58 分 / 290 万トークン / $8.92
+  - [x] researcher 5 本（prompt recorder に 5 記録 + research_completed 68 sources）/ generator sandbox Write（text: 検証失敗 2 回→リトライ 3 回目成功 = リトライ機構の実機回復を観測。code: program_code 5 ファイル）/ fix loop（reviewer_eval×3 + reviewer_fix×2、unparseable 時の前版維持 fallback も 7/12-13 の複数ランで観測）
+  - [x] `.credentials.json` 認証成功（全 Claude 呼び出し成功）+ 終了時 writeback 発火確認（本ランは「unchanged at task exit」分岐、実書き戻し分岐は 7/11 ランで「writeback succeeded」を観測。T27 の空 credentials ガード分岐はユニットテストで担保）
+  - [x] `api_call_completed` 従来契約で 43 件記録（subtype: anthropic 11 / slack 14 / github 12 / notion 3 / openai 3。anthropic payload に duration_ms / endpoint_path / input・output・total_tokens / response_status_code / subtype / success の全キー）。※ `rate_limit_hit` は本ランで発生せず（テストで担保、実機未観測のまま）
 - [x] T21: `docs/architecture.md` の CLI 記述を SDK 構成に整合更新（エージェント基盤表 / §4.5 出力フォーマット）、セッションハンドオフ memo 更新。※ Dockerfile の CLI インストール・Node.js ランタイム・認証記述は SDK 移行後も事実として正しいため温存
 
 ## Phase 6: T20 E2E 失敗（exec-20260711154440-67fed1d5）の是正
@@ -74,7 +74,7 @@
 > (`code.language` が Notion 許容 enum 外) で失敗 → T28。SDK 移行とは無関係の pre-existing バグ
 > (generator プロンプト例が非対応の "terraform" を教示 + notion_client に language 検証層なし)。
 
-- [x] T28: Notion code block language の正規化層 — `notion_client` に `_normalize_code_languages`（許容 enum + alias マップ、未知は "plain text" に縮退、非 mutate）を追加し `create_page` / `append_blocks` に適用。`prompts/generator.md` の例を `terraform` → `hcl` に訂正 + 許容値の指示行を追加。回帰テスト 10 件（本番障害の terraform 再現・payload 検証含む）→ **全 548 passed**、新規 lint ゼロ
+- [x] T28: Notion code block language の正規化層 — `notion_client` に `_normalize_code_languages`（許容 enum + alias マップ、未知は "plain text" に縮退、非 mutate）を追加し `create_page` / `append_blocks` に適用。`prompts/generator.md` の例を `terraform` → `hcl` に訂正 + 許容値の指示行を追加。**Codex ゲート収束**（Pass 1: P1×2 — enum 妥当性はライブ API プローブで全 90 値の完全一致を実証、ネスト children 漏れは再帰化で是正。Pass 2: 指摘ゼロ。`.audit/2026-07-13_notion-code-language.md`）。回帰テスト 12 件 → **全 550 passed**、新規 lint ゼロ。コミット 97c1c45 + 773cf77。**デプロイ済み（2026-07-13、ユーザー実行。検証: stack UPDATE_COMPLETE + AgentImageUri=773cf77 + task definition :18）**
 - [ ] T25: 品質ゲート — ruff / 全テスト green ✔ → secret scan（初回 102 件は全件精査で FP、`.gitleaks.toml` 整備 202efa0）✔ → commit（46b9784）→ push ✔ → **Codex レビューゲート収束**（Pass 1: P2×2 → aclosing 化 + 回帰テストで是正（ec5cb6d、534 passed）、Pass 2: 指摘ゼロ。`.audit/2026-07-11_sdk-stream-error-result.md`）✔ → 再デプロイ完了（2026-07-12、ユーザー実行。**検証**: stack UPDATE_COMPLETE + AgentImageUri=ec5cb6d + task definition `catch-expander-agent:16`）✔ → T26/T27 デプロイ完了（2026-07-12、ユーザー実行。**検証**: stack UPDATE_COMPLETE + AgentImageUri=e0ce396 + task definition `catch-expander-agent:17`）✔ → 残り: E2E 再実行（T20 残分 / preference-scope T8-4。**前提: シークレット再同期 + 使用上限の回復**）
 
 ## 完了条件
