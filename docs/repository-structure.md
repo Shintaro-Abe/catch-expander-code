@@ -27,6 +27,8 @@ Catch-Expander/
 │   ├── credential-setup.md            # クレデンシャル取得手順書
 │   ├── repository-structure.md        # リポジトリ構造定義書（本書）
 │   ├── development-guidelines.md      # 開発ガイドライン
+│   ├── execution-diagnostician.md     # 実行の診断（diagnosis/）の使い方・手動手順
+│   ├── execution-fixer.md             # 診断にもとづく修正（src/fixer/）の使い方・手動手順
 │   └── glossary.md                    # ユビキタス言語定義
 │
 ├── obsidian/                          # 調査・意思決定の記録
@@ -53,6 +55,22 @@ Catch-Expander/
 │   ├── observability/                 # 観測イベント共通ヘルパー
 │   │   ├── __init__.py
 │   │   └── event_emitter.py           # DynamoDB events テーブルへのイベント書き込みユーティリティ
+│   │
+│   ├── fixer/                         # 修正役: 診断結果をもとに修正案を作る（隔離された環境で手で動かす。本番のイメージに入れない）
+│   │   ├── __init__.py                # run_fix の再公開
+│   │   ├── __main__.py                # 手動実行の入口（python -m src.fixer）
+│   │   ├── models.py                  # 決まった値・データの型
+│   │   ├── handoff_input.py           # 受け渡しの読み込み・形の検証・場所の再検証・条件の再計算
+│   │   ├── exception_types.py         # 例外の型の許可一覧
+│   │   ├── gitio.py                   # git の操作（決まったサブコマンドだけ）
+│   │   ├── workspace.py               # 作業用の複製・パスの検査・変更の取り出し
+│   │   ├── tools.py                   # ツールの中身・入力の検証・上限・足取り
+│   │   ├── runners.py                 # テストとリントの実行・環境変数の絞り込み
+│   │   ├── gates.py                   # 合否の検査・対象外の場所の一覧
+│   │   ├── prompt.py                  # 指示文
+│   │   ├── sdk_server.py              # Agent SDK へのツールの登録
+│   │   ├── runner.py                  # 実行（オプション・時間切れ・検査・コミット）
+│   │   └── draft.py                   # プルリクエスト本文の下書き
 │   │
 │   ├── dashboard_api/                 # ダッシュボード API Lambda 群
 │   │   ├── __init__.py
@@ -95,9 +113,23 @@ Catch-Expander/
 │       ├── state/                     # 状態管理
 │       │   ├── __init__.py
 │       │   └── dynamodb_client.py     # DynamoDB操作
-│       └── notify/                    # 通知
-│           ├── __init__.py
-│           └── slack_client.py        # Slack通知送信
+│       ├── notify/                    # 通知
+│       │   ├── __init__.py
+│       │   └── slack_client.py        # Slack通知送信
+│       └── diagnosis/                 # 実行診断役: 実行の記録を調べて原因を診断する（読み取り専用）
+│           ├── __init__.py            # diagnose_execution の再公開
+│           ├── __main__.py            # 手動実行の入口（python -m diagnosis）
+│           ├── models.py              # 決まった値・データの型
+│           ├── redaction.py           # マスク・識別子の除去・切り詰め
+│           ├── records.py             # DynamoDB・S3 の読み取り
+│           ├── tools.py               # ツールの中身・入力の検証・上限・根拠の照合
+│           ├── frames.py              # スタックトレースのフレームと実際のコードの突き合わせ
+│           ├── exception_types.py     # 例外の型の許可一覧
+│           ├── handoff.py             # 受け渡し用の結果の組み立て
+│           ├── prompt.py              # 指示文（定数）
+│           ├── sdk_server.py          # Agent SDK へのツールの登録
+│           ├── runner.py              # 実行（オプション・時間切れ・イベント）
+│           └── notify.py              # Slack の投稿文の組み立て
 │
 ├── tests/                             # テスト
 │   ├── __init__.py
@@ -115,15 +147,17 @@ Catch-Expander/
 │   │   │   ├── conftest.py            # patch() サブモジュール解決問題の回避
 │   │   │   ├── test_extended_metrics.py
 │   │   │   └── test_get_metrics_summary.py
-│   │   └── agent/
-│   │       ├── __init__.py
-│   │       ├── test_main.py
-│   │       ├── test_orchestrator.py
-│   │       ├── test_feedback_processor.py  # F8 フィードバック学習テスト
-│   │       ├── test_dynamodb_client.py     # source_id 一意化（M1）
-│   │       ├── test_notion_client.py
-│   │       ├── test_github_client.py
-│   │       └── test_slack_client.py
+│   │   ├── agent/
+│   │   │   ├── __init__.py
+│   │   │   ├── test_main.py
+│   │   │   ├── test_orchestrator.py
+│   │   │   ├── test_feedback_processor.py  # F8 フィードバック学習テスト
+│   │   │   ├── test_dynamodb_client.py     # source_id 一意化（M1）
+│   │   │   ├── test_notion_client.py
+│   │   │   ├── test_github_client.py
+│   │   │   ├── test_slack_client.py
+│   │   │   └── diagnosis/             # src/agent/diagnosis/ のテスト（偽の DynamoDB・S3・SDK）
+│   │   └── fixer/                     # src/fixer/ のテスト（偽の SDK。git は一時ディレクトリの実物）
 │   └── integration/                   # 統合テスト
 │       ├── __init__.py
 │       ├── conftest.py                # _load_prompt モック（プロンプトファイル不在対応）
@@ -181,6 +215,12 @@ EventBridge の定期スケジュールで 12 時間ごとに発火し、Secrets
 
 `event_emitter.py` が DynamoDB の `{prefix}-events` テーブルへのイベント書き込みユーティリティを提供する。エージェントコンテナ（ECS）と Lambda トリガー関数の両方からインポートされ、ワークフロー各フェーズのイベントを一元的に記録する。
 
+### `src/fixer/` — 修正役: 診断にもとづく修正（隔離された環境で、手で動かす）
+
+実行診断役（`src/agent/diagnosis/`）が出した受け渡し用の診断結果を 1 つ受け取り、リポジトリの複製の中で、失敗を再現するテストと修正を作る。コードによる合否の検査に通ったものだけを、手元の作業用ブランチにコミットし、プルリクエスト本文の下書きを添える。プッシュと取り込みは人が行う。
+
+**本番のイメージには入れない**: Dockerfile が入れるのは `src/agent/` と `src/observability/` だけで、`template.yaml` からも参照しない。本番の認証情報がない、**隔離された環境**（使い捨てのコンテナか、専用のユーザー）で、人が手で起動する（`python -m src.fixer`）。位置づけは「隔離された環境で、試験的に動かせる段階」で、ふだんの開発の環境では使わない（実際の LLM を使った動作は未検証）。第 1 段階のコード（決まった値、場所の突き合わせ、マスク）は、変更せずに import して使う。使い方と隔離の条件は `docs/execution-fixer.md`、取り込みの手順は `docs/development-guidelines.md` 5 章。
+
 ### `src/dashboard_api/` — ダッシュボード API Lambda 群
 
 Slack OAuth 認証・JWT cookie 管理・観測データ取得の API エンドポイントを実装する Lambda 関数群。SAM テンプレートから `AWS::Serverless::HttpApi` にルーティングされる。`_common.py` が全 Lambda 共通のレスポンスヘルパー・クエリユーティリティを提供する。
@@ -204,6 +244,7 @@ Claude Code CLIを使ってマルチAIエージェントを実行するメイン
 | `storage/` | Notion API・GitHub APIの操作 |
 | `state/` | DynamoDBによるワークフロー状態管理 |
 | `notify/` | Slack通知の送信 |
+| `diagnosis/` | 実行診断役。実行 ID を 1 つ受け取り、その実行の記録を読み取り専用のツールで調べて原因を診断する。手動実行（`python -m diagnosis`）と、失敗時の自動起動（`EXECUTION_DIAGNOSIS`、既定オフ）から使う。実際の LLM・AWS では未検証。使い方は `docs/execution-diagnostician.md` |
 
 ### `tests/` — テスト
 
