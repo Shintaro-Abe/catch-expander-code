@@ -860,3 +860,598 @@ class TestMain:
 
         mock_claude_wb.assert_called_once_with("arn:claude", "claude-hash")
         mock_codex_wb.assert_called_once_with("arn:codex", "codex-hash")
+
+
+# ---------------------------------------------------------------------------
+# 実行診断役の自動起動（.steering/20261004-execution-diagnostician、AC-20〜AC-23）
+# ---------------------------------------------------------------------------
+
+_DIAG_EXECUTION_ID = "exec-20261004120000-abcdef12"
+_DIAG_CHANNEL = "C999"
+_DIAG_THREAD_TS = "000.001"
+_DIAG_MENTIONS = "<@U0123ABCDE> <!channel> @here"
+
+
+def _diagnosis_run(status: str = "completed", stop_detail: str = "submitted", **overrides):
+    from tests.unit.agent.diagnosis.factories import make_run
+
+    return make_run(status=status, stop_detail=stop_detail, **overrides)
+
+
+def _run_failing_main(
+    monkeypatch,
+    *,
+    flag: str | None,
+    exc: Exception | None = None,
+    task_type: str | None = None,
+    execution_id: str | None = _DIAG_EXECUTION_ID,
+    diagnose_result=None,
+    diagnose_error: BaseException | None = None,
+    progress_error: Exception | None = None,
+    fail_secret_number: int | None = None,
+    patch_diagnosis: bool = True,
+):
+    """main() を失敗させ、失敗通知・診断・2 通目の投稿・書き戻しの呼ばれ方を集める。"""
+    import contextlib
+    from types import SimpleNamespace
+
+    for key, value in TestMain._COMMON_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SLACK_CHANNEL", _DIAG_CHANNEL)
+    monkeypatch.setenv("SLACK_THREAD_TS", _DIAG_THREAD_TS)
+    for name, value in (("EXECUTION_DIAGNOSIS", flag), ("EXECUTION_ID", execution_id), ("TASK_TYPE", task_type)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    exc = exc if exc is not None else RuntimeError("boom")
+    order: list[str] = []
+    mock_slack = MagicMock()
+    mock_slack.post_error.side_effect = lambda *a, **k: order.append("post_error")
+
+    def _post_progress(*_args, **_kwargs):
+        order.append("post_progress")
+        if progress_error is not None:
+            raise progress_error
+
+    def _diagnose(*_args, **_kwargs):
+        order.append("diagnose")
+        if diagnose_error is not None:
+            raise diagnose_error
+        return diagnose_result
+
+    mock_slack.post_progress.side_effect = _post_progress
+    mock_diagnose = MagicMock(side_effect=_diagnose)
+    secret_calls = {"n": 0}
+
+    def _secret(_arn):
+        secret_calls["n"] += 1
+        if fail_secret_number is not None and secret_calls["n"] == fail_secret_number:
+            raise exc
+        return "secret"
+
+    raised: BaseException | None = None
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("main._get_secret", side_effect=_secret))
+        stack.enter_context(patch("main._setup_claude_credentials", return_value="claude-hash"))
+        claude_wb = stack.enter_context(patch("main._writeback_claude_credentials"))
+        stack.enter_context(patch("main._setup_codex_credentials", return_value="codex-hash"))
+        codex_wb = stack.enter_context(patch("main._writeback_codex_credentials"))
+        stack.enter_context(patch("main.SlackClient", return_value=mock_slack))
+        stack.enter_context(patch("main.DynamoDbClient"))
+        stack.enter_context(patch("main._run_orchestrator", side_effect=exc))
+        stack.enter_context(patch("main._run_feedback", side_effect=exc))
+        if patch_diagnosis:
+            stack.enter_context(patch("diagnosis.diagnose_execution", mock_diagnose))
+        from main import main
+
+        try:
+            main()
+        except Exception as e:  # noqa: BLE001
+            raised = e
+
+    return SimpleNamespace(
+        exc=exc,
+        raised=raised,
+        order=order,
+        slack=mock_slack,
+        diagnose=mock_diagnose,
+        claude_writeback=claude_wb,
+        codex_writeback=codex_wb,
+    )
+
+
+def _expected_generic_failure_message(execution_id: str = _DIAG_EXECUTION_ID) -> str:
+    """既存の失敗通知の文面（RuntimeError のとき）。診断役の追加で変わってはいけない。"""
+    return (
+        "タスクの処理中に予期しないエラーが発生しました（RuntimeError）。\n"
+        "ログを確認しますのでお知らせください。\n"
+        f"execution_id: `{execution_id}`"
+    )
+
+
+@pytest.fixture
+def _diagnosis_no_network(monkeypatch):
+    """AC-25: 自動起動のテストも、通信と認証情報を使えない状態で通す。
+
+    ``tests/unit/agent/diagnosis/conftest.py`` の自動適用フィクスチャは、このファイルには効かないので、
+    同じ縛りをここでかける（既存のテストには適用しない）。
+    """
+    import socket
+
+    def _blocked(*_args, **_kwargs):
+        raise AssertionError("network access is forbidden in diagnosis tests (AC-25)")
+
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", _blocked)
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+
+class TestShouldRunDiagnosis:
+    def test_returns_false_when_env_is_not_set(self, monkeypatch):
+        monkeypatch.delenv("EXECUTION_DIAGNOSIS", raising=False)
+        from main import _should_run_diagnosis
+
+        assert _should_run_diagnosis() is False
+
+    @pytest.mark.parametrize("value", ["false", "False", "", "0", "1", "yes", "on", " true"])
+    def test_returns_false_when_env_is_not_true(self, monkeypatch, value):
+        monkeypatch.setenv("EXECUTION_DIAGNOSIS", value)
+        from main import _should_run_diagnosis
+
+        assert _should_run_diagnosis() is False
+
+    @pytest.mark.parametrize("value", ["true", "True", "TRUE"])
+    def test_returns_true_when_env_is_true(self, monkeypatch, value):
+        monkeypatch.setenv("EXECUTION_DIAGNOSIS", value)
+        from main import _should_run_diagnosis
+
+        assert _should_run_diagnosis() is True
+
+
+@pytest.mark.usefixtures("_diagnosis_no_network")
+class TestMainDiagnosisFlagOff:
+    """AC-20: フラグが未設定または false のとき、診断役は呼ばれず、既存の挙動は変わらない。"""
+
+    @pytest.mark.parametrize("flag", [None, "false"])
+    def test_flag_off_does_not_call_diagnosis_and_keeps_failure_notification(self, monkeypatch, flag):
+        result = _run_failing_main(monkeypatch, flag=flag)
+
+        result.diagnose.assert_not_called()
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message()
+        )
+        result.slack.post_progress.assert_not_called()
+        assert result.order == ["post_error"]
+        assert result.raised is result.exc
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")
+        result.codex_writeback.assert_called_once_with("arn:codex", "codex-hash")
+
+    @pytest.mark.parametrize("flag", [None, "false"])
+    def test_flag_off_leaves_diagnosis_package_unloaded(self, monkeypatch, flag):
+        """R22: オフのとき、診断役のコードは 1 行も実行されない（import もされない）。"""
+        import sys
+
+        with patch.dict(sys.modules):
+            for name in [n for n in sys.modules if n == "diagnosis" or n.startswith("diagnosis.")]:
+                del sys.modules[name]
+
+            result = _run_failing_main(monkeypatch, flag=flag, patch_diagnosis=False)
+
+            assert "diagnosis" not in sys.modules
+        assert result.raised is result.exc
+        assert result.order == ["post_error"]
+
+    def test_flag_helper_exists_and_is_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("EXECUTION_DIAGNOSIS", raising=False)
+        import main
+
+        assert main._should_run_diagnosis() is False
+        assert callable(main._maybe_post_diagnosis)
+
+
+@pytest.mark.usefixtures("_diagnosis_no_network")
+class TestMainDiagnosisFlagOn:
+    """AC-21: フラグがオンのとき、失敗通知 → 診断 → 2 通目の順。例外と書き戻しはそのまま。"""
+
+    def test_flag_on_notifies_first_then_diagnoses_then_posts_second_message(self, monkeypatch):
+        run = _diagnosis_run()
+
+        result = _run_failing_main(monkeypatch, flag="true", diagnose_result=run)
+
+        assert result.order == ["post_error", "diagnose", "post_progress"]
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message()
+        )
+        result.diagnose.assert_called_once_with(_DIAG_EXECUTION_ID, trigger="auto")
+
+    def test_flag_on_posts_formatted_diagnosis_to_same_thread(self, monkeypatch):
+        from diagnosis.notify import format_slack_message
+
+        run = _diagnosis_run()
+
+        result = _run_failing_main(monkeypatch, flag="true", diagnose_result=run)
+
+        result.slack.post_progress.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, format_slack_message(run)
+        )
+        assert "レート制限" in result.slack.post_progress.call_args[0][2]
+
+    def test_flag_on_neutralizes_mentions_in_posted_message(self, monkeypatch):
+        run = _diagnosis_run(summary=f"要約 {_DIAG_MENTIONS}", action_note=f"対処 {_DIAG_MENTIONS}")
+
+        result = _run_failing_main(monkeypatch, flag="true", diagnose_result=run)
+
+        text = result.slack.post_progress.call_args[0][2]
+        for pattern in ("<@", "<!", "@here"):
+            assert pattern not in text
+
+    def test_flag_on_reraises_original_exception_and_writes_back_credentials(self, monkeypatch):
+        result = _run_failing_main(monkeypatch, flag="true", diagnose_result=_diagnosis_run())
+
+        assert result.raised is result.exc
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")
+        result.codex_writeback.assert_called_once_with("arn:codex", "codex-hash")
+
+    def test_flag_on_is_case_insensitive(self, monkeypatch):
+        result = _run_failing_main(monkeypatch, flag="TRUE", diagnose_result=_diagnosis_run())
+
+        result.diagnose.assert_called_once()
+
+    def test_flag_on_runs_diagnosis_for_claude_failure_that_is_not_rate_limit(self, monkeypatch):
+        from orchestrator import ClaudeInvocationError
+
+        exc = ClaudeInvocationError("claude agent sdk call failed after retries", exit_code=1, stderr="other")
+
+        result = _run_failing_main(monkeypatch, flag="true", exc=exc, diagnose_result=_diagnosis_run())
+
+        result.diagnose.assert_called_once_with(_DIAG_EXECUTION_ID, trigger="auto")
+        assert result.raised is exc
+
+
+@pytest.mark.usefixtures("_diagnosis_no_network")
+class TestMainDiagnosisNotStarted:
+    """AC-22: フラグがオンでも起動しない場合。既存の失敗通知は今までどおり。"""
+
+    def test_claude_rate_limit_failure_does_not_start_diagnosis(self, monkeypatch):
+        from orchestrator import ClaudeInvocationError
+
+        exc = ClaudeInvocationError("claude agent sdk call failed after retries", rate_limited=True)
+
+        result = _run_failing_main(monkeypatch, flag="true", exc=exc)
+
+        result.diagnose.assert_not_called()
+        result.slack.post_error.assert_called_once()
+        assert "レート制限" in result.slack.post_error.call_args[0][2]
+        result.slack.post_progress.assert_not_called()
+        assert result.raised is exc
+
+    def test_feedback_failure_does_not_start_diagnosis(self, monkeypatch):
+        result = _run_failing_main(monkeypatch, flag="true", task_type="feedback")
+
+        result.diagnose.assert_not_called()
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message()
+        )
+        result.slack.post_progress.assert_not_called()
+        assert result.raised is result.exc
+
+    def test_missing_execution_id_does_not_start_diagnosis(self, monkeypatch):
+        result = _run_failing_main(monkeypatch, flag="true", execution_id=None)
+
+        result.diagnose.assert_not_called()
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message("<unknown>")
+        )
+        result.slack.post_progress.assert_not_called()
+        assert result.raised is result.exc
+
+    def test_failure_before_credentials_are_ready_does_not_start_diagnosis(self, monkeypatch):
+        # 2 つ目のシークレット（Notion）の取得で失敗する。Claude の認証情報はまだ置かれていない
+        result = _run_failing_main(monkeypatch, flag="true", fail_secret_number=2)
+
+        result.diagnose.assert_not_called()
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message()
+        )
+        result.slack.post_progress.assert_not_called()
+        result.claude_writeback.assert_not_called()
+        assert result.raised is result.exc
+
+    def test_maybe_post_diagnosis_with_credentials_not_ready_does_nothing(self, monkeypatch):
+        monkeypatch.setenv("EXECUTION_DIAGNOSIS", "true")
+        monkeypatch.setenv("EXECUTION_ID", _DIAG_EXECUTION_ID)
+        monkeypatch.setenv("SLACK_CHANNEL", _DIAG_CHANNEL)
+        monkeypatch.setenv("SLACK_THREAD_TS", _DIAG_THREAD_TS)
+        monkeypatch.delenv("TASK_TYPE", raising=False)
+        mock_slack = MagicMock()
+
+        with (
+            patch("main.SlackClient", return_value=mock_slack),
+            patch("diagnosis.diagnose_execution") as mock_diagnose,
+        ):
+            from main import _maybe_post_diagnosis
+
+            _maybe_post_diagnosis("slack-token", RuntimeError("boom"), credentials_ready=False)
+
+        mock_diagnose.assert_not_called()
+        mock_slack.post_progress.assert_not_called()
+
+    @pytest.mark.parametrize("missing", ["SLACK_CHANNEL", "SLACK_THREAD_TS"])
+    def test_maybe_post_diagnosis_without_slack_destination_does_nothing(self, monkeypatch, missing):
+        monkeypatch.setenv("EXECUTION_DIAGNOSIS", "true")
+        monkeypatch.setenv("EXECUTION_ID", _DIAG_EXECUTION_ID)
+        monkeypatch.setenv("SLACK_CHANNEL", _DIAG_CHANNEL)
+        monkeypatch.setenv("SLACK_THREAD_TS", _DIAG_THREAD_TS)
+        monkeypatch.delenv("TASK_TYPE", raising=False)
+        monkeypatch.delenv(missing)
+        mock_slack = MagicMock()
+
+        with (
+            patch("main.SlackClient", return_value=mock_slack),
+            patch("diagnosis.diagnose_execution") as mock_diagnose,
+        ):
+            from main import _maybe_post_diagnosis
+
+            _maybe_post_diagnosis("slack-token", RuntimeError("boom"), credentials_ready=True)
+
+        mock_diagnose.assert_not_called()
+        mock_slack.post_progress.assert_not_called()
+
+
+@pytest.mark.usefixtures("_diagnosis_no_network")
+class TestMainDiagnosisFailureIsolated:
+    """AC-23: 診断役や 2 通目の投稿が失敗しても、元の例外・失敗通知・書き戻しに影響しない。"""
+
+    def _assert_existing_behaviour_unchanged(self, result) -> None:
+        assert result.raised is result.exc
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message()
+        )
+        assert result.order[0] == "post_error"
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")
+        result.codex_writeback.assert_called_once_with("arn:codex", "codex-hash")
+
+    @pytest.mark.parametrize(
+        ("status", "stop_detail"),
+        [("failed", "sdk_error"), ("incomplete", "max_turns"), ("incomplete", "timeout")],
+    )
+    def test_diagnosis_not_completed_does_not_post_and_changes_nothing_else(self, monkeypatch, status, stop_detail):
+        run = _diagnosis_run(status=status, stop_detail=stop_detail)
+
+        result = _run_failing_main(monkeypatch, flag="true", diagnose_result=run)
+
+        result.diagnose.assert_called_once()
+        result.slack.post_progress.assert_not_called()
+        self._assert_existing_behaviour_unchanged(result)
+
+    def test_diagnosis_raising_changes_nothing_else(self, monkeypatch):
+        result = _run_failing_main(monkeypatch, flag="true", diagnose_error=RuntimeError("diagnosis exploded"))
+
+        result.diagnose.assert_called_once()
+        result.slack.post_progress.assert_not_called()
+        self._assert_existing_behaviour_unchanged(result)
+
+    def test_second_post_raising_changes_nothing_else(self, monkeypatch):
+        result = _run_failing_main(
+            monkeypatch,
+            flag="true",
+            diagnose_result=_diagnosis_run(),
+            progress_error=RuntimeError("Slack down"),
+        )
+
+        assert result.order == ["post_error", "diagnose", "post_progress"]
+        self._assert_existing_behaviour_unchanged(result)
+
+    def test_maybe_post_diagnosis_swallows_diagnosis_exception(self, monkeypatch):
+        monkeypatch.setenv("EXECUTION_DIAGNOSIS", "true")
+        monkeypatch.setenv("EXECUTION_ID", _DIAG_EXECUTION_ID)
+        monkeypatch.setenv("SLACK_CHANNEL", _DIAG_CHANNEL)
+        monkeypatch.setenv("SLACK_THREAD_TS", _DIAG_THREAD_TS)
+        monkeypatch.delenv("TASK_TYPE", raising=False)
+
+        with (
+            patch("main.SlackClient"),
+            patch("diagnosis.diagnose_execution", side_effect=RuntimeError("diagnosis exploded")) as mock_diagnose,
+        ):
+            from main import _maybe_post_diagnosis
+
+            _maybe_post_diagnosis("slack-token", RuntimeError("boom"), credentials_ready=True)
+
+        mock_diagnose.assert_called_once_with(_DIAG_EXECUTION_ID, trigger="auto")
+
+
+@pytest.mark.usefixtures("_diagnosis_no_network")
+class TestMainDiagnosisEndToEnd:
+    """AC-21: main.py から本物の ``diagnose_execution`` までを通す（差し替えるのは SDK・AWS・Slack だけ）。
+
+    ほかの ``TestMainDiagnosis*`` は ``diagnose_execution`` を丸ごと偽物にしているので、main.py の
+    呼び方（引数）と、本物の関数の受け方が食い違っていても気づけない。ここで 1 本、つないで確かめる。
+    """
+
+    def _run(self, monkeypatch, script, *, scenario=None):
+        from tests.unit.agent.diagnosis import fakes, scenarios
+        from tests.unit.agent.diagnosis.sdk_fake import FakeSdk
+
+        scenario = scenario or scenarios.rate_limited()
+        bundle = fakes.build_reader(scenario)
+        monkeypatch.setenv("DYNAMODB_TABLE_PREFIX", fakes.TABLE_PREFIX)
+        monkeypatch.setenv("EVENTS_TABLE", fakes.EVENTS_TABLE)
+        monkeypatch.setenv("PROMPTS_BUCKET", fakes.PROMPTS_BUCKET)
+        monkeypatch.delenv("DIAGNOSIS_MODEL", raising=False)
+        sdk = FakeSdk(script)
+        with (
+            patch("diagnosis.runner.boto3") as boto3_mock,
+            patch("diagnosis.runner._invoke_sdk", sdk),
+            patch("diagnosis.runner._EventEmitter") as emitter_class,
+        ):
+            boto3_mock.resource.return_value = bundle.dynamodb
+            boto3_mock.client.return_value = bundle.s3
+            result = _run_failing_main(
+                monkeypatch, flag="true", execution_id=scenario.execution_id, patch_diagnosis=False
+            )
+        return result, scenario, bundle, sdk, emitter_class
+
+    def test_real_diagnosis_runs_once_and_posts_its_result_after_failure_notification(self, monkeypatch):
+        async def script(call) -> None:
+            events = (await call("list_events", {"event_type": "rate_limit_hit"})).data["events"]
+            await call(
+                "submit_diagnosis",
+                {
+                    "failed_stage": "researching",
+                    "cause_category": "rate_limit",
+                    "cause_nature": "transient",
+                    "confidence": "high",
+                    "evidence": [{"id": event["evidence_id"], "note": "429"} for event in events],
+                    "action_type": "retry_later",
+                    "action_note": f"しばらく待つ {_DIAG_MENTIONS}",
+                    "summary": "レート制限で失敗しました",
+                },
+            )
+
+        result, scenario, bundle, sdk, emitter_class = self._run(monkeypatch, script)
+
+        assert result.raised is result.exc
+        assert result.order == ["post_error", "post_progress"]
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message(scenario.execution_id)
+        )
+        assert sdk.invocation_count == 1
+        channel, thread_ts, text = result.slack.post_progress.call_args[0]
+        assert (channel, thread_ts) == (_DIAG_CHANNEL, _DIAG_THREAD_TS)
+        lines = text.split("\n")
+        assert "失敗した段階: 調査中" in lines
+        assert "原因: レート制限（確からしさ: 高）" in lines
+        assert "根拠: 3 件 ／ 調べた記録: イベント → 提出" in lines
+        assert lines[-1] == f"execution_id: `{scenario.execution_id}`"
+        # 修正仕様 M2: モデルが書いた自由記述には「未検証」の旨が付く
+        summary_lines = [line for line in lines if "レート制限で失敗しました" in line]
+        assert len(summary_lines) == 1
+        assert "未検証" in summary_lines[0]
+        for pattern in ("<@", "<!", "@here"):
+            assert pattern not in text
+        # 自動起動のイベントは、trigger=auto・status_at_emit=failed で 1 件
+        emitter_class.assert_called_once_with(scenario.execution_id)
+        emit = emitter_class.return_value.emit
+        emit.assert_called_once()
+        assert emit.call_args.args[0] == "diagnosis_completed"
+        assert emit.call_args.args[1]["trigger"] == "auto"
+        assert emit.call_args.args[1]["status"] == "completed"
+        assert emit.call_args.kwargs == {"status_at_emit": "failed"}
+        # 記録は読み取りだけ。Slack の識別子は、記録にあっても投稿文に出ない
+        assert {op.name for op in bundle.all_operations()} <= fakes_read_operations()
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")
+        result.codex_writeback.assert_called_once_with("arn:codex", "codex-hash")
+
+    def test_real_diagnosis_without_submission_does_not_post_and_changes_nothing_else(self, monkeypatch):
+        async def script(call) -> None:
+            await call("get_execution_overview")
+
+        result, scenario, _, sdk, emitter_class = self._run(monkeypatch, script)
+
+        assert result.raised is result.exc
+        assert result.order == ["post_error"]
+        result.slack.post_progress.assert_not_called()
+        assert sdk.invocation_count == 1
+        assert emitter_class.return_value.emit.call_args.args[1]["status"] == "incomplete"
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")
+
+    def test_real_diagnosis_with_tool_isolation_failure_does_not_post_and_changes_nothing_else(self, monkeypatch):
+        """修正仕様 M3: 自作の 5 個以外のツールが見えたら中断する。2 通目は投稿しない。"""
+        from tests.unit.agent.diagnosis import fakes, scenarios
+        from tests.unit.agent.diagnosis.sdk_fake import FakeSdk, full_name
+
+        async def script(call) -> None:
+            await call("get_execution_overview")
+
+        scenario = scenarios.rate_limited()
+        bundle = fakes.build_reader(scenario)
+        monkeypatch.setenv("DYNAMODB_TABLE_PREFIX", fakes.TABLE_PREFIX)
+        sdk = FakeSdk(script, init_tools=[full_name("list_events"), "Bash"])
+        with (
+            patch("diagnosis.runner.boto3") as boto3_mock,
+            patch("diagnosis.runner._invoke_sdk", sdk),
+            patch("diagnosis.runner._EventEmitter") as emitter_class,
+        ):
+            boto3_mock.resource.return_value = bundle.dynamodb
+            boto3_mock.client.return_value = bundle.s3
+            result = _run_failing_main(
+                monkeypatch, flag="true", execution_id=scenario.execution_id, patch_diagnosis=False
+            )
+
+        assert result.raised is result.exc
+        assert result.order == ["post_error"]
+        result.slack.post_progress.assert_not_called()
+        assert sdk.script_started is False
+        assert bundle.all_operations() == []
+        payload = emitter_class.return_value.emit.call_args.args[1]
+        assert (payload["status"], payload["stop_detail"]) == ("failed", "tool_isolation_failed")
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")
+
+    def test_real_diagnosis_with_malformed_execution_id_does_not_post_or_touch_records(self, monkeypatch):
+        from tests.unit.agent.diagnosis import fakes, scenarios
+        from tests.unit.agent.diagnosis.sdk_fake import FakeSdk
+
+        bundle = fakes.build_reader(scenarios.rate_limited())
+        sdk = FakeSdk()
+        with (
+            patch("diagnosis.runner.boto3") as boto3_mock,
+            patch("diagnosis.runner._invoke_sdk", sdk),
+            patch("diagnosis.runner._EventEmitter") as emitter_class,
+        ):
+            result = _run_failing_main(
+                monkeypatch, flag="true", execution_id="exec-123/../other", patch_diagnosis=False
+            )
+
+        assert result.raised is result.exc
+        assert result.order == ["post_error"]
+        boto3_mock.resource.assert_not_called()
+        emitter_class.assert_not_called()
+        assert sdk.invocation_count == 0
+        assert bundle.all_operations() == []
+
+
+def fakes_read_operations() -> frozenset:
+    from tests.unit.agent.diagnosis import fakes
+
+    return fakes.READ_OPERATIONS
+
+
+@pytest.mark.usefixtures("_diagnosis_no_network")
+class TestMainDiagnosisFailureIsolatedMore:
+    """AC-23 の補足: 投稿文の組み立て・Slack クライアントの生成が失敗しても、既存の挙動は変わらない。"""
+
+    def test_message_formatting_failure_changes_nothing_else(self, monkeypatch, capsys):
+        with patch("diagnosis.notify.format_slack_message", side_effect=RuntimeError("format exploded")):
+            result = _run_failing_main(monkeypatch, flag="true", diagnose_result=_diagnosis_run())
+
+        assert result.raised is result.exc
+        assert result.order == ["post_error", "diagnose"]
+        result.slack.post_error.assert_called_once_with(
+            _DIAG_CHANNEL, _DIAG_THREAD_TS, _expected_generic_failure_message()
+        )
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")
+        result.codex_writeback.assert_called_once_with("arn:codex", "codex-hash")
+        # main() がログの出力先を標準出力に設定するので、ログは標準出力で確かめる
+        assert "WARNING Execution diagnosis failed (non-fatal)" in capsys.readouterr().out
+
+    def test_diagnosis_result_of_unexpected_type_changes_nothing_else(self, monkeypatch):
+        result = _run_failing_main(monkeypatch, flag="true", diagnose_result=None)
+
+        assert result.raised is result.exc
+        assert result.order == ["post_error", "diagnose"]
+        result.slack.post_progress.assert_not_called()
+        result.claude_writeback.assert_called_once_with("arn:claude", "claude-hash")

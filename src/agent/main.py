@@ -277,6 +277,47 @@ def _notify_task_failure(slack_token: str, exc: BaseException | None = None) -> 
         logger.warning("Failed to send failure notification to Slack")
 
 
+def _should_run_diagnosis() -> bool:
+    """失敗時に実行診断役を自動で走らせるかを判定する。
+
+    feature flag `EXECUTION_DIAGNOSIS`。デフォルトは `False`（未設定なら無効）。
+    `EXECUTION_DIAGNOSIS=true` で有効にする。大文字/小文字は区別しない。
+    """
+    return os.environ.get("EXECUTION_DIAGNOSIS", "false").lower() == "true"
+
+
+def _maybe_post_diagnosis(slack_token: str, exc: BaseException, *, credentials_ready: bool) -> None:
+    """失敗通知の後に実行診断役を 1 回走らせ、診断結果を同じスレッドに投稿する。
+
+    ベストエフォート: 診断役の失敗・投稿の失敗はログに留め、元の例外を隠さない。
+    次の場合は走らせない: フラグがオフ / 認証情報の準備前の失敗 / フィードバック処理の失敗 /
+    Claude のレート制限・使用上限による失敗（診断役も同じ理由で失敗するため）/ 実行 ID や投稿先が不明。
+    投稿するのは診断が completed のときだけ（中身のない通知を送らないため）。
+    """
+    try:
+        if not _should_run_diagnosis():
+            return
+        if not credentials_ready or os.environ.get("TASK_TYPE", "") == "feedback":
+            return
+        if isinstance(exc, ClaudeInvocationError) and exc.rate_limited:
+            return
+        execution_id = os.environ.get("EXECUTION_ID", "")
+        channel = os.environ.get("SLACK_CHANNEL", "")
+        thread_ts = os.environ.get("SLACK_THREAD_TS", "")
+        if not execution_id or not channel or not thread_ts:
+            return
+        # フラグがオンのときだけ import する（オフなら diagnosis パッケージは読み込まれない）
+        from diagnosis import diagnose_execution
+        from diagnosis.notify import format_slack_message
+
+        run = diagnose_execution(execution_id, trigger="auto")
+        if run.status != "completed":
+            return
+        SlackClient(slack_token).post_progress(channel, thread_ts, format_slack_message(run))
+    except Exception:
+        logger.warning("Execution diagnosis failed (non-fatal)", exc_info=True)
+
+
 def main() -> None:
     """ECSタスクのエントリポイント。TASK_TYPE環境変数に基づき処理を分岐する。"""
     _setup_logging()
@@ -308,6 +349,7 @@ def main() -> None:
     except Exception as exc:
         logger.exception("Task failed")
         _notify_task_failure(slack_token, exc)
+        _maybe_post_diagnosis(slack_token, exc, credentials_ready=claude_initial_hash is not None)
         raise
     finally:
         if claude_initial_hash is not None:
