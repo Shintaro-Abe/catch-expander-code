@@ -2423,11 +2423,16 @@ class TestCallClaudeWithWorkspace:
         with patch("orchestrator._query_claude_sync", side_effect=fake_query):
             call_claude_with_workspace("p", "iac_code")
 
-        assert captured["cwd"].startswith("/tmp/agent-output-iac_code-")
-        # finally で削除済み
+        import tempfile
         from pathlib import Path
 
-        assert not Path(captured["cwd"]).exists()
+        # 一時ディレクトリの場所は環境 (TMPDIR) に依るので決め打ちしない。
+        # シンボリックリンク (/tmp と /private/tmp など) の差は resolve() で吸収する。
+        sandbox = Path(captured["cwd"])
+        assert sandbox.parent.resolve() == Path(tempfile.gettempdir()).resolve()
+        assert sandbox.name.startswith("agent-output-iac_code-")
+        # finally で削除済み
+        assert not sandbox.exists()
 
     def test_passes_cwd_in_options(self):
         from orchestrator import call_claude_with_workspace
@@ -2442,7 +2447,15 @@ class TestCallClaudeWithWorkspace:
             call_claude_with_workspace("p", "iac_code")
 
         assert captured["cwd"] is not None
-        assert captured["cwd"].startswith("/tmp/agent-output-iac_code-")
+
+        import tempfile
+        from pathlib import Path
+
+        # 一時ディレクトリの場所は環境 (TMPDIR) に依るので決め打ちしない。
+        # シンボリックリンク (/tmp と /private/tmp など) の差は resolve() で吸収する。
+        sandbox = Path(captured["cwd"])
+        assert sandbox.parent.resolve() == Path(tempfile.gettempdir()).resolve()
+        assert sandbox.name.startswith("agent-output-iac_code-")
 
     def test_includes_write_in_allowed_tools(self):
         from orchestrator import call_claude_with_workspace
