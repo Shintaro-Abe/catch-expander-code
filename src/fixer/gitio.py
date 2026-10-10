@@ -66,6 +66,12 @@ _FINGERPRINTED_PATHS = ("config", "config.worktree", "hooks", "info/attributes")
 _ARCHIVE_ATTRIBUTES = ("export-ignore", "export-subst")
 _ATTRIBUTES_FILE_NAME = ".gitattributes"
 _MAX_ATTRIBUTES_BYTES = 1_000_000
+# 照合の上限。中身を読むファイルの大きさ、たどる深さ、数えるファイルとディレクトリの数（設計 §22 の J1）
+_MAX_FINGERPRINT_FILE_BYTES = 1_000_000
+_MAX_FINGERPRINT_DEPTH = 8
+_MAX_FINGERPRINT_ENTRIES = 2_000
+# 読み取り専用で開く。リンクをたどらず、FIFO などに替えられていても待たない
+_OPEN_FOR_READING = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
 _INDEX_SIGNATURE = b"DIRC"
 _INDEX_VERSION = 2
 _INDEX_ENTRY_HEADER = struct.Struct(">10I20sH")  # 時刻など 10 個、オブジェクト名、フラグ
@@ -210,16 +216,21 @@ class Git:
         修正役が走らせたテストのコードは、元のリポジトリの `.git` に書ける。実行の前と、git の書き込みの
         直前とで、この値を比べる。読むだけで、何も書かない。
 
+        読む量には上限がある。`_MAX_FINGERPRINT_FILE_BYTES` を超えるファイルは、中身を読まず、大きさで表す。
+        深さが `_MAX_FINGERPRINT_DEPTH` 段を超えるディレクトリがあるか、ファイルとディレクトリが合わせて
+        `_MAX_FINGERPRINT_ENTRIES` 個を超えたら、失敗とする。
+
         Raises:
-            GitError: 共通ディレクトリを得られない、読めない。
+            GitError: 共通ディレクトリを得られない、読めない、上限を超えた。
         """
         common = self.common_dir()
         digest = hashlib.sha256()
         try:
-            for name in _FINGERPRINTED_PATHS:
-                for record in _describe(common / name, name):
-                    digest.update(record.encode("utf-8", errors="surrogateescape") + b"\0")
-        except OSError as e:
+            for record in _describe([(common / name, name) for name in _FINGERPRINTED_PATHS]):
+                digest.update(record.encode("utf-8", errors="surrogateescape") + b"\0")
+        except _FingerprintLimitExceeded as e:
+            raise GitError("repository configuration is too deep or has too many entries") from e
+        except (OSError, RuntimeError, ValueError, MemoryError) as e:
             raise GitError("repository configuration could not be read") from e
         return digest.hexdigest()
 
@@ -272,8 +283,9 @@ class Git:
                         file = archive.extractfile(member)
                         if file is not None and _sets_archive_attribute(file.read(_MAX_ATTRIBUTES_BYTES)):
                             return True
-            info = self.common_dir() / "info" / "attributes"
-            if info.is_file() and _sets_archive_attribute(info.read_bytes()[:_MAX_ATTRIBUTES_BYTES]):
+            # `$GIT_DIR/info/attributes` も、読み切れない大きさなら扱わない（全体を読んでから切らない）
+            info = _read_limited(self.common_dir() / "info" / "attributes", _MAX_ATTRIBUTES_BYTES)
+            if info is _OVERSIZED or (isinstance(info, bytes) and _sets_archive_attribute(info)):
                 return True
         except (tarfile.TarError, OSError) as e:
             raise GitError("exported tree could not be inspected") from e
@@ -422,27 +434,113 @@ def _branch_ref(name: str) -> str:
     return BRANCH_REF_PREFIX + name
 
 
-def _describe(path: Path, name: str) -> list[str]:
-    """パスの下のすべての項目を、「名前・種類・モード・中身の要約」の行にする（シンボリックリンクはたどらない）。"""
+class _FingerprintLimitExceeded(Exception):
+    """照合でたどる深さか、数える項目の数が、上限を超えた。"""
+
+
+def _describe(roots: Sequence[tuple[Path, str]]) -> list[str]:
+    """それぞれの根の下のすべての項目を、「名前・種類・モード・中身の要約」の行にする。
+
+    シンボリックリンクはたどらない。再帰を使わず、これから見る項目を積んで、名前の順に 1 つずつ見る。
+    深さは、根の下のディレクトリの入れ子で数える（根の直下のディレクトリが 1 段目）。数えるのは、すべての根を
+    合わせた、ファイルとディレクトリ（とリンクなど）の数。
+
+    Raises:
+        _FingerprintLimitExceeded: 深さか、項目の数が、上限を超えた。
+        OSError: 読めなかった。
+    """
+    records: list[str] = []
+    entries = 0
+    # 後ろから取り出すので、逆の順に積む
+    pending = [(path, name, 0) for path, name in reversed(roots)]
+    while pending:
+        path, name, depth = pending.pop()
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            records.append(f"{name} missing")
+            continue
+        entries += 1
+        if entries > _MAX_FINGERPRINT_ENTRIES:
+            raise _FingerprintLimitExceeded
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode):
+            records.append(f"{name} link {os.readlink(path)}")
+        elif stat.S_ISDIR(info.st_mode):
+            if depth > _MAX_FINGERPRINT_DEPTH:
+                raise _FingerprintLimitExceeded
+            records.append(f"{name} dir {mode:o}")
+            children = _child_names(path, _MAX_FINGERPRINT_ENTRIES - entries)
+            pending.extend((path / child, f"{name}/{child}", depth + 1) for child in reversed(children))
+        elif stat.S_ISREG(info.st_mode):
+            records.append(_describe_file(path, name))
+        else:
+            records.append(f"{name} other {mode:o}")
+    return records
+
+
+def _child_names(directory: Path, budget: int) -> list[str]:
+    """ディレクトリの直下の名前を、名前の順で返す。`budget` 個を超えたら、残りを読まずに失敗とする。"""
+    names: list[str] = []
+    with os.scandir(directory) as scan:
+        for entry in scan:
+            if len(names) >= budget:
+                raise _FingerprintLimitExceeded
+            names.append(entry.name)
+    return sorted(names)
+
+
+def _describe_file(path: Path, name: str) -> str:
+    """ファイル 1 つの行。大きさは、開いた後に確かめる（開く前に見た大きさは、入れ替えられると当てにならない）。"""
+    descriptor = os.open(path, _OPEN_FOR_READING | os.O_NOFOLLOW)
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return [f"{name} missing"]
-    mode = stat.S_IMODE(info.st_mode)
-    if stat.S_ISLNK(info.st_mode):
-        return [f"{name} link {os.readlink(path)}"]
-    if stat.S_ISDIR(info.st_mode):
-        records = [f"{name} dir {mode:o}"]
-        for child in sorted(os.listdir(path)):
-            records.extend(_describe(path / child, f"{name}/{child}"))
-        return records
-    if not stat.S_ISREG(info.st_mode):
-        return [f"{name} other {mode:o}"]
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        while chunk := file.read(_READ_CHUNK_BYTES):
+        info = os.fstat(descriptor)
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISREG(info.st_mode):
+            # 確かめた後で、ファイルでないものに替えられた
+            return f"{name} other {mode:o}"
+        if info.st_size > _MAX_FINGERPRINT_FILE_BYTES:
+            # 中身を読まない。大きさが変われば、値も変わる
+            return f"{name} oversized {mode:o} {info.st_size}"
+        digest = hashlib.sha256()
+        remaining = _MAX_FINGERPRINT_FILE_BYTES + 1
+        while remaining > 0 and (chunk := os.read(descriptor, min(_READ_CHUNK_BYTES, remaining))):
             digest.update(chunk)
-    return [f"{name} file {mode:o} {digest.hexdigest()}"]
+            remaining -= len(chunk)
+        if remaining <= 0:
+            # 読んでいる間に、上限を超えて伸びた
+            return f"{name} oversized {mode:o} {os.fstat(descriptor).st_size}"
+        return f"{name} file {mode:o} {digest.hexdigest()}"
+    finally:
+        os.close(descriptor)
+
+
+_OVERSIZED = object()  # `_read_limited` が、上限を超えるファイルに返す印
+
+
+def _read_limited(path: Path, limit: int) -> bytes | object | None:
+    """ファイルの中身を返す。無いか、ファイルでなければ None。`limit` バイトを超えていれば、読まずに `_OVERSIZED`。
+
+    大きさは、開いた後に確かめる。リンクはたどる（今までの `is_file()` と同じ）。
+    """
+    try:
+        descriptor = os.open(path, _OPEN_FOR_READING)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_size > limit:
+            return _OVERSIZED
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0 and (chunk := os.read(descriptor, min(_READ_CHUNK_BYTES, remaining))):
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return _OVERSIZED if remaining <= 0 else b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _parse_index(data: bytes) -> dict[str, tuple[int, str]]:

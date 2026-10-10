@@ -10,7 +10,19 @@ import socket
 import pytest
 
 from .conftest import NetworkBlockedError
-from .factories import adversarial_inputs, bearer_value, extra_secrets, fake_tokens, more_secrets
+from .factories import (
+    AWS_SECRET_NAME,
+    adversarial_inputs,
+    aws_secret_values,
+    bearer_value,
+    extra_secrets,
+    fake_tokens,
+    more_secrets,
+    ordinary_key_names,
+    quoted_adversarial_inputs,
+    quoted_aws_secret_forms,
+    secret_key_names,
+)
 
 DROPPED_KEYS = (
     "user_id",
@@ -668,3 +680,451 @@ class TestMaskingTime:
         result = session.call("submit_diagnosis", valid_submission(summary=long_text))
 
         assert result.outcome == "invalid_input"
+
+
+# ===========================================================================
+# main に入れる前のレビュー（5 巡目）の修正仕様 ①: 引用符つきのキー名と、秘密を表す名前のキー
+# ===========================================================================
+#
+# 再現: ``{"aws_secret_access_key": "<値>"}`` は、キー名を閉じる引用符が ``:`` の前に入るので、今までの式
+# （キー名の直後に ``=`` か ``:``）に当たらなかった。``redact()`` に辞書で渡しても、キーと値を別々に見るので、
+# 値が残った。
+#
+# このテストが決めたこと（仕様に無い細部）:
+# - 辞書のキーの名前が秘密を表し、値が文字列なら、値は ``"[MASKED]"`` そのものになる（キーは残る）。
+# - 文字列の中の書き方で確かめるキー名は、今までの式と同じ ``aws_secret_access_key``（大文字と小文字は区別しない）。
+
+MASK = "[MASKED]"
+PLAIN_VALUE = "plain-value-without-any-known-shape"
+
+
+class TestQuotedKeyInText:
+    """文字列の中の、キー名も値も引用符で囲んだ書き方（JSON と、Python の辞書の表示）。"""
+
+    FORMS = sorted(quoted_aws_secret_forms(""))
+
+    @pytest.mark.parametrize("value_kind", sorted(aws_secret_values()))
+    @pytest.mark.parametrize("form", FORMS)
+    def test_quoted_key_and_value_is_masked(self, form, value_kind):
+        from diagnosis.redaction import mask_secrets
+
+        value = aws_secret_values()[value_kind]
+        text = quoted_aws_secret_forms(value)[form]
+
+        masked = mask_secrets(f"前の文 {text} 後の文")
+
+        assert value not in masked
+        assert value[:20] not in masked
+        assert value[-20:] not in masked
+        assert MASK in masked
+        assert masked.startswith("前の文 ")
+        assert masked.endswith(" 後の文")
+
+    @pytest.mark.parametrize("form", FORMS)
+    def test_quoted_key_and_value_is_masked_at_the_edges_and_between_lines(self, form):
+        from diagnosis.redaction import mask_secrets
+
+        value = aws_secret_values()["alnum"]
+        text = quoted_aws_secret_forms(value)[form]
+
+        for whole in (text, f"{text}\n次の行", f"前の行\n{text}", text[1:-1]):
+            assert value not in mask_secrets(whole)
+
+    def test_neighbouring_keys_and_values_are_kept(self):
+        from diagnosis.redaction import mask_secrets
+
+        value = aws_secret_values()["alnum"]
+        forms = quoted_aws_secret_forms(value)
+
+        json_masked = mask_secrets(forms["json_among_other_keys"])
+        repr_masked = mask_secrets(forms["python_repr_among_other_keys"])
+
+        assert '"region": "ap-northeast-1"' in json_masked
+        assert '"retries": 3' in json_masked
+        assert "'region': 'ap-northeast-1'" in repr_masked
+        assert "'retries': 3" in repr_masked
+
+    def test_every_occurrence_in_one_text_is_masked(self):
+        from diagnosis.redaction import mask_secrets
+
+        values = aws_secret_values()
+        first = quoted_aws_secret_forms(values["alnum"])
+        second = quoted_aws_secret_forms(values["with_slash_and_plus"])
+        text = " / ".join([first["json"], second["python_repr"], first["json_upper"], second["json_no_space"]])
+
+        masked = mask_secrets(text)
+
+        for value in values.values():
+            assert value not in masked
+        assert masked.count(MASK) >= 4
+
+    def test_real_json_dump_and_dictionary_display_are_masked(self):
+        """実際の経路: 例外メッセージに、``json.dumps`` の結果や、辞書の表示がそのまま入る。"""
+        import json
+
+        from diagnosis.redaction import mask_secrets
+
+        value = aws_secret_values()["with_slash_and_plus"]
+        config = {"region": "ap-northeast-1", AWS_SECRET_NAME: value}
+
+        for text in (json.dumps(config), json.dumps(config, indent=2), repr(config), str(config), f"{config}"):
+            masked = mask_secrets(f"failed to load credentials: {text}")
+            assert value not in masked
+            assert "ap-northeast-1" in masked
+            assert masked.startswith("failed to load credentials: ")
+
+    def test_forms_that_were_already_masked_are_still_masked(self):
+        from diagnosis.redaction import mask_secrets
+
+        value = aws_secret_values()["alnum"]
+
+        for text in (f"{AWS_SECRET_NAME}={value}", f"{AWS_SECRET_NAME} = {value}", f"{AWS_SECRET_NAME}: {value}"):
+            assert value not in mask_secrets(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            'the "' + AWS_SECRET_NAME + '" setting is missing',
+            "'" + AWS_SECRET_NAME + "' was not found in the configuration",
+            '"' + AWS_SECRET_NAME + '" と "aws_access_key_id" を設定してください',
+            '{"region": "ap-northeast-1", "retries": 3}',
+            "{'region': 'ap-northeast-1', 'retries': 3}",
+            '{"topic": "DynamoDB の設計", "status": "failed"}',
+            'He said "hello": "world" twice',
+        ],
+    )
+    def test_text_without_a_quoted_secret_value_is_kept(self, text):
+        from diagnosis.redaction import mask_secrets
+
+        assert mask_secrets(text) == text
+
+    def test_quoted_form_inside_a_value_of_redact_is_masked(self):
+        from diagnosis.redaction import redact
+
+        value = aws_secret_values()["alnum"]
+        forms = quoted_aws_secret_forms(value)
+
+        cleaned = redact({"error_message": f"boto3 config: {forms['json']}", "lines": [forms["python_repr"], "ok"]})
+
+        assert value not in json_text(cleaned)
+        assert cleaned["error_message"].startswith("boto3 config: ")
+        assert cleaned["lines"][1] == "ok"
+
+    def test_quoted_form_in_event_payload_does_not_reach_the_model(self):
+        from diagnosis.models import DiagnosisLimits
+        from diagnosis.tools import ToolSession
+
+        from . import fakes, scenarios
+
+        value = aws_secret_values()["with_slash_and_plus"]
+        forms = quoted_aws_secret_forms(value)
+        scenario = scenarios.rate_limited()
+        scenario.events = [
+            scenarios.make_event(scenario.execution_id, n, "error", {"error_message": f"failed with {text}"})
+            for n, text in enumerate(forms.values(), start=1)
+        ]
+        session = ToolSession(fakes.build_reader(scenario).reader, DiagnosisLimits())
+
+        result = session.call("list_events", {})
+
+        assert result.outcome == "ok"
+        assert value not in result.to_text()
+        assert value[:20] not in result.to_text()
+
+    def test_quoted_form_in_summary_does_not_reach_the_slack_message(self):
+        """レビューの再現: モデルが要約に写しても、Slack の投稿文に値が残らない。"""
+        from diagnosis.notify import format_slack_message
+
+        from .factories import make_run
+
+        value = aws_secret_values()["alnum"]
+        forms = quoted_aws_secret_forms(value)
+
+        for form in ("json", "python_repr"):
+            text = format_slack_message(make_run(summary=f"設定 {forms[form]} が原因", action_note=forms[form]))
+            assert value not in text
+            assert value[:20] not in text
+
+    def test_quoted_form_in_accepted_submission_is_masked(self):
+        from diagnosis.models import DiagnosisLimits
+        from diagnosis.tools import ToolSession
+
+        from . import fakes, scenarios
+        from .factories import valid_submission
+
+        value = aws_secret_values()["alnum"]
+        forms = quoted_aws_secret_forms(value)
+        session = ToolSession(fakes.build_reader(scenarios.rate_limited()).reader, DiagnosisLimits())
+
+        result = session.call(
+            "submit_diagnosis",
+            valid_submission(
+                cause_category="unknown", summary=f"設定 {forms['json']}", action_note=forms["python_repr"]
+            ),
+        )
+        diagnosis = session.finalize()
+
+        assert result.outcome == "ok"
+        assert value not in diagnosis.summary
+        assert value not in diagnosis.action_note
+
+
+class TestSecretNamedKeys:
+    """``redact()`` に辞書を渡したとき: キーの名前が秘密を表し、値が文字列なら、値全体をマスクする。"""
+
+    @pytest.mark.parametrize("key", secret_key_names())
+    def test_string_value_under_a_secret_named_key_is_masked_whole(self, key):
+        from diagnosis.redaction import redact
+
+        assert redact({key: PLAIN_VALUE, "topic": "残る"}) == {key: MASK, "topic": "残る"}
+
+    @pytest.mark.parametrize("value_kind", sorted(aws_secret_values()))
+    def test_reviewer_reproduction_aws_secret_in_a_dictionary_is_masked(self, value_kind):
+        """レビューの再現: ``redact({"aws_secret_access_key": <値>})`` で、値が残った。"""
+        from diagnosis.redaction import redact
+
+        value = aws_secret_values()[value_kind]
+
+        cleaned = redact({AWS_SECRET_NAME: value, "region": "ap-northeast-1"})
+
+        assert value not in json_text(cleaned)
+        assert cleaned == {AWS_SECRET_NAME: MASK, "region": "ap-northeast-1"}
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "two words with spaces",
+            "line one\nline two",
+            "a",
+            "値は日本語",
+            "x" * 5_000,
+            "12345",
+            "true",
+            "{'inner': 'looks like a dictionary'}",
+        ],
+        ids=["words", "lines", "one_char", "japanese", "long", "digits", "true", "dictionary_display"],
+    )
+    def test_whole_value_is_masked_whatever_its_shape(self, value):
+        from diagnosis.redaction import redact
+
+        assert redact({"password": value}) == {"password": MASK}
+
+    def test_secret_named_keys_are_masked_at_every_depth(self):
+        from diagnosis.redaction import redact
+
+        cleaned = redact(
+            {
+                "outer": {"inner": {"db_password": PLAIN_VALUE, "host": "db.example.com"}},
+                "items": [{"api_key": PLAIN_VALUE, "name": "a"}, [{"Session" + "Token": PLAIN_VALUE}], "plain text"],
+                "count": 2,
+            }
+        )
+
+        assert cleaned == {
+            "outer": {"inner": {"db_password": MASK, "host": "db.example.com"}},
+            "items": [{"api_key": MASK, "name": "a"}, [{"Session" + "Token": MASK}], "plain text"],
+            "count": 2,
+        }
+
+    def test_list_of_dictionaries_at_the_top_is_walked(self):
+        from diagnosis.redaction import redact
+
+        assert redact([{"token": PLAIN_VALUE}, {"plain": PLAIN_VALUE}]) == [{"token": MASK}, {"plain": PLAIN_VALUE}]
+
+    @pytest.mark.parametrize("value", [0, 5, 12345, -1, 1.5, True, False, None])
+    @pytest.mark.parametrize("key", ["token", "password", "api_key", AWS_SECRET_NAME, "credential"])
+    def test_value_that_is_not_a_string_is_left_as_it_is(self, key, value):
+        from diagnosis.redaction import redact
+
+        cleaned = redact({key: value})
+
+        assert cleaned == {key: value}
+        assert type(cleaned[key]) is type(value)
+
+    def test_counters_whose_names_contain_token_are_not_broken(self):
+        """``token_count`` や ``total_tokens`` のような、数を持つキーは、そのまま残る。"""
+        from diagnosis.redaction import redact
+
+        usage = {
+            "token_count": 7,
+            "total_tokens": 165,
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens_used": 12345,
+            "total_input_tokens": 9000,
+            "tokens_used": None,
+            "max_tokens": 4096,
+            "cost_per_token": 0.000015,
+            "has_token": True,
+        }
+
+        cleaned = redact({"usage": dict(usage), "events": [dict(usage)]})
+
+        assert cleaned == {"usage": usage, "events": [usage]}
+        assert all(type(cleaned["usage"][name]) is type(value) for name, value in usage.items())
+
+    def test_dictionary_under_a_secret_named_key_is_walked_not_replaced(self):
+        from diagnosis.redaction import redact
+
+        cleaned = redact({"credentials": {"user": "deploy", "password": PLAIN_VALUE, "port": 5432}})
+
+        assert cleaned == {"credentials": {"user": "deploy", "password": MASK, "port": 5432}}
+
+    def test_list_under_a_secret_named_key_is_walked_not_replaced(self):
+        """リストは、今までどおり中をたどる（リストの中の文字列は、形で見る。辞書は、キーの名前で見る）。"""
+        from diagnosis.redaction import redact
+
+        token = fake_tokens()["github"]
+
+        cleaned = redact({"tokens": [{"token": PLAIN_VALUE, "scope": "repo"}, 3, None, f"value {token}", "plain"]})
+
+        assert cleaned == {"tokens": [{"token": MASK, "scope": "repo"}, 3, None, f"value {MASK}", "plain"]}
+
+    @pytest.mark.parametrize("key", ordinary_key_names())
+    def test_string_value_under_an_ordinary_key_is_kept(self, key):
+        from diagnosis.redaction import redact
+
+        assert redact({key: PLAIN_VALUE}) == {key: PLAIN_VALUE}
+
+    def test_value_under_an_ordinary_key_is_still_masked_by_its_shape(self):
+        from diagnosis.redaction import redact
+
+        token = fake_tokens()["github"]
+
+        assert redact({"message": f"push failed with {token}"}) == {"message": f"push failed with {MASK}"}
+
+    def test_identifier_keys_are_still_dropped_and_non_string_keys_are_kept(self):
+        from diagnosis.redaction import redact
+
+        cleaned = redact({"user_id": "U0123ABCDE", "thread_ts": "1.2", 1: "a", "password": PLAIN_VALUE, "n": 2})
+
+        assert cleaned == {1: "a", "password": MASK, "n": 2}
+
+    def test_secret_in_the_key_itself_is_still_masked(self):
+        from diagnosis.redaction import redact
+
+        token = fake_tokens()["github"]
+
+        text = json_text(redact({f"header {token}": "v", "plain": 1}))
+
+        assert token not in text
+        assert MASK in text
+
+    def test_input_is_not_modified(self):
+        from diagnosis.redaction import redact
+
+        original = {"password": PLAIN_VALUE, "nested": [{"token": PLAIN_VALUE}]}
+
+        redact(original)
+
+        assert original == {"password": PLAIN_VALUE, "nested": [{"token": PLAIN_VALUE}]}
+
+    def test_secret_named_keys_in_event_payload_do_not_reach_the_model(self):
+        """ツールの結果でも効いている。数を持つ ``total_tokens_used`` は、そのまま返る。"""
+        from diagnosis.models import DiagnosisLimits
+        from diagnosis.tools import ToolSession
+
+        from . import fakes, scenarios
+        from .factories import parse
+
+        values = aws_secret_values()
+        scenario = scenarios.rate_limited()
+        scenario.events = [
+            scenarios.make_event(
+                scenario.execution_id,
+                1,
+                "error",
+                {
+                    AWS_SECRET_NAME: values["alnum"],
+                    "config": {"Secret" + "AccessKey": values["with_slash_and_plus"], "region": "ap-northeast-1"},
+                    "headers": [{"Authorization": "custom-scheme opaque-value-0001"}],
+                    "total_tokens_used": 12345,
+                    "tokens_used": None,
+                },
+            )
+        ]
+        session = ToolSession(fakes.build_reader(scenario).reader, DiagnosisLimits())
+
+        result = session.call("list_events", {})
+        text = result.to_text()
+        payload = parse(result)["events"][0]["payload"]
+
+        assert result.outcome == "ok"
+        for value in values.values():
+            assert value not in text
+        assert "opaque-value-0001" not in text
+        assert payload["total_tokens_used"] == 12345
+        assert payload["tokens_used"] is None
+        assert payload["config"]["region"] == "ap-northeast-1"
+
+    def test_token_counters_of_the_execution_record_still_reach_the_model(self):
+        from diagnosis.models import DiagnosisLimits
+        from diagnosis.tools import ToolSession
+
+        from . import fakes, scenarios
+
+        session = ToolSession(fakes.build_reader(scenarios.rate_limited()).reader, DiagnosisLimits())
+
+        text = session.call("get_execution_overview", {}).to_text()
+
+        assert "12345" in text  # total_tokens_used
+        assert "9000" in text  # total_input_tokens
+        assert "3345" in text  # total_output_tokens
+
+
+class TestQuotedKeyMaskingTime:
+    """新しい形も、入力の長さに対して、ほぼ線形の時間で終わる（A1 と同じ確かめ方）。"""
+
+    @pytest.mark.parametrize("kind", sorted(quoted_adversarial_inputs()))
+    def test_mask_secrets_finishes_one_megabyte_of_quoted_key_input_in_time(self, kind):
+        from diagnosis.redaction import mask_secrets
+
+        check_roughly_linear(quoted_adversarial_inputs()[kind], mask_secrets)
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["double_quoted_name_open_value_repeated", "double_quoted_value_never_closed", "quote_colon_quote_repeated"],
+    )
+    def test_redact_of_nested_quoted_key_text_finishes_in_time(self, kind):
+        from diagnosis.redaction import redact
+
+        build = quoted_adversarial_inputs()[kind]
+
+        def nested(size: int) -> dict:
+            text = build(size // 4)
+            return {text: [text, {"inner": text}], "plain": text}
+
+        check_roughly_linear(nested, redact)
+
+    def test_redact_of_many_secret_named_keys_finishes_in_time(self):
+        """秘密を表す名前のキーが多い辞書（1 件 50 字ほど）。件数に対して、ほぼ線形。"""
+        from diagnosis.redaction import redact
+
+        def wide(size: int) -> dict:
+            return {f"api_key_{n:07d}_token_password": "v" * 20 for n in range(size // 50)}
+
+        check_roughly_linear(wide, redact)
+
+    def test_redact_of_many_keys_that_almost_name_a_secret_finishes_in_time(self):
+        from diagnosis.redaction import redact
+
+        def wide(size: int) -> dict:
+            return {f"secre_toke_passwor_api_ke_credentia_{n:07d}": "v" * 10 for n in range(size // 50)}
+
+        check_roughly_linear(wide, redact)
+
+    def test_redact_of_one_very_long_key_name_finishes_in_time(self):
+        from diagnosis.redaction import redact
+
+        def long_key(size: int) -> dict:
+            return {"secre" * (size // 10): "v", "t" * (size // 2): "w"}
+
+        check_roughly_linear(long_key, redact)
+
+    def test_redact_of_a_list_of_dictionaries_with_secret_named_keys_finishes_in_time(self):
+        from diagnosis.redaction import redact
+
+        def many(size: int) -> list:
+            return [{"password": "p" * 10, "token_count": n, "name": "n" * 10} for n in range(size // 60)]
+
+        check_roughly_linear(many, redact)

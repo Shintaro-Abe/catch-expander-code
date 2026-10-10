@@ -154,6 +154,15 @@ TMPDIR=/tmp AWS_DEFAULT_REGION=ap-northeast-1 AWS_ACCESS_KEY_ID=dummy AWS_SECRET
 - [x] D6d-7 `[developer]` 文書（`design.md` §11・§15・§18、`docs/execution-diagnostician.md`）。
   - 完了の確かめ方: 基準のコマンド（`--ignore=tests/unit/fixer` つき）で全テストが通る。追加・変更したファイルに `ruff check` の指摘なし。`git diff --numstat -- src/agent/main.py` が追加 42 行・削除 0 行のまま
 
+## Phase 6e: main に入れる前のレビューへの対応（`design.md` §18 の 5 巡目）
+
+- [x] T6e-1 `[tester]` 指摘ごとに、再現するテストを先に書く（`test_redaction.py`・`test_chained_exceptions.py` と、既存のテスト 2 件の改訂）。
+- [x] D6e-1 `[developer]` R1: 引用符つきの `aws_secret_access_key` をマスクする。`redact` は、秘密を表す名前のキーの文字列の値を、丸ごと置き換える。
+- [x] D6e-2 `[developer]` R2: `frames.is_single_complete_trace` を足し、連鎖したトレースと 5,000 字以上のトレースを、受け渡しに使わない。
+- [x] D6e-3 `[developer]` `src/agent/diagnosis/` が Python 3.11 で動くことを確かめる（直した箇所は無い）。
+- [x] D6e-4 `[developer]` 文書（`design.md` §6・§15・§18、`docs/execution-diagnostician.md`、ADR 0003）。
+  - 完了の確かめ方（2026-10-10）: 全テストが通る（4,343 件。対応の前は、今回のテスト 164 件が落ちていた）。`ruff check src/agent/diagnosis src/fixer` の指摘なし。`gitleaks` は `src`・`docs`・`.steering` で検出なし。`tests/unit/agent/diagnosis` は Python 3.11 でも 1,873 件が通る
+
 ## Phase 7: ユーザーの承認が要る作業（承認があるまで着手しない）
 
 - [ ] U7-1 コミット（ユーザーが求めたとき）。

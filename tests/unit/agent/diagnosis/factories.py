@@ -366,3 +366,141 @@ def make_run(*, status: str = "completed", stop_detail: str = "submitted", **dia
         usage={"input_tokens": 100, "output_tokens": 50, "total_tokens": 165},
         total_cost_usd=0.0123,
     )
+
+
+# ---------------------------------------------------------------------------
+# main に入れる前のレビュー（5 巡目）の修正仕様 ①: 引用符つきのキー名と、秘密を表す名前のキー
+# ---------------------------------------------------------------------------
+
+AWS_SECRET_NAME = "aws_secret_" + "access_key"
+# 秘密を表す名前に含まれる語（大文字と小文字を区別しない）
+SECRET_NAME_PARTS = (
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "credential",
+)
+
+
+def aws_secret_values() -> dict[str, str]:
+    """AWS のシークレットキーの形をした値（40 字）。断片の連結で作る（``.gitleaks.toml`` の検出を避ける）。"""
+    return {
+        "alnum": "wJalrXUtnFEMI" + "K7MDENGbPxRfiCY" + "EXAMPLEKEY12",
+        "with_slash_and_plus": "wJalrXUtnFEMI" + "/K7MDENG+bPxRfi" + "CYEXAMPLEKEY",
+    }
+
+
+def quoted_aws_secret_forms(value: str) -> dict[str, str]:
+    """キー名も値も引用符で囲んだ書き方（JSON と、Python の辞書の表示）。``種別: 文の中に置く文字列``。"""
+    name = AWS_SECRET_NAME
+    return {
+        "json": '{"' + name + '": "' + value + '"}',
+        "json_no_space": '{"' + name + '":"' + value + '"}',
+        "json_spaces_around_colon": '{"' + name + '"  :  "' + value + '"}',
+        "json_upper": '{"' + name.upper() + '": "' + value + '"}',
+        "json_mixed_case": '{"' + name.title() + '": "' + value + '"}',
+        "json_among_other_keys": '{"region": "ap-northeast-1", "' + name + '": "' + value + '", "retries": 3}',
+        "json_pretty": '{\n  "' + name + '": "' + value + '"\n}',
+        "python_repr": "{'" + name + "': '" + value + "'}",
+        "python_repr_no_space": "{'" + name + "':'" + value + "'}",
+        "python_repr_upper": "{'" + name.upper() + "': '" + value + "'}",
+        "python_repr_among_other_keys": "{'region': 'ap-northeast-1', '" + name + "': '" + value + "', 'retries': 3}",
+    }
+
+
+def secret_key_names() -> list[str]:
+    """秘密を表す名前のキー（``SECRET_NAME_PARTS`` のどれかを、大文字と小文字を区別せずに含む）。"""
+    return [
+        AWS_SECRET_NAME,
+        AWS_SECRET_NAME.upper(),
+        "Secret" + "AccessKey",
+        "client_secret",
+        "SECRET",
+        "token",
+        "Session" + "Token",
+        "access_token",
+        "REFRESH_TOKEN",
+        "password",
+        "Password",
+        "db_password",
+        "passwd",
+        "DB_PASSWD",
+        "api_key",
+        "X_API_KEY",
+        "apikey",
+        "apiKey",
+        "api-key",
+        "X-Api-Key",
+        "authorization",
+        "Authorization",
+        "proxy-authorization",
+        "credential",
+        "Credentials",
+        "aws_credentials_json",
+    ]
+
+
+def ordinary_key_names() -> list[str]:
+    """秘密を表さない名前のキー（似た語を含むが、``SECRET_NAME_PARTS`` のどれも含まない）。"""
+    return [
+        "topic",
+        "status",
+        "message",
+        "error_message",
+        "key",
+        "keys",
+        "api",
+        "api_version",
+        "author",
+        "auth_mode",
+        "pass",
+        "passed",
+        "tok",
+        "secre",
+        "subagent",
+        "stage",
+    ]
+
+
+def quoted_adversarial_inputs() -> dict:
+    """引用符つきのキー名の式を、最も遅くする形の入力。``種別: 大きさ n を受け取って、n 字ほどの入力を作る関数``。"""
+
+    def repeat(unit: str):
+        return lambda size: (unit * (size // len(unit) + 1))[:size]
+
+    def after(prefix: str, filler: str):
+        return lambda size: prefix + filler * size
+
+    name = AWS_SECRET_NAME
+    return {
+        "double_quoted_name_repeated": repeat('"' + name + '"'),
+        "single_quoted_name_repeated": repeat("'" + name + "'"),
+        "double_quoted_name_colon_repeated": repeat('"' + name + '":'),
+        "double_quoted_name_open_value_repeated": repeat('"' + name + '": "'),
+        "single_quoted_name_open_value_repeated": repeat("'" + name + "': '"),
+        "double_quoted_name_then_spaces": after('"' + name + '"', " "),
+        "double_quoted_name_colon_then_spaces": after('"' + name + '":', " "),
+        "double_quoted_name_then_colons": after('"' + name + '"', ":"),
+        "double_quoted_value_never_closed": after('"' + name + '": "', "a"),
+        "single_quoted_value_never_closed": after("'" + name + "': '", "a"),
+        "double_quoted_value_of_backslashes": after('"' + name + '": "', "\\"),
+        "double_quoted_value_of_escaped_quotes": after('"' + name + '": "', '\\"'),
+        "open_quote_then_names": after('"', name),
+        "upper_name_repeated": repeat('"' + name.upper() + '": '),
+        "double_quotes": after("", '"'),
+        "single_quotes": after("", "'"),
+        "mixed_quotes": repeat("\"'"),
+        "quote_colon_quote_repeated": repeat('":"'),
+        "quote_colon_space_quote_repeated": repeat('": "'),
+        "single_quote_colon_quote_repeated": repeat("':'"),
+        "empty_pairs_repeated": repeat('"": "", '),
+        "brief_pairs_repeated": repeat('"a": "b", '),
+        "name_without_quotes_then_quotes": after(name, '"'),
+        "quoted_name_with_spaces_inside": repeat('" ' + name + ' " : " '),
+        "japanese_with_quoted_names": repeat('日本語の文 "' + name + '" と \'' + name + "' "),
+    }

@@ -591,7 +591,11 @@ class TestInjectedFramesNeverReachHandoff:
 
         # C2: 最初のブロックのフレームだけ（2 つ目のブロックは、本物の形でも読まない）
         assert locations(event["frames"]) == [("/app/pkg/mod.py", "helper", 2)]
-        assert handoff.fixer_eligible is True  # 本物のフレームがあり、ほかの条件も満たす
+        # 5 巡目のレビューの修正仕様 ②で書き換えた（元は ``fixer_eligible is True``）:
+        # 連鎖したトレースは、内側と外側が同じ型（ここでは、どちらも ValueError の行で始まる）でも、受け渡しに使わない
+        assert handoff.fixer_eligible is False
+        assert handoff.exception_type is None
+        assert tuple(handoff.code_locations) == ()
         self._check_nothing_injected(event, text)
 
     def test_fake_frame_naming_a_real_file_but_made_up_function_is_not_registered(self, code_root):

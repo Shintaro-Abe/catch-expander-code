@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from diagnosis.exception_types import ExceptionTypeAllowlist
-from diagnosis.frames import FrameVerifier, exception_line_type
+from diagnosis.frames import FrameVerifier, exception_line_type, is_single_complete_trace
 from diagnosis.models import (
     ACTION_TYPES,
     CAUSE_CATEGORIES,
@@ -504,10 +504,11 @@ class ToolSession:
             # 例外の型は、コード側の許可一覧にある名前だけを通す。一覧に無い値は、モデルにもそのまま返さない
             error_type = payload.get("error_type")
             if self._exception_types.allows(error_type):
-                # 受け渡しに使えるのは、トレースの最初のブロックを終える例外の行の型と一致するときだけ
-                # （連鎖した例外で、内側の例外の場所と、外側の例外の型を組にしない）。
-                # 一致しなくても、モデルに返す結果には、今までどおり見せる
-                if exception_line_type(payload.get("stack_trace")) == error_type:
+                # 受け渡しに使えるのは、連鎖の無い、切られていないトレースで、最初のブロックを終える例外の行の型と
+                # 一致するときだけ（連鎖した例外では、内側と外側が同じ型でも、内側の場所を外側の例外と組にしない）。
+                # 使えなくても、モデルに返す結果には、今までどおり見せる
+                stack_trace = payload.get("stack_trace")
+                if is_single_complete_trace(stack_trace) and exception_line_type(stack_trace) == error_type:
                     error_types[evidence_id] = error_type
             elif error_type is not None:
                 payload = {**payload, "error_type": UNLISTED_EXCEPTION_TYPE}

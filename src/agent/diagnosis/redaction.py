@@ -4,6 +4,9 @@
 
 順序は「識別子の除去 → マスク → 切り詰め」。マスクを先にするのは、切り詰めでトークンが
 途中で切れて形に合わなくなるのを防ぐため。
+
+マスクは 2 通り。文字列は、トークン・キーの形で見る。辞書は、それに加えて、キーの名前が秘密を表すなら、
+文字列の値を丸ごと置き換える（形の決まっていない値も、名前で分かるものは残さない）。
 """
 
 from __future__ import annotations
@@ -26,6 +29,26 @@ _DROPPED_KEYS = frozenset(
     }
 )
 
+# 辞書のキーの名前が、これらのどれかを含めば（大文字と小文字は区別しない）、秘密を表す名前とみなす
+_SECRET_NAME_PARTS = (
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "credential",
+)
+_AWS_SECRET_NAME = "aws_secret_" + "access_key"
+# 引用符で囲んだ値の中身。閉じる引用符の手前までを、後戻りなしで読む（`\"` などのエスケープは、値の続き）。
+# 閉じる引用符が無ければ、文字列の終わりまで
+_DOUBLE_QUOTED_BODY = r'(?:[^"\\]++|\\[\s\S])++'
+_SINGLE_QUOTED_BODY = r"(?:[^'\\]++|\\[\s\S])++"
+# 引用符で囲んだキー名と、`:` まで（JSON と、Python の辞書の表示。`:` の前後の空白と改行を許す）
+_QUOTED_AWS_SECRET_NAME = rf"[\"'](?i:{_AWS_SECRET_NAME})[\"']\s{{0,8}}:\s{{0,8}}"
+
 # マスクする形。どの式も、入力の長さに対してほぼ線形の時間で終わるように書く:
 # - 長い並びの後ろに別の要素が続く式（JWT、URL の認証情報）は、並びの途中から試し直さないよう、
 #   手前の文字を確かめ（否定の後読み）、量指定子を所有的（++ や {m,n}+）にするか、上限を付ける。
@@ -45,8 +68,12 @@ _SECRET_PATTERN = re.compile(
             r"secret_[A-Za-z0-9]{20,}",  # Notion
             r"ntn_[A-Za-z0-9]{20,}",
             r"(?:AKIA|ASIA)[A-Z0-9]{16}",  # AWS のアクセスキー
+            # AWS のシークレットキー。キー名も値も引用符で囲んだ書き方（`{"名前": "値"}`、`{'名前': '値'}`）。
+            # 値は、形を問わず、閉じる引用符の手前までをマスクする。下の式より先に試す
+            rf'(?P<keep4>{_QUOTED_AWS_SECRET_NAME}"){_DOUBLE_QUOTED_BODY}',
+            rf"(?P<keep5>{_QUOTED_AWS_SECRET_NAME}'){_SINGLE_QUOTED_BODY}",
             # AWS のシークレットキー（= か : の後ろの値）
-            r"(?P<keep1>(?i:aws_secret_access_key)[ \t]{0,8}[=:][ \t]{0,8}[\"']?)[A-Za-z0-9/+=]{16,}",
+            rf"(?P<keep1>(?i:{_AWS_SECRET_NAME})[ \t]{{0,8}}[=:][ \t]{{0,8}}[\"']?)[A-Za-z0-9/+=]{{16,}}",
             r"(?i:bearer)\s{1,16}[A-Za-z0-9._~+/=-]{16,}",
             r"(?P<keep2>(?i:authorization:[ \t]{0,8}basic)[ \t]{1,8})[A-Za-z0-9+/=]{8,}",
             # URL の中の認証情報（scheme://user:password@host の password）
@@ -59,7 +86,7 @@ _SECRET_PATTERN = re.compile(
         )
     )
 )
-_KEPT_GROUPS = ("keep1", "keep2", "keep3")
+_KEPT_GROUPS = ("keep1", "keep2", "keep3", "keep4", "keep5")
 
 _SLACK_NEUTRALIZE = str.maketrans({"<": "＜", ">": "＞", "@": "＠"})
 
@@ -86,21 +113,36 @@ def _masked(match: re.Match[str]) -> str:
     return MASK
 
 
+def is_secret_name(key: object) -> bool:
+    """辞書のキーの名前が、秘密を表すか（`_SECRET_NAME_PARTS` のどれかを、大文字と小文字を区別せずに含む）。"""
+    if not isinstance(key, str):
+        return False
+    lowered = key.lower()
+    return any(part in lowered for part in _SECRET_NAME_PARTS)
+
+
 def _mask_strings(obj: Any) -> Any:
     if isinstance(obj, str):
         return mask_secrets(obj)
     if isinstance(obj, dict):
-        # 辞書のキーの文字列もマスクする
-        return {
-            (mask_secrets(key) if isinstance(key, str) else key): _mask_strings(value) for key, value in obj.items()
-        }
+        masked = {}
+        for key, value in obj.items():
+            # 辞書のキーの文字列もマスクする
+            masked_key = mask_secrets(key) if isinstance(key, str) else key
+            # 秘密を表す名前のキーの値が文字列なら、形を問わず、丸ごと置き換える（キーは残す）。
+            # 辞書とリストは中をたどり、数（total_tokens_used など）はそのまま残す
+            masked[masked_key] = MASK if isinstance(value, str) and is_secret_name(key) else _mask_strings(value)
+        return masked
     if isinstance(obj, list):
         return [_mask_strings(value) for value in obj]
     return obj
 
 
 def redact(obj: Any) -> Any:
-    """識別子を落としたあと、すべての文字列（辞書のキーを含む）をマスクする。"""
+    """識別子を落としたあと、すべての文字列（辞書のキーを含む）をマスクする。
+
+    辞書のキーの名前が秘密を表すときは、文字列の値を `MASK` そのものにする。
+    """
     return _mask_strings(drop_identifiers(obj))
 
 

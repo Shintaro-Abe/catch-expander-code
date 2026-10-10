@@ -3620,8 +3620,25 @@ class TestExceptionTypeMustMatchTheTrace:
         assert event["payload"]["error_type"] == "RuntimeError"
         assert [(f["function"], f["line"]) for f in event["frames"]] == [("load", 520)]
 
-    def test_type_that_matches_the_first_block_is_usable(self):
-        _, diagnosis, handoff = self._handoff("KeyError", self.CHAINED)
+    def test_type_that_matches_the_first_block_of_a_chain_is_not_usable(self):
+        """5 巡目のレビューの修正仕様 ②で書き換えた（元は「最初のブロックの型と一致すれば使える」）。
+
+        連鎖したトレースは、型が最初のブロックと一致しても、受け渡しに使わない。モデルに返す結果は変えない。
+        """
+        event, diagnosis, handoff = self._handoff("KeyError", self.CHAINED)
+
+        assert handoff.exception_type is None
+        assert tuple(handoff.code_locations) == ()
+        assert handoff.fixer_eligible is False
+        assert diagnosis.exception_evidence_id is None
+        assert event["payload"]["error_type"] == "KeyError"
+        assert [(f["function"], f["line"]) for f in event["frames"]] == [("load", 520)]
+
+    def test_type_that_matches_the_only_block_is_usable(self):
+        """連鎖の無いトレースなら、型が一致すれば、今までどおり使える。"""
+        only_block = self.CHAINED.split("\n\n")[0] + "\n"
+
+        _, diagnosis, handoff = self._handoff("KeyError", only_block)
 
         assert handoff.exception_type == "KeyError"
         assert [(c.function, c.line) for c in handoff.code_locations] == [("load", 520)]

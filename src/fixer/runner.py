@@ -313,7 +313,9 @@ def _repository_was_changed(progress: _Progress) -> bool:
         return False
     try:
         return progress.git.repository_fingerprint() != progress.fingerprint
-    except GitError:
+    except Exception:
+        # 照合が、どんな形で失敗しても、外に漏らさない。確かめられなかったものは「変わった」として扱う
+        logger.warning("Repository configuration could not be checked (non-fatal)", exc_info=True)
         return True
 
 
@@ -722,6 +724,13 @@ def _execute(
     if not _is_valid_out_dir(out_dir, repo):
         return progress.stop("failed", "invalid_out_dir")
     try:
+        # 元のリポジトリの設定とフックの、いまの状態を覚えておく（モデルの作業の後、コミットの直前、終わりに比べる）。
+        # 上限を超えるなどで照合できないリポジトリは、複製を作る前（git archive を呼ぶ前）に断る
+        fingerprint = git.repository_fingerprint()
+    except Exception:
+        logger.warning("Repository configuration could not be checked before the start (non-fatal)", exc_info=True)
+        return progress.stop("failed", "setup_error")
+    try:
         # 書き出し（git archive）が、コミットの中身と食い違うリポジトリは、扱わない
         if git.has_archive_attributes(progress.base_commit):
             return progress.stop("failed", "unsupported_attributes")
@@ -739,8 +748,7 @@ def _execute(
     try:
         if git.branch_exists(BRANCH_PREFIX + handoff.execution_id):
             return progress.stop("failed", "branch_exists")
-        # 元のリポジトリの設定とフックの、いまの状態を覚えておく（モデルの作業の後、コミットの直前、終わりに比べる）
-        progress.git, progress.fingerprint = git, git.repository_fingerprint()
+        progress.git, progress.fingerprint = git, fingerprint
         # 基準のツリーも、モデルが書いたコードが走る前に、ここで記録する（コミットを作るときに、これと比べる）
         progress.base_tree = git.tree_objects(progress.base_commit)
     except GitError:

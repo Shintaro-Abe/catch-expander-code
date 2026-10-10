@@ -125,6 +125,18 @@ TMPDIR=/tmp AWS_DEFAULT_REGION=ap-northeast-1 AWS_ACCESS_KEY_ID=dummy AWS_SECRET
   - 確かめ方: `tests/unit/fixer` が全件通る（1,811 件）。それ以外のテストは 2,230 件のまま。H2 のツリーの確かめは、環境変数を外した状態で、スクラッチパッドの小さなリポジトリと、`run_fix` の 2 件で確かめた（`design.md` §21.1 の 4）
 - [ ] T5b-2 `[tester]` 全テストとリントをもう一度確かめる（T3-1 と同じ項目）。
 
+## Phase 5c: main に入れる前のレビューへの対応
+
+（`design.md` §22。）
+
+- [x] T5c-1 `[tester]` 指摘を再現するテストを先に書く（`tests/unit/fixer/test_fingerprint_limits.py`）。
+- [x] D5c-1 `[developer]` J1: 設定とフックの照合に上限を付ける（1,000,000 バイトを超えるファイルは読まない。深さ 8 段、2,000 個まで。再帰を使わない）。
+- [x] D5c-2 `[developer]` J2: 照合の失敗を、例外の種類に関わらず `run_fix` から漏らさない。起動の前の照合を、`git archive` の前に移す。
+- [x] D5c-3 `[developer]` J3: `.git/info/attributes` を、読む前に大きさを確かめる。
+- [x] D5c-4 `[developer]` J4: 「既存のテスト 2 件が、検査の実行では落ちる」という記述を、今のコードに合わせる（`design.md` §16.2、`docs/execution-fixer.md` §9）。
+- [x] D5c-5 `[developer]` 文書（`design.md` §16・§22、`docs/execution-fixer.md`）。
+  - 確かめ方（2026-10-10）: `tests/unit/fixer` が全件通る（1,878 件）。全テストは 4,343 件が通る。`ruff check src/agent/diagnosis src/fixer` の指摘なし。実行の後、`/tmp/fixer-*` は残っていない
+
 ## Phase 6: 永続的な文書
 
 - [x] D6-1 `[developer]` `docs/glossary.md`（用語の登録。名称は司令塔がユーザーに確認してから）、`docs/repository-structure.md`（`src/fixer/` の置き場所）、`docs/development-guidelines.md`（修正役の成果物を取り込むときの手順）。

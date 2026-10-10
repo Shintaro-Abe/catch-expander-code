@@ -1,6 +1,6 @@
 """スタックトレースのフレームの取り出しと、実際のコードとの突き合わせ。SDK には依存しない。
 
-設計詳細: `.steering/20261004-execution-diagnostician/design.md` §18 の S1・C2・A3
+設計詳細: `.steering/20261004-execution-diagnostician/design.md` §18 の S1・C2・A3・R2
 
 スタックトレースは記録の中身（信頼できない入力）で、末尾の例外メッセージには外から来た文字列が
 入りうる。フレームの形をした行を仕込まれても受け渡しに入らないよう、取り出したフレームは
@@ -38,6 +38,17 @@ _ANY_FRAME_LINE_PATTERN = re.compile(r'  File ".*", line [0-9]+, in .+')
 _CODE_LINE_PREFIX = "    "
 # ブロックを終える例外の行。「点で区切った識別子」で始まり、その後ろは行末か `:`。型の名前は最後の部分（80 字まで）
 _EXCEPTION_LINE_PATTERN = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]{0,79})(?::.*)?")
+
+# 連鎖した例外の印になる行。最初のブロックの後ろに、このどれか（または 2 つ目の見出し）があれば、連鎖している
+_CHAIN_MARKERS = frozenset(
+    {
+        _TRACEBACK_HEADER,
+        "During handling of the above exception, another exception occurred:",
+        "The above exception was the direct cause of the following exception:",
+    }
+)
+# 記録する側は、スタックトレースを先頭のこの字数で切る。この長さ以上のものは、後ろが切れているかもしれない
+RECORDED_TRACE_CHARS = 5_000
 
 # ファイル 1 つの解析結果: (行数, [(関数名, 開始行, 終了行), ...])
 _Source = tuple[int, list[tuple[str, int, int]]]
@@ -77,6 +88,20 @@ def exception_line_type(stack_trace: object) -> str | None:
         return None
     match = _EXCEPTION_LINE_PATTERN.fullmatch(terminator)
     return match.group(1) if match is not None else None
+
+
+def is_single_complete_trace(stack_trace: object) -> bool:
+    """スタックトレースが、連鎖の無い、切られていない 1 つのブロックと言えるか。
+
+    偽になるのは、文字列でない、`RECORDED_TRACE_CHARS` 字以上（後ろに連鎖があっても分からない）、
+    2 行目より後ろに、連鎖の区切りの文か 2 つ目の見出しの行がある、のどれか。連鎖したトレースの最初の
+    ブロックは内側の例外のもので、記録された型（外側の例外）と同じ型でも、場所は外側の例外のものではない。
+    受け渡しに使うイベントを選ぶために使う。フレームの取り出しと `exception_line_type` の動作は変えない。
+    """
+    if not isinstance(stack_trace, str) or len(stack_trace) >= RECORDED_TRACE_CHARS:
+        return False
+    # 行の前後の空白（CR を含む）は無視して比べる。最初のブロックの中の行は、どれも印と一致しない
+    return not any(line.strip() in _CHAIN_MARKERS for line in stack_trace.split("\n")[1:])
 
 
 class FrameVerifier:

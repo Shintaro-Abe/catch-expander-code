@@ -126,7 +126,7 @@ PYTHONPATH=src/agent .venv/bin/python -m src.fixer \
 | `failed` | `unisolated_environment` | ホームに認証情報らしいものがある、または、検査に使う Python の環境に書き込める（§2.1）。何もしていない。出力先には何も書かない |
 | `failed` | `not_a_repository` / `base_not_found` / `invalid_out_dir` / `branch_exists` | 起動の前の確かめに落ちた。出力先には何も書かない |
 | `failed` | `unsupported_attributes` | 基準のコミットが `.gitattributes` の `export-ignore`・`export-subst` を使っている（複製の中身が、コミットの中身と食い違う）、または、1,000,000 バイトを超える `.gitattributes` がある。出力先には何も書かない |
-| `failed` | `repository_tampered` | 元のリポジトリの `.git/hooks`・`.git/config`・`.git/info/attributes` が、実行の間に変わった（モデルの作業の後と、コミットの直前に照合する）。検査の前に気づいたときは、検査も走らせていない。コミットはしていない。**次の git の操作の前に、`.git/hooks` と `.git/config` を確かめること** |
+| `failed` | `repository_tampered` | 元のリポジトリの `.git/hooks`・`.git/config`・`.git/info/attributes` が、実行の間に変わった（モデルの作業の後と、コミットの直前に照合する）。検査の前に気づいたときは、検査も走らせていない。コミットはしていない。照合そのものが失敗したときも、同じ終了理由になる。**次の git の操作の前に、`.git/hooks` と `.git/config` を確かめること** |
 | `failed` | `workspace_tampered` | 作業用の複製の根が、実行の間に、リンクや別のディレクトリに替えられた。変更を取り出さず、何も提案していない |
 | `failed` | `invalid_handoff` | 受け渡しの形が合わない（未定義の項目、決まった値以外、識別子の形でない値など） |
 | `failed` | `setup_error` / `tool_isolation_failed` / `sdk_error` / `commit_error` / `internal_error` | 準備・SDK・コミットの失敗、7 個以外のツールの検出 |
@@ -240,8 +240,9 @@ git branch -D fix/diagnosed-<実行 ID>
 - **まだ無い関数やモジュールを足す種類の修正は、成果物にならない**。新しいテストが、修正の前に、集めるときのエラーになるためである（G5）。
 - **G7 は、成否が「同じ」であることを求める**。基準の時点で落ちていたテストは、落ちたままなら妨げにならないが、
   修正でそのテストが通るようになった場合も不合格になる（安全な側に倒している）。その修正は、人が取り込む。
-- **既存のテスト 2 件（`TestCallClaudeWithWorkspace` の 2 件）は、検査の実行では落ちる**。テストに渡す `TMPDIR` が
-  `/tmp/fixer-run-*/tmp` になるためである。基準と修正後で同じように落ちるので G7 は通るが、この 2 件は、修正で壊れても検出されない。
+- **照合には上限がある**。1,000,000 バイトを超えるファイルは、中身を読まず、大きさで比べる（同じ大きさのまま中身を
+  書き換えられても、気づけない）。`.git/hooks` などの下に、深さが 8 段を超えるディレクトリがあるか、ファイルとディレクトリが
+  合わせて 2,000 個を超えるリポジトリでは、照合できないので、起動しない（`setup_error`）。
 - **場所は手がかりにすぎない**。記録そのものを書き換えられる相手は、偽の場所を受け渡しに入れられる。
   誤った場所を指されたとき、修正役は「直せない」と返すか、無関係な修正案を出す。
 - **版のずれ**。基準のコミットが、失敗した実行の版と違うと、場所の行番号が関数の範囲から外れて捨てられる
@@ -253,7 +254,7 @@ git branch -D fix/diagnosed-<実行 ID>
 - **依存の名前の一覧の限界**。足せない名前は、決まった一覧と、基準のコミットの `requirements*.txt` の配布物の名前から作る。
   配布物の名前と import の名前が違うもの（`PyYAML` → `yaml` など）は、決まった一覧にあるものしか拾えない。
 - **`export-ignore`・`export-subst` を使うリポジトリは、扱わない**（`unsupported_attributes`）。1,000,000 バイトを超える
-  `.gitattributes` があるコミットも、扱わない。`.git/info/attributes` は、先頭の 1,000,000 バイトだけを見る。
+  `.gitattributes` があるコミットも、扱わない。`.git/info/attributes` が 1,000,000 バイトを超えるリポジトリも、同じである。
 - **開発用の環境に依存する**。検査のテストは、修正役を動かしている Python と、その依存で走る。
 - **リントの比べ方は件数だけ**。指摘が 1 件減って 1 件増えた場合は通る。
 - **SDK の未確認の点**（`tools=[]` で組み込みツールがすべて外れるか、初期化のメッセージにツール一覧が入るか）は、
